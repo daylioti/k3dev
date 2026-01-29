@@ -62,7 +62,7 @@ get_latest_version() {
 
 # Download and install
 install() {
-    local os arch variant artifact version download_url tmp_dir
+    local os arch variant artifact version download_url
 
     os=$(detect_os)
     arch=$(detect_arch)
