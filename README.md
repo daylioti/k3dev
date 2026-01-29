@@ -24,7 +24,23 @@ A TUI for managing local K3s clusters in Docker.
 
 ## Installation
 
-### Download
+### Quick Install (Recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/daylioti/k3dev/main/install.sh | bash
+```
+
+This automatically detects your architecture and installs to `~/.local/bin`.
+
+### cargo binstall
+
+If you have [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+
+```bash
+cargo binstall k3dev
+```
+
+### Manual Download
 
 Download the latest binary from [Releases](https://github.com/daylioti/k3dev/releases).
 

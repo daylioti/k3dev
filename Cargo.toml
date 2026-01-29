@@ -4,6 +4,29 @@ version = "0.1.0"
 edition = "2021"
 description = "TUI for local k3s cluster development"
 authors = ["daylioti"]
+license = "MIT"
+repository = "https://github.com/daylioti/k3dev"
+homepage = "https://github.com/daylioti/k3dev"
+readme = "README.md"
+keywords = ["k3s", "kubernetes", "docker", "tui", "devops"]
+categories = ["command-line-utilities", "development-tools"]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/k3dev-linux-{ target-arch }{ binary-ext }"
+bin-dir = "k3dev-linux-{ target-arch }{ binary-ext }"
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/k3dev-linux-x86_64"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/k3dev-linux-x86_64-musl"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/k3dev-linux-aarch64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/k3dev-linux-aarch64-musl"
 
 [dependencies]
 # TUI
