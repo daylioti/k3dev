@@ -1,0 +1,69 @@
+#!/bin/sh
+#
+# Commit message hook - validates conventional commits format
+#
+# Format: <type>[(scope)][!]: <description>
+#
+# Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+#
+# Examples:
+#   feat: add new command
+#   fix(parser): handle edge case
+#   docs: update README
+#   feat!: breaking change
+
+commit_msg_file="$1"
+commit_msg=$(cat "$commit_msg_file")
+
+# Skip merge commits
+if echo "$commit_msg" | grep -qE "^Merge "; then
+    exit 0
+fi
+
+# Skip fixup/squash commits
+if echo "$commit_msg" | grep -qE "^(fixup|squash)! "; then
+    exit 0
+fi
+
+# Conventional commit pattern
+# type(optional-scope)optional-!: description
+pattern="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9_-]+\))?\!?: .{1,}"
+
+# Get first line (subject)
+subject=$(echo "$commit_msg" | head -n1)
+
+if ! echo "$subject" | grep -qE "$pattern"; then
+    echo "ERROR: Invalid commit message format"
+    echo ""
+    echo "Expected format: <type>[(scope)][!]: <description>"
+    echo ""
+    echo "Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+    echo ""
+    echo "Examples:"
+    echo "  feat: add user authentication"
+    echo "  fix(api): handle timeout errors"
+    echo "  docs: update installation guide"
+    echo "  refactor!: rename public API methods"
+    echo ""
+    echo "Your message: $subject"
+    exit 1
+fi
+
+# Check subject line length (max 72 characters recommended)
+subject_length=${#subject}
+if [ "$subject_length" -gt 72 ]; then
+    echo "WARNING: Subject line is $subject_length characters (recommended max: 72)"
+    echo "Your message: $subject"
+    # Warning only, don't block
+fi
+
+# Check description doesn't start with capital letter after colon
+description=$(echo "$subject" | sed -E 's/^[^:]+: //')
+first_char=$(echo "$description" | cut -c1)
+if echo "$first_char" | grep -qE "^[A-Z]$"; then
+    echo "WARNING: Description should start with lowercase letter"
+    echo "Your message: $subject"
+    # Warning only, don't block
+fi
+
+exit 0

@@ -1,0 +1,29 @@
+# IDE
+.idea/
+.vscode/
+.claude/
+
+# Build artifacts
+target/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Logs
+*.log
+
+# Editor swap files
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Local config files (use k3dev.example.yml as template)
+k3dev.yml
+k3dev.yml.disabled

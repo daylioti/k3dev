@@ -1,0 +1,74 @@
+# K3dev Configuration
+# Copy this file to one of the following locations:
+#   - ./k3dev.yml (current directory)
+#   - ~/.config/k3dev/config.yml (recommended)
+#   - /etc/k3dev/config.yml (system-wide)
+
+# =============================================================================
+# Cluster Connection Settings
+# =============================================================================
+cluster:
+  # Path to kubeconfig (optional, defaults to ~/.kube/config)
+  kubeconfig: ""
+  # Kubernetes context to use (optional, defaults to current context)
+  context: ""
+
+# =============================================================================
+# Infrastructure Settings
+# =============================================================================
+infrastructure:
+  # Domain for local cluster ingresses
+  domain: "myapp.local"
+
+  # K3s version
+  k3s_version: "v1.33.4-k3s1"
+
+  # Container settings
+  container_name: "k3s-server"
+  network_name: "k8s-local-net"
+
+  # Ports
+  api_port: 6443
+  http_port: 80
+  https_port: 443
+
+  # Feature flags
+  auto_update_hosts: false   # Auto-update /etc/hosts with ingress entries
+  deploy_traefik: true       # Deploy Traefik as ingress controller
+
+# =============================================================================
+# Placeholders (optional)
+# Define reusable values referenced as @placeholder_name
+# =============================================================================
+placeholders:
+  ns: "default"
+  app_selector: "app=myapp"
+
+# =============================================================================
+# Custom Commands
+# =============================================================================
+commands:
+  - name: "App"
+    commands:
+      - name: "Shell"
+        exec:
+          target:
+            namespace: "@ns"
+            selector: "@app_selector"
+          cmd: "/bin/sh"
+
+      - name: "View Logs"
+        exec:
+          target:
+            namespace: "@ns"
+            selector: "@app_selector"
+          cmd: "tail -f /var/log/app.log"
+
+      - name: "Custom Command"
+        exec:
+          target:
+            namespace: "@ns"
+            selector: "@app_selector"
+          cmd: "@command"
+          input:
+            command: "Enter command:"
