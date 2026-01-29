@@ -54,6 +54,15 @@ impl KeyBinding {
             parts[parts.len() - 1]
         };
 
+        // For single uppercase characters, add SHIFT modifier
+        // This allows "H" to be distinct from "h"
+        if key_part.len() == 1 {
+            let c = key_part.chars().next().unwrap();
+            if c.is_ascii_uppercase() {
+                modifiers |= KeyModifiers::SHIFT;
+            }
+        }
+
         let code = Self::parse_key_code(key_part)?;
 
         Ok(Self { code, modifiers })
@@ -201,5 +210,32 @@ mod tests {
         assert!(display.contains("Ctrl"));
         assert!(display.contains("Shift"));
         assert!(display.contains("p"));
+    }
+
+    #[test]
+    fn test_uppercase_implies_shift() {
+        // Uppercase "H" should be distinct from lowercase "h"
+        let upper = KeyBinding::parse("H").unwrap();
+        let lower = KeyBinding::parse("h").unwrap();
+
+        // "H" should have SHIFT modifier
+        assert_eq!(upper.code, KeyCode::Char('h'));
+        assert!(upper.modifiers.contains(KeyModifiers::SHIFT));
+
+        // "h" should have no modifiers
+        assert_eq!(lower.code, KeyCode::Char('h'));
+        assert_eq!(lower.modifiers, KeyModifiers::NONE);
+
+        // They should be different bindings
+        assert_ne!(upper, lower);
+
+        // "H" matches Shift+h key press
+        assert!(upper.matches(KeyCode::Char('h'), KeyModifiers::SHIFT));
+        assert!(upper.matches(KeyCode::Char('H'), KeyModifiers::SHIFT));
+        assert!(!upper.matches(KeyCode::Char('h'), KeyModifiers::NONE));
+
+        // "h" matches just h key press
+        assert!(lower.matches(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(!lower.matches(KeyCode::Char('h'), KeyModifiers::SHIFT));
     }
 }
