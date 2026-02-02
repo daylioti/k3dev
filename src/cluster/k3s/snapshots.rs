@@ -21,7 +21,7 @@ impl K3sManager {
     /// Replaces dots and special chars with dashes
     /// Example: "v1.33.4-k3s1" -> "v1-33-4-k3s1"
     pub(super) fn sanitize_version(version: &str) -> String {
-        version.replace('.', "-").replace('/', "-")
+        version.replace(['.', '/'], "-")
     }
 
     /// Calculate config hash from fields that affect cluster state
