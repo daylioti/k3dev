@@ -3,6 +3,7 @@
 //! This module contains all spawn_* methods for background data refresh.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::cluster::{
     ClusterManager, ClusterStatus, DockerManager, IngressHealthChecker, IngressManager,
@@ -15,12 +16,12 @@ use super::{App, AppMessage};
 impl App {
     pub(super) fn spawn_status_check(&self) {
         let message_tx = self.message_tx.clone();
-        let cluster_config = self.cluster_config.clone();
+        let cluster_config = Arc::clone(&self.cluster_config);
         let timeout = self.refresh_config.status_check_timeout;
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let manager = match ClusterManager::new(Some(cluster_config)).await {
+                let manager = match ClusterManager::new(cluster_config).await {
                     Ok(m) => m,
                     Err(_) => return ClusterStatus::Unknown,
                 };
@@ -109,24 +110,6 @@ impl App {
         });
     }
 
-    pub(super) fn spawn_hosts_update(&self) {
-        if !self.auto_update_hosts || !matches!(self.cluster_status, ClusterStatus::Running) {
-            return;
-        }
-
-        let domain = self.cluster_config.domain.clone();
-        let timeout = self.refresh_config.hosts_update_timeout;
-
-        // Auto hosts update tries without sudo - silently skips if no permission
-        tokio::spawn(async move {
-            let _ = tokio::time::timeout(timeout, async {
-                let mut ingress_manager = IngressManager::with_domain(domain);
-                // Silently ignore errors - user can manually update with 'H' key if needed
-                let _ = ingress_manager.update_hosts(None).await;
-            })
-            .await;
-        });
-    }
 
     pub(super) fn spawn_resource_stats_check(&self) {
         if !matches!(self.cluster_status, ClusterStatus::Running) {

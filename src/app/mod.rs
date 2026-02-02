@@ -12,6 +12,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::Stdout;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -57,7 +58,7 @@ pub struct App {
     // Configuration
     #[allow(dead_code)]
     config: Config,
-    cluster_config: ClusterConfig,
+    cluster_config: Arc<ClusterConfig>,
     refresh_config: RefreshConfig,
 
     // Clients
@@ -113,9 +114,6 @@ pub struct App {
     // Keybinding resolver
     keybinding_resolver: KeybindingResolver,
 
-    // Auto-update hosts setting
-    auto_update_hosts: bool,
-
     // Current layout for mouse click detection
     current_layout: Option<AppLayout>,
 
@@ -125,11 +123,9 @@ pub struct App {
 
 impl App {
     pub async fn new(config_path: Option<&str>) -> Result<Self> {
-        // Load configuration
         let loader = ConfigLoader::new(config_path);
         let config = loader.load().unwrap_or_default();
 
-        // Validate configuration and collect warnings
         let validation_result = ConfigValidator::new(&config).validate();
         let validation_warnings: Vec<String> = validation_result
             .warnings
@@ -137,7 +133,6 @@ impl App {
             .map(|w| format!("Config warning: {}", w))
             .collect();
 
-        // Create unified cluster config from loaded settings
         let kubeconfig = if config.cluster.kubeconfig.is_empty() {
             None
         } else {
@@ -148,56 +143,45 @@ impl App {
         } else {
             Some(config.cluster.context.clone())
         };
-        let cluster_config = ClusterConfig::from(config.infrastructure.clone())
-            .with_hooks(config.hooks.clone())
-            .with_k8s_config(kubeconfig.clone(), context.clone());
-        let auto_update_hosts = config.infrastructure.auto_update_hosts;
+        let cluster_config = Arc::new(
+            ClusterConfig::from(config.infrastructure.clone())
+                .with_hooks(config.hooks.clone())
+                .with_k8s_config(kubeconfig.clone(), context.clone()),
+        );
 
-        // Initialize clients (silently fail)
+        let _ = crate::logging::init_logging(
+            &config.logging,
+            &config.infrastructure.cluster_name,
+        );
+
         let k8s_client = K8sClient::new(kubeconfig.as_deref(), context.as_deref())
             .await
             .ok();
 
-        // Initialize cluster manager
-        let cluster_manager = ClusterManager::new(Some(cluster_config.clone())).await.ok();
-
-        // Create message channel
+        let cluster_manager = ClusterManager::new(Arc::clone(&cluster_config)).await.ok();
         let (message_tx, message_rx) = mpsc::channel(100);
-
-        // Get theme from config
         let theme = config.theme;
 
-        // Build menu from config
         let mut menu = Menu::with_theme(theme);
         menu.build_from_config(&config);
 
-        // Initialize refresh scheduler and keybinding resolver
         let refresh_config = RefreshConfig::default();
         let scheduler = RefreshScheduler::new(&refresh_config);
         let keybinding_resolver = KeybindingResolver::from_config(config.keybindings.as_ref());
 
-        // Create output component and show validation warnings
         let mut output = Output::with_theme(theme);
         for warning in validation_warnings {
             output.add_warning(&warning);
         }
 
-        // Update help overlay with custom keybindings
         let mut help_overlay = HelpOverlay::with_theme(theme);
         help_overlay.update_from_resolver(&keybinding_resolver);
 
-        // Create command palette and load custom commands from config
         let mut command_palette = CommandPalette::with_theme(theme);
         command_palette.load_custom_commands(&config.commands);
 
-        // Note: forwarded_ports will be set when cluster status becomes Running
-
-        // Create action bar and set cluster name
         let mut action_bar = ActionBar::with_theme(theme);
-        let cluster_name = context.clone().or_else(|| {
-            // Fallback to container name if no context is set
-            Some(cluster_config.container_name.clone())
-        });
+        let cluster_name = context.clone().or_else(|| Some(cluster_config.container_name.clone()));
         action_bar.set_cluster_name(cluster_name);
 
         Ok(Self {
@@ -235,7 +219,6 @@ impl App {
             cancel_token: None,
             scheduler,
             keybinding_resolver,
-            auto_update_hosts,
             current_layout: None,
             menu_width_offset: 0,
         })

@@ -33,9 +33,6 @@ pub struct RefreshConfig {
     /// Timeout for ingress health check operations
     pub ingress_health_timeout: Duration,
 
-    /// Timeout for hosts update operations
-    pub hosts_update_timeout: Duration,
-
     /// Timeout for docker stats operations
     pub docker_stats_timeout: Duration,
 
@@ -60,7 +57,6 @@ impl Default for RefreshConfig {
             cluster_operation_timeout: Duration::from_secs(300), // 5 minutes
             ingress_timeout: Duration::from_secs(10),
             ingress_health_timeout: Duration::from_secs(30),
-            hosts_update_timeout: Duration::from_secs(30),
             docker_stats_timeout: Duration::from_secs(5),
             port_forward_timeout: Duration::from_secs(10),
             manual_hosts_timeout: Duration::from_secs(60),
@@ -88,7 +84,6 @@ impl RefreshConfig {
             cluster_operation_timeout: Duration::from_secs(10),
             ingress_timeout: Duration::from_secs(1),
             ingress_health_timeout: Duration::from_secs(2),
-            hosts_update_timeout: Duration::from_secs(2),
             docker_stats_timeout: Duration::from_secs(1),
             port_forward_timeout: Duration::from_secs(1),
             manual_hosts_timeout: Duration::from_secs(5),

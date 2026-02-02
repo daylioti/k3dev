@@ -1,172 +1,21 @@
-//! Configuration validation with comprehensive error and warning detection
+//! Validation check implementations
 //!
-//! This module provides detailed validation of the configuration file,
-//! detecting issues that range from hard errors to soft warnings.
+//! This module contains all the individual validation checks for configuration.
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
-use super::types::{CommandEntry, Config};
+use super::{ConfigValidator, ValidationWarning};
+use crate::config::types::CommandEntry;
 
-/// Result of configuration validation
-#[derive(Debug, Default)]
-pub struct ValidationResult {
-    #[allow(dead_code)]
-    pub errors: Vec<ValidationError>,
-    pub warnings: Vec<ValidationWarning>,
-}
-
-impl ValidationResult {
-    #[allow(dead_code)]
-    pub fn is_valid(&self) -> bool {
-        self.errors.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub fn has_warnings(&self) -> bool {
-        !self.warnings.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub fn add_error(&mut self, error: ValidationError) {
-        self.errors.push(error);
-    }
-
-    pub fn add_warning(&mut self, warning: ValidationWarning) {
-        self.warnings.push(warning);
-    }
-}
-
-/// Hard validation errors that should prevent loading
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum ValidationError {
-    MissingRequiredField {
-        path: String,
-        field: String,
-    },
-    InvalidValue {
-        path: String,
-        field: String,
-        reason: String,
-    },
-}
-
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ValidationError::MissingRequiredField { path, field } => {
-                write!(f, "{}: missing required field '{}'", path, field)
-            }
-            ValidationError::InvalidValue {
-                path,
-                field,
-                reason,
-            } => {
-                write!(f, "{}: invalid value for '{}': {}", path, field, reason)
-            }
-        }
-    }
-}
-
-/// Soft validation warnings shown on startup
-#[derive(Debug, Clone)]
-pub enum ValidationWarning {
-    UnusedPlaceholder {
-        name: String,
-    },
-    DuplicateCommandName {
-        group: String,
-        name: String,
-    },
-    SuspiciousPort {
-        port: u16,
-        reason: String,
-    },
-    EmptyCommandGroup {
-        name: String,
-    },
-    UnresolvedPlaceholder {
-        path: String,
-        placeholder: String,
-    },
-    DuplicateKeybinding {
-        key: String,
-        actions: Vec<String>,
-    },
-    InvalidKeybindingSyntax {
-        key: String,
-        reason: String,
-    },
-    PortConflict {
-        ports: Vec<u16>,
-        description: String,
-    },
-}
-
-impl std::fmt::Display for ValidationWarning {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ValidationWarning::UnusedPlaceholder { name } => {
-                write!(f, "Placeholder '@{}' is defined but never used", name)
-            }
-            ValidationWarning::DuplicateCommandName { group, name } => {
-                write!(f, "Duplicate command name '{}' in group '{}'", name, group)
-            }
-            ValidationWarning::SuspiciousPort { port, reason } => {
-                write!(f, "Port {}: {}", port, reason)
-            }
-            ValidationWarning::EmptyCommandGroup { name } => {
-                write!(f, "Command group '{}' has no commands", name)
-            }
-            ValidationWarning::UnresolvedPlaceholder { path, placeholder } => {
-                write!(f, "{}: unresolved placeholder '@{}'", path, placeholder)
-            }
-            ValidationWarning::DuplicateKeybinding { key, actions } => {
-                write!(
-                    f,
-                    "Key '{}' bound to multiple actions: {}",
-                    key,
-                    actions.join(", ")
-                )
-            }
-            ValidationWarning::InvalidKeybindingSyntax { key, reason } => {
-                write!(f, "Invalid keybinding '{}': {}", key, reason)
-            }
-            ValidationWarning::PortConflict { ports, description } => {
-                write!(f, "Port conflict {:?}: {}", ports, description)
-            }
-        }
-    }
-}
-
-/// Configuration validator
-pub struct ConfigValidator<'a> {
-    config: &'a Config,
-    result: ValidationResult,
-}
+/// Lazy-compiled regex for extracting @placeholder names
+static PLACEHOLDER_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"@(\w+)").expect("Invalid PLACEHOLDER_REGEX pattern"));
 
 impl<'a> ConfigValidator<'a> {
-    pub fn new(config: &'a Config) -> Self {
-        Self {
-            config,
-            result: ValidationResult::default(),
-        }
-    }
-
-    /// Run all validation checks
-    pub fn validate(mut self) -> ValidationResult {
-        self.check_port_conflicts();
-        self.check_duplicate_command_names();
-        self.check_unused_placeholders();
-        self.check_unresolved_placeholders();
-        self.check_empty_command_groups();
-        self.check_suspicious_ports();
-        self.check_keybinding_conflicts();
-        self.result
-    }
-
     /// Check for port conflicts between http/https/api ports
-    fn check_port_conflicts(&mut self) {
+    pub(super) fn check_port_conflicts(&mut self) {
         let infra = &self.config.infrastructure;
         let mut port_usage: HashMap<u16, Vec<&str>> = HashMap::new();
 
@@ -198,7 +47,7 @@ impl<'a> ConfigValidator<'a> {
     }
 
     /// Check for duplicate command names within the same group
-    fn check_duplicate_command_names(&mut self) {
+    pub(super) fn check_duplicate_command_names(&mut self) {
         for group in &self.config.commands {
             let mut seen_names: HashSet<String> = HashSet::new();
             self.check_duplicate_names_in_entries(&group.commands, &group.name, &mut seen_names);
@@ -236,7 +85,7 @@ impl<'a> ConfigValidator<'a> {
     }
 
     /// Check for placeholders defined but never used
-    fn check_unused_placeholders(&mut self) {
+    pub(super) fn check_unused_placeholders(&mut self) {
         if self.config.placeholders.is_empty() {
             return;
         }
@@ -278,8 +127,7 @@ impl<'a> ConfigValidator<'a> {
     }
 
     fn extract_placeholders(&self, s: &str, used: &mut HashSet<String>) {
-        let re = regex::Regex::new(r"@(\w+)").unwrap();
-        for cap in re.captures_iter(s) {
+        for cap in PLACEHOLDER_REGEX.captures_iter(s) {
             if let Some(name) = cap.get(1) {
                 used.insert(name.as_str().to_string());
             }
@@ -287,7 +135,7 @@ impl<'a> ConfigValidator<'a> {
     }
 
     /// Check for unresolved @placeholder patterns that don't match any definition
-    fn check_unresolved_placeholders(&mut self) {
+    pub(super) fn check_unresolved_placeholders(&mut self) {
         let defined: HashSet<&String> = self.config.placeholders.keys().collect();
 
         for group in &self.config.commands {
@@ -301,8 +149,6 @@ impl<'a> ConfigValidator<'a> {
         path: &str,
         defined: &HashSet<&String>,
     ) {
-        let re = regex::Regex::new(r"@(\w+)").unwrap();
-
         for entry in entries {
             let entry_path = format!("{}/{}", path, entry.name);
 
@@ -321,7 +167,7 @@ impl<'a> ConfigValidator<'a> {
             };
 
             for (field, value) in fields_to_check {
-                for cap in re.captures_iter(value) {
+                for cap in PLACEHOLDER_REGEX.captures_iter(value) {
                     if let Some(name) = cap.get(1) {
                         let placeholder_name = name.as_str().to_string();
                         // Skip if it's a defined placeholder or an input placeholder
@@ -351,7 +197,7 @@ impl<'a> ConfigValidator<'a> {
     }
 
     /// Check for empty command groups
-    fn check_empty_command_groups(&mut self) {
+    pub(super) fn check_empty_command_groups(&mut self) {
         for group in &self.config.commands {
             if group.commands.is_empty() {
                 self.result
@@ -363,7 +209,7 @@ impl<'a> ConfigValidator<'a> {
     }
 
     /// Check for suspicious port configurations
-    fn check_suspicious_ports(&mut self) {
+    pub(super) fn check_suspicious_ports(&mut self) {
         let infra = &self.config.infrastructure;
 
         // Check for privileged ports
@@ -414,7 +260,7 @@ impl<'a> ConfigValidator<'a> {
     }
 
     /// Check for keybinding conflicts (if keybindings are configured)
-    fn check_keybinding_conflicts(&mut self) {
+    pub(super) fn check_keybinding_conflicts(&mut self) {
         if let Some(keybindings) = &self.config.keybindings {
             let mut bindings: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -466,7 +312,10 @@ impl<'a> ConfigValidator<'a> {
         }
     }
 
-    fn validate_keybinding_syntax(&mut self, keybindings: &super::types::KeybindingsConfig) {
+    pub(super) fn validate_keybinding_syntax(
+        &mut self,
+        keybindings: &crate::config::types::KeybindingsConfig,
+    ) {
         let all_keys: Vec<(&str, Option<&String>)> = vec![
             ("quit", keybindings.quit.as_ref()),
             ("help", keybindings.help.as_ref()),
@@ -484,7 +333,7 @@ impl<'a> ConfigValidator<'a> {
 
         for (action, opt_key) in all_keys {
             if let Some(key) = opt_key {
-                if let Err(reason) = validate_key_syntax(key) {
+                if let Err(reason) = super::validate_key_syntax(key) {
                     self.result
                         .add_warning(ValidationWarning::InvalidKeybindingSyntax {
                             key: format!("{} = {}", action, key),
@@ -495,7 +344,7 @@ impl<'a> ConfigValidator<'a> {
         }
 
         for key in keybindings.custom.keys() {
-            if let Err(reason) = validate_key_syntax(key) {
+            if let Err(reason) = super::validate_key_syntax(key) {
                 self.result
                     .add_warning(ValidationWarning::InvalidKeybindingSyntax {
                         key: key.clone(),
@@ -503,93 +352,5 @@ impl<'a> ConfigValidator<'a> {
                     });
             }
         }
-    }
-}
-
-/// Validate keybinding syntax
-fn validate_key_syntax(key: &str) -> Result<(), String> {
-    let parts: Vec<&str> = key.split('+').collect();
-
-    if parts.is_empty() {
-        return Err("empty keybinding".to_string());
-    }
-
-    let valid_modifiers = ["ctrl", "alt", "shift"];
-    let valid_special_keys = [
-        "enter",
-        "esc",
-        "escape",
-        "tab",
-        "backspace",
-        "delete",
-        "insert",
-        "home",
-        "end",
-        "pageup",
-        "pagedown",
-        "up",
-        "down",
-        "left",
-        "right",
-        "f1",
-        "f2",
-        "f3",
-        "f4",
-        "f5",
-        "f6",
-        "f7",
-        "f8",
-        "f9",
-        "f10",
-        "f11",
-        "f12",
-        "space",
-    ];
-
-    for (i, part) in parts.iter().enumerate() {
-        let lower = part.to_lowercase();
-        let is_last = i == parts.len() - 1;
-
-        if is_last {
-            // Last part should be the actual key
-            if lower.len() == 1 {
-                // Single character is valid
-                continue;
-            }
-            if valid_special_keys.contains(&lower.as_str()) {
-                continue;
-            }
-            // Also allow modifiers as the key (e.g., just "Ctrl")
-            if valid_modifiers.contains(&lower.as_str()) {
-                continue;
-            }
-            return Err(format!("unknown key '{}'", part));
-        } else {
-            // Non-last parts should be modifiers
-            if !valid_modifiers.contains(&lower.as_str()) {
-                return Err(format!(
-                    "invalid modifier '{}'; expected ctrl, alt, or shift",
-                    part
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validate_key_syntax() {
-        assert!(validate_key_syntax("q").is_ok());
-        assert!(validate_key_syntax("Enter").is_ok());
-        assert!(validate_key_syntax("Ctrl+c").is_ok());
-        assert!(validate_key_syntax("Ctrl+Shift+p").is_ok());
-        assert!(validate_key_syntax("F1").is_ok());
-        assert!(validate_key_syntax("").is_err());
-        assert!(validate_key_syntax("Foo+c").is_err());
     }
 }

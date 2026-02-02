@@ -33,6 +33,10 @@ pub struct Config {
     /// Custom keybindings
     #[serde(default)]
     pub keybindings: Option<KeybindingsConfig>,
+
+    /// Logging configuration
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 /// Menu width configuration
@@ -262,6 +266,10 @@ pub struct K8sClientConfig {
 /// Infrastructure configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct InfrastructureConfig {
+    /// Cluster name - used to derive container and network names
+    #[serde(default = "default_cluster_name")]
+    pub cluster_name: String,
+
     /// Domain for the local cluster
     #[serde(default = "default_domain")]
     pub domain: String,
@@ -269,14 +277,6 @@ pub struct InfrastructureConfig {
     /// K3s version to use (e.g., "v1.33.4-k3s1")
     #[serde(default = "default_k3s_version")]
     pub k3s_version: String,
-
-    /// Container name for k3s
-    #[serde(default = "default_container_name")]
-    pub container_name: String,
-
-    /// Docker network name
-    #[serde(default = "default_network_name")]
-    pub network_name: String,
 
     /// Kubernetes API port
     #[serde(default = "default_api_port")]
@@ -294,30 +294,61 @@ pub struct InfrastructureConfig {
     #[serde(default)]
     pub additional_ports: Vec<String>,
 
-    /// Auto-update /etc/hosts with ingress entries
+    /// Speedup optimizations configuration
     #[serde(default)]
-    pub auto_update_hosts: bool,
+    pub speedup: SpeedupConfig,
+}
 
-    /// Deploy Traefik as ingress controller
+/// Speedup optimization configuration
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpeedupConfig {
+    /// Enable snapshot-based startup (faster subsequent starts)
+    /// Default: true - snapshots are enabled by default for optimal performance
     #[serde(default = "default_true")]
-    pub deploy_traefik: bool,
+    pub use_snapshot: bool,
+
+    /// Automatically cleanup old snapshots when creating new ones
+    /// Default: true - only keeps the current snapshot
+    #[serde(default = "default_true")]
+    pub snapshot_auto_cleanup: bool,
+}
+
+impl Default for SpeedupConfig {
+    fn default() -> Self {
+        Self {
+            use_snapshot: true,
+            snapshot_auto_cleanup: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl InfrastructureConfig {
+    /// Get container name derived from cluster name
+    pub fn container_name(&self) -> String {
+        format!("{}-server", self.cluster_name)
+    }
+
+    /// Get network name derived from cluster name
+    pub fn network_name(&self) -> String {
+        format!("{}-net", self.cluster_name)
+    }
 }
 
 // Default value functions
+fn default_cluster_name() -> String {
+    "k3dev".to_string()
+}
+
 fn default_domain() -> String {
     "local.k8s.dev".to_string()
 }
 
 fn default_k3s_version() -> String {
     "v1.33.4-k3s1".to_string()
-}
-
-fn default_container_name() -> String {
-    "k3s-server".to_string()
-}
-
-fn default_network_name() -> String {
-    "k8s-local-net".to_string()
 }
 
 fn default_api_port() -> u16 {
@@ -332,23 +363,17 @@ fn default_https_port() -> u16 {
     443
 }
 
-fn default_true() -> bool {
-    true
-}
-
 impl Default for InfrastructureConfig {
     fn default() -> Self {
         Self {
+            cluster_name: default_cluster_name(),
             domain: default_domain(),
             k3s_version: default_k3s_version(),
-            container_name: default_container_name(),
-            network_name: default_network_name(),
             api_port: default_api_port(),
             http_port: default_http_port(),
             https_port: default_https_port(),
             additional_ports: vec!["2345:2345".to_string(), "8309:8309".to_string()],
-            auto_update_hosts: false,
-            deploy_traefik: true,
+            speedup: SpeedupConfig::default(),
         }
     }
 }
@@ -409,4 +434,43 @@ pub struct TargetConfig {
 
     #[serde(default)]
     pub container: String,
+}
+
+/// Logging configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoggingConfig {
+    /// Enable file logging
+    #[serde(default = "default_logging_enabled")]
+    pub enabled: bool,
+
+    /// Log file path template (supports {cluster_name} placeholder)
+    /// Default: /tmp/k3dev-{cluster_name}.log
+    #[serde(default = "default_log_file")]
+    pub file: String,
+
+    /// Log level: trace, debug, info, warn, error
+    #[serde(default = "default_log_level")]
+    pub level: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_logging_enabled(),
+            file: default_log_file(),
+            level: default_log_level(),
+        }
+    }
+}
+
+fn default_logging_enabled() -> bool {
+    true
+}
+
+fn default_log_file() -> String {
+    "/tmp/k3dev-{cluster_name}.log".to_string()
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }

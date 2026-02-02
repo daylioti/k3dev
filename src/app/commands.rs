@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -194,11 +195,11 @@ impl App {
         let timeout_duration = self.refresh_config.cluster_operation_timeout;
         let (ctx, tx) = CommandContext::new(self.message_tx.clone(), timeout_duration);
 
-        let cluster_config = self.cluster_config.clone();
+        let cluster_config = Arc::clone(&self.cluster_config);
 
         tokio::spawn(async move {
             ctx.execute(move |_output_tx| async move {
-                let mut manager = ClusterManager::new(Some(cluster_config))
+                let mut manager = ClusterManager::new(cluster_config)
                     .await
                     .map_err(|e| format!("Manager error: {}", e))?;
 

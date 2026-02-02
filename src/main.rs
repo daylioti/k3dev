@@ -17,6 +17,7 @@ mod config;
 mod hooks;
 mod k8s;
 mod keybindings;
+mod logging;
 mod shell;
 mod ui;
 
@@ -51,17 +52,14 @@ async fn main() -> Result<()> {
         original_hook(panic_info);
     }));
 
-    // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create and run app
     let result = run_app(&mut terminal, cli.config.as_deref()).await;
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

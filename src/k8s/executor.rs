@@ -43,7 +43,6 @@ impl PodExecutor {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
 
         if let Some(name) = pod_name.filter(|s| !s.is_empty()) {
-            // Get pod by name
             let pod = pods.get(name).await?;
             return Ok(pod_to_info(&pod));
         }
@@ -100,21 +99,18 @@ impl PodExecutor {
         let mut stdout = String::new();
         let mut stderr = String::new();
 
-        // Read stdout
         if let Some(mut stdout_stream) = attached.stdout() {
             let mut buf = Vec::new();
             stdout_stream.read_to_end(&mut buf).await?;
             stdout = String::from_utf8_lossy(&buf).to_string();
         }
 
-        // Read stderr
         if let Some(mut stderr_stream) = attached.stderr() {
             let mut buf = Vec::new();
             stderr_stream.read_to_end(&mut buf).await?;
             stderr = String::from_utf8_lossy(&buf).to_string();
         }
 
-        // Get exit status
         let status = attached.take_status();
         let exit_code = if let Some(status_future) = status {
             match status_future.await {
@@ -164,7 +160,6 @@ impl PodExecutor {
         let tx1 = output_tx.clone();
         let tx2 = output_tx;
 
-        // Read stdout in background
         let stdout_handle = attached.stdout().map(|mut stdout_stream| {
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
@@ -189,7 +184,6 @@ impl PodExecutor {
             })
         });
 
-        // Read stderr in background
         let stderr_handle = attached.stderr().map(|mut stderr_stream| {
             tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
@@ -214,7 +208,6 @@ impl PodExecutor {
             })
         });
 
-        // Wait for completion or cancellation
         tokio::select! {
             _ = async {
                 if let Some(h) = stdout_handle { let _ = h.await; }
@@ -225,24 +218,15 @@ impl PodExecutor {
             }
         }
 
-        // Get exit status
         let status = attached.take_status();
-        let exit_code = if let Some(status_future) = status {
+        Ok(if let Some(status_future) = status {
             match status_future.await {
-                Some(status) => {
-                    if status.status.as_deref() == Some("Success") {
-                        0
-                    } else {
-                        1
-                    }
-                }
-                None => 1,
+                Some(status) if status.status.as_deref() == Some("Success") => 0,
+                _ => 1,
             }
         } else {
             0
-        };
-
-        Ok(exit_code)
+        })
     }
 
     /// Execute a simple command string

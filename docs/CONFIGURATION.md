@@ -35,32 +35,52 @@ K3s cluster infrastructure settings.
 
 ```yaml
 infrastructure:
+  cluster_name: "k3dev"
   domain: "myapp.local"
   k3s_version: "v1.33.4-k3s1"
-  container_name: "k3s-server"
-  network_name: "k8s-local-net"
   api_port: 6443
   http_port: 80
   https_port: 443
   additional_ports:
     - "2345:2345"
     - "8080:8080"
-  auto_update_hosts: false
-  deploy_traefik: true
+  speedup:
+    use_snapshot: true
+    snapshot_auto_cleanup: true
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `domain` | string | - | Domain for local cluster ingress |
+| `cluster_name` | string | `k3dev` | Cluster name (derives container name: `{cluster_name}-server`, network name: `{cluster_name}-net`) |
+| `domain` | string | `local.k8s.dev` | Domain for local cluster ingress |
 | `k3s_version` | string | `v1.33.4-k3s1` | K3s container image version |
-| `container_name` | string | `k3s-server` | Docker container name |
-| `network_name` | string | `k8s-local-net` | Docker network name |
 | `api_port` | integer | `6443` | Kubernetes API port |
 | `http_port` | integer | `80` | HTTP ingress port |
 | `https_port` | integer | `443` | HTTPS ingress port |
 | `additional_ports` | list | `[]` | Additional port mappings (host:container) |
-| `auto_update_hosts` | boolean | `false` | Auto-update /etc/hosts with ingress entries |
-| `deploy_traefik` | boolean | `true` | Deploy Traefik as ingress controller |
+| `speedup` | object | see below | Speedup optimization settings |
+
+#### infrastructure.speedup
+
+Cluster startup speedup optimizations. **Snapshots are enabled by default** for optimal performance.
+
+```yaml
+speedup:
+  use_snapshot: true           # DEFAULT: true (enabled)
+  snapshot_auto_cleanup: true  # DEFAULT: true (enabled)
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `use_snapshot` | boolean | `true` | Enable snapshot-based startup. First start creates a snapshot (~30-60s), subsequent starts use the snapshot (~5-10s). Snapshots are automatically invalidated when config changes. Set to `false` to disable. |
+| `snapshot_auto_cleanup` | boolean | `true` | Automatically delete old snapshots when creating new ones. Only the current snapshot is kept. |
+
+**Snapshot Behavior:**
+- **First start**: Normal initialization time (~30-60s). A snapshot is created after successful startup.
+- **Subsequent starts**: Much faster (~5-10s) by using the pre-initialized snapshot.
+- **Config changes**: If k3s version, domain, ports, or other critical settings change, the old snapshot is invalidated and a new one is created.
+- **Disk space**: Each snapshot is approximately 500MB. Old snapshots are automatically cleaned up when `snapshot_auto_cleanup` is enabled.
+- **Snapshot naming**: Snapshots are named `k3dev-snapshot-{version}-{config-hash}` (e.g., `k3dev-snapshot-v1-33-4-k3s1-a7b3c2d1`)
 
 ### ui
 
@@ -87,6 +107,47 @@ Available themes:
 - `fallout` - Green phosphor CRT aesthetic (default)
 - `cyberpunk` - Neon purple and cyan
 - `nord` - Calm arctic blue-gray palette
+
+### logging
+
+Application logging configuration. Logs are written to a file with timestamps including milliseconds.
+
+```yaml
+logging:
+  enabled: true
+  file: "/tmp/k3dev-{cluster_name}.log"
+  level: "info"
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | boolean | `true` | Enable file logging |
+| `file` | string | `/tmp/k3dev-{cluster_name}.log` | Log file path (supports `{cluster_name}` placeholder) |
+| `level` | string | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
+
+**Log Format:**
+
+Each log entry includes:
+- Timestamp with milliseconds (format: `2026-02-01 12:34:56.789`)
+- Log level (INFO, WARN, ERROR, DEBUG, TRACE)
+- Message content
+
+**Example log entries:**
+```
+2026-02-01 12:34:56.123 INFO Logging initialized cluster_name="k3dev" log_file="/tmp/k3dev-k3dev.log" level=INFO
+2026-02-01 12:34:57.456 INFO Cluster status changed old_status=Stopped new_status=Running
+2026-02-01 12:35:00.789 INFO Command completed exit_code=0
+2026-02-01 12:35:15.234 ERROR Failed to connect to cluster
+```
+
+**Placeholder Substitution:**
+
+The `{cluster_name}` placeholder in the log file path is automatically replaced with the actual cluster name from your configuration. This allows running multiple k3dev instances with different cluster names, each with its own log file.
+
+Example:
+- Configuration: `cluster_name: "myapp"`
+- Log file: `/tmp/k3dev-{cluster_name}.log`
+- Actual file: `/tmp/k3dev-myapp.log`
 
 ### placeholders
 
@@ -300,17 +361,14 @@ cluster:
   context: ""
 
 infrastructure:
+  cluster_name: "k3dev"
   domain: "myapp.local"
   k3s_version: "v1.33.4-k3s1"
-  container_name: "k3s-server"
-  network_name: "k8s-local-net"
   api_port: 6443
   http_port: 80
   https_port: 443
   additional_ports:
     - "2345:2345"
-  auto_update_hosts: false
-  deploy_traefik: true
 
 ui:
   menu_width: "30%"

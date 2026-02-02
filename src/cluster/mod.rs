@@ -18,6 +18,7 @@ pub use port_forward::PortForwardDetector;
 pub use traefik::TraefikManager;
 
 use anyhow::Result;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::config::HookEvent;
@@ -26,7 +27,7 @@ use crate::ui::components::OutputLine;
 
 /// Unified cluster manager that orchestrates all cluster operations
 pub struct ClusterManager {
-    config: ClusterConfig,
+    config: Arc<ClusterConfig>,
     k3s: Option<K3sManager>,
     traefik: TraefikManager,
     ingress: IngressManager,
@@ -34,14 +35,14 @@ pub struct ClusterManager {
 }
 
 impl ClusterManager {
-    pub async fn new(config: Option<ClusterConfig>) -> Result<Self> {
-        let config = config.unwrap_or_default();
+    /// Create a new ClusterManager from a shared config
+    pub async fn new(config: Arc<ClusterConfig>) -> Result<Self> {
         let platform = PlatformInfo::detect()?;
 
         // Try to create K3sManager, but don't fail if Docker isn't available yet
-        let k3s = K3sManager::new(config.clone()).await.ok();
+        let k3s = K3sManager::new(Arc::clone(&config)).await.ok();
 
-        let traefik = TraefikManager::new(config.clone());
+        let traefik = TraefikManager::new(Arc::clone(&config));
         // IngressManager without sudo - auto hosts update will try non-interactive
         let ingress = IngressManager::new();
 
@@ -73,10 +74,10 @@ impl ClusterManager {
     pub async fn start(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
         // Ensure K3sManager is available
         if self.k3s.is_none() {
-            self.k3s = K3sManager::new(self.config.clone()).await.ok();
+            self.k3s = K3sManager::new(Arc::clone(&self.config)).await.ok();
         }
 
-        // Start k3s cluster
+        // Start k3s cluster (core components only)
         if let Some(k3s) = &mut self.k3s {
             k3s.start(output_tx.clone()).await?;
         } else {
@@ -86,31 +87,45 @@ impl ClusterManager {
             return Ok(());
         }
 
-        // Deploy Traefik and update hosts (traefik needs &mut self, so run sequentially)
-        if self.config.deploy_traefik {
-            self.traefik.deploy(output_tx.clone()).await?;
-        }
+        // Deploy Traefik (ingress controller) in background for faster cluster availability
+        let _ = output_tx
+            .send(OutputLine::info(
+                "Deploying Traefik ingress in background (cluster is usable now)...",
+            ))
+            .await;
 
-        if self.config.auto_update_hosts {
-            // Try to update hosts without sudo - silently skip if no permission
-            // User can manually update with 'H' key if needed
-            if let Err(e) = self.ingress.update_hosts(Some(output_tx.clone())).await {
-                let _ = output_tx
-                    .send(OutputLine::warning(format!(
-                        "Could not update /etc/hosts (use 'H' key for manual update): {}",
-                        e
-                    )))
+        let mut traefik_manager = TraefikManager::new(Arc::clone(&self.config));
+        let config = Arc::clone(&self.config);
+        let tx = output_tx.clone();
+
+        // Spawn background task for Traefik deployment and post-deployment tasks
+        tokio::spawn(async move {
+            // Deploy Traefik
+            if let Err(e) = traefik_manager.deploy(tx.clone()).await {
+                let _ = tx
+                    .send(OutputLine::error(format!("Traefik deployment failed: {}", e)))
                     .await;
+                return;
             }
-        }
 
-        // Execute on_services_deployed hooks
-        if self.config.hooks.has_hooks() {
-            let hook_executor = HookExecutor::new(self.config.hooks.clone());
-            hook_executor
-                .execute_hooks(HookEvent::OnServicesDeployed, output_tx.clone())
-                .await?;
-        }
+            // Execute on_services_deployed hooks
+            if config.hooks.has_hooks() {
+                let hook_executor = HookExecutor::new(config.hooks.clone());
+                if let Err(e) = hook_executor
+                    .execute_hooks(HookEvent::OnServicesDeployed, tx.clone())
+                    .await
+                {
+                    let _ = tx
+                        .send(OutputLine::error(format!("Hook execution failed: {}", e)))
+                        .await;
+                    return;
+                }
+            }
+
+            let _ = tx
+                .send(OutputLine::success("All services deployed successfully!"))
+                .await;
+        });
 
         let _ = output_tx
             .send(OutputLine::success("Cluster started successfully!"))

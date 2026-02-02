@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::process::Command;
@@ -14,12 +15,12 @@ use crate::ui::components::OutputLine;
 /// Traefik ingress controller manager
 /// Configures K3s built-in Traefik with custom TLS certificates
 pub struct TraefikManager {
-    config: ClusterConfig,
+    config: Arc<ClusterConfig>,
     kube_ops: KubeOps,
 }
 
 impl TraefikManager {
-    pub fn new(config: ClusterConfig) -> Self {
+    pub fn new(config: Arc<ClusterConfig>) -> Self {
         Self {
             config,
             kube_ops: KubeOps::new(),

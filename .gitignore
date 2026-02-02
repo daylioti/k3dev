@@ -27,3 +27,5 @@ target/
 # Local config files (use k3dev.example.yml as template)
 k3dev.yml
 k3dev.yml.disabled
+
+test

@@ -48,11 +48,22 @@ impl App {
     pub(super) fn handle_message(&mut self, msg: AppMessage) {
         match msg {
             AppMessage::OutputLine(line) => {
+                // Log the output line based on its type
+                use crate::ui::components::OutputType;
+                match line.output_type {
+                    OutputType::Info => tracing::info!("{}", line.content),
+                    OutputType::Warning => tracing::warn!("{}", line.content),
+                    OutputType::Error => tracing::error!("{}", line.content),
+                    OutputType::Success => tracing::info!(event = "success", "{}", line.content),
+                }
+
                 // Forward to both output (internal buffer) and output_popup
                 self.output.add_line(line.clone());
                 self.output_popup.add_line(line);
             }
             AppMessage::CommandComplete(exit_code) => {
+                tracing::info!(exit_code = %exit_code, "Command completed");
+
                 self.is_executing = false;
                 self.status_bar.set_executing(false);
                 self.cancel_token = None;
@@ -82,6 +93,16 @@ impl App {
             AppMessage::ClusterStatusUpdate(status) => {
                 let was_running = matches!(self.cluster_status, ClusterStatus::Running);
                 let is_running = matches!(status, ClusterStatus::Running);
+
+                // Log cluster status changes
+                if self.cluster_status != status {
+                    tracing::info!(
+                        old_status = ?self.cluster_status,
+                        new_status = ?status,
+                        "Cluster status changed"
+                    );
+                }
+
                 self.cluster_status = status;
 
                 // If cluster just became running, trigger refresh and show ports
@@ -99,7 +120,6 @@ impl App {
                     self.menu.set_forwarded_ports(all_ports);
 
                     self.spawn_ingress_refresh();
-                    self.spawn_hosts_update();
                     self.spawn_missing_hosts_check();
                     self.spawn_port_forwards_check();
                     // Reset scheduler timers for tasks we just triggered
@@ -160,6 +180,7 @@ impl App {
                 self.menu.set_active_port_forwards(forwards);
             }
             AppMessage::Error(msg) => {
+                tracing::error!("{}", msg);
                 self.output.add_error(&msg);
             }
         }

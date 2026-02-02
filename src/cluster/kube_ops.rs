@@ -9,10 +9,20 @@ use kube::api::{Api, DynamicObject, ListParams, Patch, PatchParams, PostParams};
 use kube::config::Kubeconfig;
 use kube::discovery::ApiResource;
 use kube::{Client, Config};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::time::sleep;
+
+/// Lazy-compiled regex for extracting Host from Traefik IngressRoute match rules
+static HOST_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"Host\(`([^`]+)`\)").expect("Invalid HOST_REGEX pattern"));
+
+/// Lazy-compiled regex for extracting PathPrefix from Traefik IngressRoute match rules
+static PATH_PREFIX_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"PathPrefix\(`([^`]+)`\)").expect("Invalid PATH_PREFIX_REGEX pattern"));
 
 /// Lazy-initialized Kubernetes client
 /// Creates connection on first use, handles cases where cluster isn't ready yet
@@ -32,7 +42,8 @@ impl KubeOps {
             let client = Client::try_from(config)?;
             self.client = Some(client);
         }
-        Ok(self.client.as_ref().unwrap())
+        // Safety: client is guaranteed to be Some after the above initialization
+        Ok(self.client.as_ref().expect("client was just initialized"))
     }
 
     /// Try to get client, returns None if cluster not accessible
@@ -214,10 +225,7 @@ impl KubeOps {
         let client = self.client().await?;
         let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
 
-        // Delete existing secret if any (ignore errors)
         let _ = secrets.delete(name, &Default::default()).await;
-
-        // Wait a moment for deletion to complete
         sleep(Duration::from_millis(500)).await;
 
         let mut data = BTreeMap::new();
@@ -489,9 +497,6 @@ impl KubeOps {
 
         match ingressroutes.list(&ListParams::default()).await {
             Ok(list) => {
-                let host_regex = regex::Regex::new(r"Host\(`([^`]+)`\)").unwrap();
-                let path_regex = regex::Regex::new(r"PathPrefix\(`([^`]+)`\)").unwrap();
-
                 let mut result = Vec::new();
                 for ir in list.items {
                     if let Some(spec) = ir.data.get("spec") {
@@ -499,13 +504,13 @@ impl KubeOps {
                             for route in routes {
                                 if let Some(match_str) = route.get("match").and_then(|m| m.as_str())
                                 {
-                                    // Extract host
-                                    if let Some(cap) = host_regex.captures(match_str) {
+                                    // Extract host using lazy-compiled regex
+                                    if let Some(cap) = HOST_REGEX.captures(match_str) {
                                         if let Some(host) = cap.get(1) {
                                             let host = host.as_str().to_string();
 
-                                            // Extract path
-                                            let path = path_regex
+                                            // Extract path using lazy-compiled regex
+                                            let path = PATH_PREFIX_REGEX
                                                 .captures(match_str)
                                                 .and_then(|c| c.get(1))
                                                 .map(|p| p.as_str().to_string())
@@ -645,39 +650,28 @@ impl KubeOps {
         context_name: &str,
         user_name: &str,
     ) -> Result<()> {
-        // Get kubeconfig path
         let kubeconfig_path = dirs::home_dir()
             .ok_or_else(|| anyhow!("Cannot find home directory"))?
             .join(".kube")
             .join("config");
 
         if !kubeconfig_path.exists() {
-            return Ok(()); // Nothing to clean up
+            return Ok(());
         }
 
-        // Read the kubeconfig using kube crate's Kubeconfig struct
         let mut kubeconfig = Kubeconfig::read_from(&kubeconfig_path)?;
 
-        // Remove the cluster entry
         kubeconfig.clusters.retain(|c| c.name != cluster_name);
-
-        // Remove the context entry
         kubeconfig.contexts.retain(|c| c.name != context_name);
-
-        // Remove the user (auth_info) entry
         kubeconfig.auth_infos.retain(|a| a.name != user_name);
 
-        // If current-context was the one we removed, clear it
         if kubeconfig.current_context.as_deref() == Some(context_name) {
-            // Set to first available context or None
             kubeconfig.current_context = kubeconfig.contexts.first().map(|c| c.name.clone());
         }
 
-        // Write back the modified kubeconfig
         let yaml_content = serde_yaml::to_string(&kubeconfig)?;
         tokio::fs::write(&kubeconfig_path, yaml_content).await?;
 
-        // Set file permissions to 600 (owner read/write only)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

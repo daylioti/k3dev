@@ -57,7 +57,8 @@ impl KeyBinding {
         // For single uppercase characters, add SHIFT modifier
         // This allows "H" to be distinct from "h"
         if key_part.len() == 1 {
-            let c = key_part.chars().next().unwrap();
+            // Safety: len() == 1 guarantees at least one character
+            let c = key_part.chars().next().expect("non-empty string");
             if c.is_ascii_uppercase() {
                 modifiers |= KeyModifiers::SHIFT;
             }
@@ -71,7 +72,8 @@ impl KeyBinding {
     fn parse_key_code(s: &str) -> Result<KeyCode, String> {
         // Single character
         if s.len() == 1 {
-            let c = s.chars().next().unwrap();
+            // Safety: len() == 1 guarantees at least one character
+            let c = s.chars().next().expect("non-empty string");
             return Ok(KeyCode::Char(c.to_ascii_lowercase()));
         }
 

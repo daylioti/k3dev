@@ -18,9 +18,29 @@ A TUI for managing local K3s clusters in Docker.
 ## Requirements
 
 - Linux
-- Docker (running)
+- Docker (running, with cgroupfs driver)
 - kubectl
 - mkcert (optional, for HTTPS)
+
+### Docker Configuration
+
+k3dev runs K3s inside Docker containers. Docker must be configured to use the `cgroupfs` cgroup driver:
+
+```bash
+sudo mkdir -p /etc/docker
+sudo tee /etc/docker/daemon.json <<EOF
+{
+    "exec-opts": ["native.cgroupdriver=cgroupfs"]
+}
+EOF
+sudo systemctl restart docker
+```
+
+Verify with:
+```bash
+docker info | grep -i cgroup
+# Should show: Cgroup Driver: cgroupfs
+```
 
 ## Installation
 
@@ -77,12 +97,9 @@ cluster:
   context: ""
 
 infrastructure:
+  cluster_name: "k3dev"
   domain: "myapp.local"
   k3s_version: "v1.33.4-k3s1"
-  container_name: "k3s-server"
-  network_name: "k8s-local-net"
-  auto_update_hosts: false
-  deploy_traefik: true
 
 theme: fallout
 

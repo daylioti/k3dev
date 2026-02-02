@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::config::{HooksConfig, InfrastructureConfig};
+use crate::config::{HooksConfig, InfrastructureConfig, SpeedupConfig};
 
 /// Unified cluster configuration settings
 ///
@@ -29,9 +29,8 @@ pub struct ClusterConfig {
     pub https_port: u16,
     pub additional_ports: Vec<(u16, u16)>,
 
-    // Features
-    pub auto_update_hosts: bool,
-    pub deploy_traefik: bool,
+    // Speedup optimizations
+    pub speedup: SpeedupConfig,
 
     // Hooks
     pub hooks: HooksConfig,
@@ -57,19 +56,21 @@ impl From<InfrastructureConfig> for ClusterConfig {
             .filter_map(|s| parse_port_mapping(s))
             .collect();
 
+        let container_name = infra.container_name();
+        let network_name = infra.network_name();
+
         Self {
             kubeconfig: None,
             context: None,
             k3s_version: infra.k3s_version,
             domain: infra.domain,
-            container_name: infra.container_name,
-            network_name: infra.network_name,
+            container_name,
+            network_name,
             api_port: infra.api_port,
             http_port: infra.http_port,
             https_port: infra.https_port,
             additional_ports,
-            auto_update_hosts: infra.auto_update_hosts,
-            deploy_traefik: infra.deploy_traefik,
+            speedup: infra.speedup,
             hooks: HooksConfig::default(),
         }
     }
@@ -77,23 +78,26 @@ impl From<InfrastructureConfig> for ClusterConfig {
 
 impl Default for ClusterConfig {
     fn default() -> Self {
+        let infra = InfrastructureConfig::default();
+        let container_name = infra.container_name();
+        let network_name = infra.network_name();
+
         Self {
             kubeconfig: None,
             context: None,
 
-            k3s_version: "v1.33.4-k3s1".to_string(),
-            domain: "local.k8s.dev".to_string(),
+            k3s_version: infra.k3s_version,
+            domain: infra.domain,
 
-            container_name: "k3s-server".to_string(),
-            network_name: "k8s-local-net".to_string(),
+            container_name,
+            network_name,
 
-            api_port: 6443,
-            http_port: 80,
-            https_port: 443,
+            api_port: infra.api_port,
+            http_port: infra.http_port,
+            https_port: infra.https_port,
             additional_ports: vec![(2345, 2345), (8309, 8309)],
 
-            auto_update_hosts: false,
-            deploy_traefik: true,
+            speedup: SpeedupConfig::default(),
 
             hooks: HooksConfig::default(),
         }

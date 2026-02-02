@@ -144,6 +144,23 @@ main() {
     fi
 
     install
+
+    # Post-install checks
+    echo ""
+    if ! command -v docker >/dev/null 2>&1; then
+        warn "Docker is not installed. k3dev requires Docker to run."
+    elif ! docker info >/dev/null 2>&1; then
+        warn "Docker is not running or not accessible."
+    else
+        cgroup_driver=$(docker info 2>/dev/null | grep -i "Cgroup Driver:" | awk '{print $3}')
+        if [ "$cgroup_driver" != "cgroupfs" ]; then
+            warn "Docker cgroup driver is '$cgroup_driver', but 'cgroupfs' is required."
+            echo ""
+            echo "  Configure Docker with:"
+            echo "    sudo tee /etc/docker/daemon.json <<< '{\"exec-opts\": [\"native.cgroupdriver=cgroupfs\"]}'"
+            echo "    sudo systemctl restart docker"
+        fi
+    fi
 }
 
 main "$@"

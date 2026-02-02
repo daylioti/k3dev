@@ -1,10 +1,19 @@
 use anyhow::{anyhow, Context, Result};
+use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::types::{CommandEntry, CommandGroup, Config, ExecConfig};
+
+/// Lazy-compiled regex for matching @placeholder patterns (without capture)
+static PLACEHOLDER_CHECK_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"@\w+").expect("Invalid PLACEHOLDER_CHECK_REGEX pattern"));
+
+/// Lazy-compiled regex for extracting @placeholder names (with capture)
+static PLACEHOLDER_EXTRACT_REGEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"@(\w+)").expect("Invalid PLACEHOLDER_EXTRACT_REGEX pattern"));
 
 /// Configuration file loader
 pub struct ConfigLoader {
@@ -28,10 +37,7 @@ impl ConfigLoader {
         let mut config: Config = serde_yaml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
-        // Resolve placeholders throughout the config
         self.resolve_placeholders(&mut config);
-
-        // Validate the configuration
         self.validate(&config)?;
 
         Ok(config)
@@ -199,17 +205,15 @@ pub fn expand_home(path: &Path) -> Result<PathBuf> {
 
 /// Check if a string contains unresolved @placeholder patterns
 pub fn has_input_placeholders(s: &str) -> bool {
-    let re = Regex::new(r"@\w+").unwrap();
-    re.is_match(s)
+    PLACEHOLDER_CHECK_REGEX.is_match(s)
 }
 
 /// Extract all @placeholder names from a string
 pub fn get_input_placeholders(s: &str) -> Vec<String> {
-    let re = Regex::new(r"@(\w+)").unwrap();
     let mut placeholders = Vec::new();
     let mut seen = HashSet::new();
 
-    for cap in re.captures_iter(s) {
+    for cap in PLACEHOLDER_EXTRACT_REGEX.captures_iter(s) {
         if let Some(name) = cap.get(1) {
             let name_str = name.as_str().to_string();
             if !seen.contains(&name_str) {

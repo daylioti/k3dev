@@ -17,24 +17,55 @@ cluster:
 # Infrastructure Settings
 # =============================================================================
 infrastructure:
+  # Cluster name (used to derive container and network names)
+  # Container name will be: {cluster_name}-server
+  # Network name will be: {cluster_name}-net
+  cluster_name: "k3dev"
+
   # Domain for local cluster ingresses
   domain: "myapp.local"
 
   # K3s version
   k3s_version: "v1.33.4-k3s1"
 
-  # Container settings
-  container_name: "k3s-server"
-  network_name: "k8s-local-net"
-
   # Ports
   api_port: 6443
   http_port: 80
   https_port: 443
 
-  # Feature flags
-  auto_update_hosts: false   # Auto-update /etc/hosts with ingress entries
-  deploy_traefik: true       # Deploy Traefik as ingress controller
+  # =============================================================================
+  # Speedup Optimizations (optional)
+  # =============================================================================
+  # Snapshots are ENABLED BY DEFAULT for optimal performance.
+  # Uncomment and set to 'false' to disable if needed.
+  #
+  # speedup:
+  #   # Enable snapshot-based startup for faster subsequent starts
+  #   # When enabled (default):
+  #   # - First start: Normal speed (~30-60s), creates a snapshot
+  #   # - Subsequent starts: Much faster (~5-10s), uses the snapshot
+  #   #
+  #   # Snapshots are automatically invalidated when config changes (k3s version,
+  #   # domain, ports, etc.), ensuring consistency across cluster restarts.
+  #   use_snapshot: true  # DEFAULT: true
+  #
+  #   # Automatically cleanup old snapshots when creating new ones
+  #   # Only keeps the snapshot matching current config
+  #   snapshot_auto_cleanup: true  # DEFAULT: true
+
+# =============================================================================
+# Logging Configuration (optional)
+# =============================================================================
+logging:
+  # Enable file logging
+  enabled: true
+
+  # Log file path (supports {cluster_name} placeholder)
+  # The {cluster_name} placeholder is replaced with the actual cluster name
+  file: "/tmp/k3dev-{cluster_name}.log"
+
+  # Log level: trace, debug, info, warn, error
+  level: "info"
 
 # =============================================================================
 # Placeholders (optional)
