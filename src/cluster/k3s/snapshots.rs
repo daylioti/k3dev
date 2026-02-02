@@ -64,10 +64,7 @@ impl K3sManager {
     }
 
     /// Create a snapshot of the current running cluster
-    pub(super) async fn create_snapshot(
-        &self,
-        output_tx: &mpsc::Sender<OutputLine>,
-    ) -> Result<()> {
+    pub(super) async fn create_snapshot(&self, output_tx: &mpsc::Sender<OutputLine>) -> Result<()> {
         let snapshot_image = self.get_snapshot_image_name();
 
         let _ = output_tx

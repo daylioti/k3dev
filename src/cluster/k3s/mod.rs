@@ -172,7 +172,10 @@ impl K3sManager {
             } else {
                 // Cleanup old snapshots if enabled
                 if self.config.speedup.snapshot_auto_cleanup {
-                    if let Err(e) = self.cleanup_old_snapshots(&snapshot_image, &output_tx).await {
+                    if let Err(e) = self
+                        .cleanup_old_snapshots(&snapshot_image, &output_tx)
+                        .await
+                    {
                         tracing::warn!(error = %e, "Snapshot cleanup failed");
                     }
                 }
@@ -452,33 +455,32 @@ impl K3sManager {
         let _ = output_tx
             .send(OutputLine::info("Cleaning up cluster resources..."))
             .await;
-        let (network_result, rancher_volume_result, pv_volume_result, kubeconfig_result) =
-            tokio::join!(
-                async {
-                    let _ = output_tx
-                        .send(OutputLine::info("Removing Docker network..."))
-                        .await;
-                    self.docker.remove_network(&self.config.network_name).await
-                },
-                async {
-                    let _ = output_tx
-                        .send(OutputLine::info("Removing rancher data volume..."))
-                        .await;
-                    self.docker.remove_volume(Self::RANCHER_VOLUME_NAME).await
-                },
-                async {
-                    let _ = output_tx
-                        .send(OutputLine::info("Removing PV storage volume..."))
-                        .await;
-                    self.docker.remove_volume(Self::LOCAL_PV_VOLUME_NAME).await
-                },
-                async {
-                    let _ = output_tx
-                        .send(OutputLine::info("Cleaning kubeconfig..."))
-                        .await;
-                    self.cleanup_kubeconfig().await
-                },
-            );
+        let (network_result, rancher_volume_result, pv_volume_result, kubeconfig_result) = tokio::join!(
+            async {
+                let _ = output_tx
+                    .send(OutputLine::info("Removing Docker network..."))
+                    .await;
+                self.docker.remove_network(&self.config.network_name).await
+            },
+            async {
+                let _ = output_tx
+                    .send(OutputLine::info("Removing rancher data volume..."))
+                    .await;
+                self.docker.remove_volume(Self::RANCHER_VOLUME_NAME).await
+            },
+            async {
+                let _ = output_tx
+                    .send(OutputLine::info("Removing PV storage volume..."))
+                    .await;
+                self.docker.remove_volume(Self::LOCAL_PV_VOLUME_NAME).await
+            },
+            async {
+                let _ = output_tx
+                    .send(OutputLine::info("Cleaning kubeconfig..."))
+                    .await;
+                self.cleanup_kubeconfig().await
+            },
+        );
         // Propagate errors from cleanup operations
         network_result?;
         rancher_volume_result?;

@@ -350,7 +350,12 @@ impl DockerManager {
         self.client
             .commit_container(options, config)
             .await
-            .with_context(|| format!("Failed to commit container {} to image {}", container, image))?;
+            .with_context(|| {
+                format!(
+                    "Failed to commit container {} to image {}",
+                    container, image
+                )
+            })?;
 
         tracing::info!(container = %container, image = %image, "Container committed to image");
         Ok(())

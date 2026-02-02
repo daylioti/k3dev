@@ -110,7 +110,6 @@ impl App {
         });
     }
 
-
     pub(super) fn spawn_resource_stats_check(&self) {
         if !matches!(self.cluster_status, ClusterStatus::Running) {
             let message_tx = self.message_tx.clone();

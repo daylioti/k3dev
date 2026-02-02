@@ -206,9 +206,7 @@ impl K3sManager {
         let tx2 = output_tx.clone();
 
         let coredns_task = tokio::spawn(async move {
-            let _ = tx1
-                .send(OutputLine::info("Waiting for coredns..."))
-                .await;
+            let _ = tx1.send(OutputLine::info("Waiting for coredns...")).await;
             let mut kube_ops = KubeOps::new();
             match kube_ops
                 .wait_for_deployment_ready("coredns", "kube-system", 60)

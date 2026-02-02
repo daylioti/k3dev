@@ -103,7 +103,10 @@ impl ClusterManager {
             // Deploy Traefik
             if let Err(e) = traefik_manager.deploy(tx.clone()).await {
                 let _ = tx
-                    .send(OutputLine::error(format!("Traefik deployment failed: {}", e)))
+                    .send(OutputLine::error(format!(
+                        "Traefik deployment failed: {}",
+                        e
+                    )))
                     .await;
                 return;
             }

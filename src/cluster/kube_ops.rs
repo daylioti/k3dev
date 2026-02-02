@@ -21,8 +21,9 @@ static HOST_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"Host\(`([^`]+)`\)").expect("Invalid HOST_REGEX pattern"));
 
 /// Lazy-compiled regex for extracting PathPrefix from Traefik IngressRoute match rules
-static PATH_PREFIX_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"PathPrefix\(`([^`]+)`\)").expect("Invalid PATH_PREFIX_REGEX pattern"));
+static PATH_PREFIX_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"PathPrefix\(`([^`]+)`\)").expect("Invalid PATH_PREFIX_REGEX pattern")
+});
 
 /// Lazy-initialized Kubernetes client
 /// Creates connection on first use, handles cases where cluster isn't ready yet

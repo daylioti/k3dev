@@ -149,10 +149,7 @@ impl App {
                 .with_k8s_config(kubeconfig.clone(), context.clone()),
         );
 
-        let _ = crate::logging::init_logging(
-            &config.logging,
-            &config.infrastructure.cluster_name,
-        );
+        let _ = crate::logging::init_logging(&config.logging, &config.infrastructure.cluster_name);
 
         let k8s_client = K8sClient::new(kubeconfig.as_deref(), context.as_deref())
             .await
@@ -181,7 +178,9 @@ impl App {
         command_palette.load_custom_commands(&config.commands);
 
         let mut action_bar = ActionBar::with_theme(theme);
-        let cluster_name = context.clone().or_else(|| Some(cluster_config.container_name.clone()));
+        let cluster_name = context
+            .clone()
+            .or_else(|| Some(cluster_config.container_name.clone()));
         action_bar.set_cluster_name(cluster_name);
 
         Ok(Self {
