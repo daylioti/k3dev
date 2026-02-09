@@ -183,8 +183,7 @@ impl App {
                         p.containers
                             .iter()
                             .filter(|c| {
-                                c.reason == "ContainerCreating"
-                                    || c.reason == "PodInitializing"
+                                c.reason == "ContainerCreating" || c.reason == "PodInitializing"
                             })
                             .map(|c| c.image.clone())
                     })
@@ -198,7 +197,10 @@ impl App {
                 // Merge monotonically: never let downloaded/total bytes decrease
                 for (image, new_progress) in progress {
                     let entry = self.pull_progress_cache.entry(image).or_insert_with(|| {
-                        ContainerPullProgress::new(&new_progress.container_name, &new_progress.image)
+                        ContainerPullProgress::new(
+                            &new_progress.container_name,
+                            &new_progress.image,
+                        )
                     });
                     if new_progress.downloaded_bytes >= entry.downloaded_bytes {
                         entry.downloaded_bytes = new_progress.downloaded_bytes;
@@ -209,7 +211,8 @@ impl App {
                     // Recompute percent from monotonic values
                     if entry.total_bytes > 0 {
                         entry.progress_percent =
-                            (entry.downloaded_bytes as f64 / entry.total_bytes as f64 * 100.0).min(100.0);
+                            (entry.downloaded_bytes as f64 / entry.total_bytes as f64 * 100.0)
+                                .min(100.0);
                         entry.tracking_available = true;
                     }
                     // Pass through phase and layer counts
@@ -275,16 +278,17 @@ impl App {
                 .filter(|c| c.reason == "ContainerCreating" || c.reason == "PodInitializing")
                 .collect();
 
-            let failed_container = pending
-                .containers
-                .iter()
-                .find(|c| {
-                    matches!(
-                        c.reason.as_str(),
-                        "ImagePullBackOff" | "ErrImagePull" | "InvalidImageName"
-                            | "CrashLoopBackOff" | "Error" | "Failed"
-                    )
-                });
+            let failed_container = pending.containers.iter().find(|c| {
+                matches!(
+                    c.reason.as_str(),
+                    "ImagePullBackOff"
+                        | "ErrImagePull"
+                        | "InvalidImageName"
+                        | "CrashLoopBackOff"
+                        | "Error"
+                        | "Failed"
+                )
+            });
 
             // Determine state based on container waiting reasons
             let state = if let Some(failed) = failed_container {

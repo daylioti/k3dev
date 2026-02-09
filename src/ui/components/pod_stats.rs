@@ -431,15 +431,21 @@ impl PodStats {
                         self.styles.success_text
                     };
 
-                    let cpu_label =
-                        format_cpu_display(pod.cpu_percent, pod.cpu_limit_millicores, has_cpu_limit);
+                    let cpu_label = format_cpu_display(
+                        pod.cpu_percent,
+                        pod.cpu_limit_millicores,
+                        has_cpu_limit,
+                    );
                     let cpu_filled_style = Style::default()
                         .fg(self.styles.palette.background)
                         .bg(cpu_base_style.fg.unwrap_or(ratatui::style::Color::Green));
                     let cpu_empty_style = self.styles.muted_text;
 
-                    let mem_label =
-                        format_memory_display(pod.memory_used_mb, pod.memory_limit_mb, has_mem_limit);
+                    let mem_label = format_memory_display(
+                        pod.memory_used_mb,
+                        pod.memory_limit_mb,
+                        has_mem_limit,
+                    );
                     let mem_filled_style = Style::default()
                         .fg(self.styles.palette.background)
                         .bg(mem_base_style.fg.unwrap_or(ratatui::style::Color::Green));
@@ -504,9 +510,11 @@ impl PodStats {
                         .saturating_sub(prefix_width)
                         .saturating_sub(1); // scrollbar
 
-                    let filled_style = Style::default()
-                        .fg(self.styles.palette.background)
-                        .bg(self.styles.info_text.fg.unwrap_or(ratatui::style::Color::Cyan));
+                    let filled_style = Style::default().fg(self.styles.palette.background).bg(self
+                        .styles
+                        .info_text
+                        .fg
+                        .unwrap_or(ratatui::style::Color::Cyan));
 
                     let cursor_span = Span::styled(
                         cursor,
@@ -527,9 +535,17 @@ impl PodStats {
 
                     if containers.is_empty() {
                         let bar_w = full_bar_width.saturating_sub(elapsed_display.len());
-                        let mut spans = vec![cursor_span, name_span, Span::styled(" ", self.styles.muted_text)];
+                        let mut spans = vec![
+                            cursor_span,
+                            name_span,
+                            Span::styled(" ", self.styles.muted_text),
+                        ];
                         spans.extend(progress_bar_with_label(
-                            0.0, "pulling...", bar_w, filled_style, self.styles.muted_text,
+                            0.0,
+                            "pulling...",
+                            bar_w,
+                            filled_style,
+                            self.styles.muted_text,
                         ));
                         spans.push(Span::styled(elapsed_display, self.styles.muted_text));
                         vec![Line::from(spans)]
@@ -540,9 +556,16 @@ impl PodStats {
                             let is_last = i == containers.len() - 1;
 
                             let mut spans: Vec<Span> = if is_first {
-                                vec![cursor_span.clone(), name_span.clone(), Span::styled(" ", self.styles.muted_text)]
+                                vec![
+                                    cursor_span.clone(),
+                                    name_span.clone(),
+                                    Span::styled(" ", self.styles.muted_text),
+                                ]
                             } else {
-                                vec![Span::styled(" ".repeat(prefix_width), self.styles.muted_text)]
+                                vec![Span::styled(
+                                    " ".repeat(prefix_width),
+                                    self.styles.muted_text,
+                                )]
                             };
 
                             let bar_w = if is_first {
@@ -553,9 +576,11 @@ impl PodStats {
 
                             // Use yellow bar fill for extracting phase
                             let bar_fill = if container.phase == PullPhase::Extracting {
-                                Style::default()
-                                    .fg(self.styles.palette.background)
-                                    .bg(self.styles.warning_text.fg.unwrap_or(ratatui::style::Color::Yellow))
+                                Style::default().fg(self.styles.palette.background).bg(self
+                                    .styles
+                                    .warning_text
+                                    .fg
+                                    .unwrap_or(ratatui::style::Color::Yellow))
                             } else {
                                 filled_style
                             };
@@ -571,16 +596,31 @@ impl PodStats {
                                     format!("{:.0}%", percent)
                                 };
                                 spans.extend(progress_bar_with_label(
-                                    percent, &label, bar_w, bar_fill, self.styles.muted_text,
+                                    percent,
+                                    &label,
+                                    bar_w,
+                                    bar_fill,
+                                    self.styles.muted_text,
                                 ));
                             } else if container.layers_total > 0 {
-                                let label = format!("{}/{} layers", container.layers_done, container.layers_total);
+                                let label = format!(
+                                    "{}/{} layers",
+                                    container.layers_done, container.layers_total
+                                );
                                 spans.extend(progress_bar_with_label(
-                                    0.0, &label, bar_w, bar_fill, self.styles.muted_text,
+                                    0.0,
+                                    &label,
+                                    bar_w,
+                                    bar_fill,
+                                    self.styles.muted_text,
                                 ));
                             } else {
                                 spans.extend(progress_bar_with_label(
-                                    0.0, "pulling...", bar_w, bar_fill, self.styles.muted_text,
+                                    0.0,
+                                    "pulling...",
+                                    bar_w,
+                                    bar_fill,
+                                    self.styles.muted_text,
                                 ));
                             }
 
@@ -675,8 +715,7 @@ impl PodStats {
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
                 .end_symbol(Some("↓"));
-            let mut scrollbar_state =
-                ScrollbarState::new(total_lines).position(self.scroll_offset);
+            let mut scrollbar_state = ScrollbarState::new(total_lines).position(self.scroll_offset);
             frame.render_stateful_widget(scrollbar, inner, &mut scrollbar_state);
         }
     }
@@ -718,7 +757,9 @@ impl Default for PodStats {
 /// Pod hashes: 5 lowercase alphanumeric (e.g., "nzsf5")
 fn is_k8s_hash(s: &str) -> bool {
     let len = s.len();
-    (len == 5 || (8..=10).contains(&len)) && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    (len == 5 || (8..=10).contains(&len))
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 /// Truncate a string to a maximum length, adding ellipsis if needed
@@ -885,10 +926,7 @@ fn format_elapsed(duration: chrono::Duration) -> String {
 #[allow(dead_code)]
 fn extract_short_image(image: &str) -> String {
     // Remove registry prefix (everything before the last '/')
-    let short = image
-        .rsplit('/')
-        .next()
-        .unwrap_or(image);
+    let short = image.rsplit('/').next().unwrap_or(image);
 
     // If still too long, truncate the tag
     if short.len() > 20 {

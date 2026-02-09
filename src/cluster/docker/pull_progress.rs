@@ -633,11 +633,7 @@ pub async fn monitor_image_pull(
     // Pre-fetch manifest with 5s timeout, caching, and concurrency limit
     let manifest_info = {
         let _permit = manifest_semaphore.acquire().await.ok();
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            fetch_manifest_cached(&image_ref),
-        )
-        .await
+        match tokio::time::timeout(Duration::from_secs(5), fetch_manifest_cached(&image_ref)).await
         {
             Ok(result) => {
                 if let Some(ref info) = result {
@@ -700,9 +696,7 @@ pub async fn monitor_image_pull(
             .with_progress(0, info.total_bytes);
         let mut map = HashMap::new();
         map.insert(image.clone(), progress);
-        let _ = message_tx
-            .send(AppMessage::PullProgressUpdated(map))
-            .await;
+        let _ = message_tx.send(AppMessage::PullProgressUpdated(map)).await;
     }
 
     while let Some(result) = stream.next().await {
@@ -799,9 +793,7 @@ pub async fn monitor_image_pull(
 
                 let mut map = HashMap::new();
                 map.insert(image.clone(), final_progress);
-                let _ = message_tx
-                    .send(AppMessage::PullProgressUpdated(map))
-                    .await;
+                let _ = message_tx.send(AppMessage::PullProgressUpdated(map)).await;
                 last_send = Instant::now();
             }
         }
@@ -890,8 +882,7 @@ fn aggregate_progress(
         total_bytes: effective_total,
         downloaded_bytes: stream_current.min(effective_total),
         progress_percent: if effective_total > 0 {
-            (stream_current.min(effective_total) as f64 / effective_total as f64 * 100.0)
-                .min(100.0)
+            (stream_current.min(effective_total) as f64 / effective_total as f64 * 100.0).min(100.0)
         } else {
             0.0
         },
@@ -1211,7 +1202,10 @@ mod tests {
             r#"realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/nginx:pull""#,
         );
         assert_eq!(params.len(), 3);
-        assert_eq!(params[0], ("realm", "https://auth.docker.io/token".to_string()));
+        assert_eq!(
+            params[0],
+            ("realm", "https://auth.docker.io/token".to_string())
+        );
         assert_eq!(params[1], ("service", "registry.docker.io".to_string()));
         assert_eq!(
             params[2],
@@ -1306,7 +1300,7 @@ mod tests {
 
     #[test]
     fn test_manifest_list_no_matching_platform() {
-        let manifests = vec![ManifestListEntry {
+        let manifests = [ManifestListEntry {
             digest: Some("sha256:s390xdigest".to_string()),
             platform: Some(ManifestPlatform {
                 architecture: Some("s390x".to_string()),
@@ -1319,8 +1313,7 @@ mod tests {
             m.platform
                 .as_ref()
                 .map(|p| {
-                    p.architecture.as_deref() == Some(target)
-                        && p.os.as_deref() == Some("linux")
+                    p.architecture.as_deref() == Some(target) && p.os.as_deref() == Some("linux")
                 })
                 .unwrap_or(false)
         });
@@ -1329,7 +1322,7 @@ mod tests {
 
     #[test]
     fn test_manifest_list_windows_platform_skipped() {
-        let manifests = vec![ManifestListEntry {
+        let manifests = [ManifestListEntry {
             digest: Some("sha256:windowsdigest".to_string()),
             platform: Some(ManifestPlatform {
                 architecture: Some("amd64".to_string()),
@@ -1342,8 +1335,7 @@ mod tests {
             m.platform
                 .as_ref()
                 .map(|p| {
-                    p.architecture.as_deref() == Some(target)
-                        && p.os.as_deref() == Some("linux")
+                    p.architecture.as_deref() == Some(target) && p.os.as_deref() == Some("linux")
                 })
                 .unwrap_or(false)
         });
@@ -1352,7 +1344,7 @@ mod tests {
 
     #[test]
     fn test_manifest_list_missing_platform_field() {
-        let manifests = vec![ManifestListEntry {
+        let manifests = [ManifestListEntry {
             digest: Some("sha256:noplatform".to_string()),
             platform: None,
         }];
@@ -1362,8 +1354,7 @@ mod tests {
             m.platform
                 .as_ref()
                 .map(|p| {
-                    p.architecture.as_deref() == Some(target)
-                        && p.os.as_deref() == Some("linux")
+                    p.architecture.as_deref() == Some(target) && p.os.as_deref() == Some("linux")
                 })
                 .unwrap_or(false)
         });
@@ -1375,10 +1366,7 @@ mod tests {
     #[test]
     fn test_image_ref_cache_key() {
         let img = ImageRef::parse("nginx:1.25");
-        assert_eq!(
-            img.cache_key(),
-            "registry-1.docker.io/library/nginx/1.25"
-        );
+        assert_eq!(img.cache_key(), "registry-1.docker.io/library/nginx/1.25");
 
         let img2 = ImageRef::parse("ghcr.io/owner/repo:v2");
         assert_eq!(img2.cache_key(), "ghcr.io/owner/repo/v2");

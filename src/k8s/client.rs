@@ -52,7 +52,7 @@ pub struct ContainerWaitingInfo {
     #[allow(dead_code)]
     pub name: String,
     pub image: String,
-    pub reason: String,  // "ContainerCreating", "ImagePullBackOff", "ErrImagePull"
+    pub reason: String, // "ContainerCreating", "ImagePullBackOff", "ErrImagePull"
     #[allow(dead_code)]
     pub message: Option<String>,
 }
@@ -515,8 +515,10 @@ impl K8sClient {
                     for cs in all_statuses {
                         if let Some(state) = &cs.state {
                             if let Some(waiting) = &state.waiting {
-                                let reason =
-                                    waiting.reason.clone().unwrap_or_else(|| "Unknown".to_string());
+                                let reason = waiting
+                                    .reason
+                                    .clone()
+                                    .unwrap_or_else(|| "Unknown".to_string());
                                 let message = waiting.message.clone();
                                 let image = container_images
                                     .get(&cs.name)

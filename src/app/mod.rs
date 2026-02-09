@@ -22,12 +22,11 @@ use bollard::Docker;
 use crate::cluster::{
     ClusterConfig, ClusterManager, ClusterStatus, ContainerPullProgress, ContainerStats,
 };
-use crate::k8s::PendingPodInfo;
-use std::collections::{HashMap, HashSet};
 use crate::config::{
     Config, ConfigLoader, ConfigValidator, RefreshConfig, RefreshScheduler, RefreshTask,
 };
 use crate::k8s::K8sClient;
+use crate::k8s::PendingPodInfo;
 use crate::keybindings::KeybindingResolver;
 use crate::ui::components::{
     ActionBar, ClusterAction, ClusterStatus as UiClusterStatus, CommandPalette, ConfirmPopup,
@@ -35,6 +34,7 @@ use crate::ui::components::{
     StatusBar,
 };
 use crate::ui::{AppLayout, Styles};
+use std::collections::{HashMap, HashSet};
 
 pub use messages::AppMessage;
 

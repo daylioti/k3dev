@@ -450,7 +450,13 @@ impl K3sManager {
             .send(OutputLine::info("Cleaning up cluster resources..."))
             .await;
 
-        let (pods_result, network_result, rancher_volume_result, pv_volume_result, kubeconfig_result) = tokio::join!(
+        let (
+            pods_result,
+            network_result,
+            rancher_volume_result,
+            pv_volume_result,
+            kubeconfig_result,
+        ) = tokio::join!(
             self.docker.cleanup_containers_by_prefix("k8s_"),
             self.docker.remove_network(&self.config.network_name),
             self.docker.remove_volume(Self::RANCHER_VOLUME_NAME),
