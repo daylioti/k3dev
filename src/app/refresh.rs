@@ -2,9 +2,11 @@
 //!
 //! This module contains all spawn_* methods for background data refresh.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
+use tokio::sync::Semaphore;
+
+use crate::cluster::docker::pull_progress::monitor_image_pull;
 use crate::cluster::{
     ClusterManager, ClusterStatus, DockerManager, IngressHealthChecker, IngressManager,
     PortForwardDetector,
@@ -12,6 +14,10 @@ use crate::cluster::{
 use crate::k8s::K8sClient;
 
 use super::{App, AppMessage};
+
+/// Maximum concurrent manifest fetches across all pull monitors
+static MANIFEST_SEMAPHORE: once_cell::sync::Lazy<Arc<Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(5)));
 
 impl App {
     pub(super) fn spawn_status_check(&self) {
@@ -160,8 +166,6 @@ impl App {
 
         let message_tx = self.message_tx.clone();
         let container_name = self.cluster_config.container_name.clone();
-        let kubeconfig = self.cluster_config.kubeconfig.clone();
-        let context = self.cluster_config.context.clone();
         let timeout = self.refresh_config.docker_stats_timeout;
 
         tokio::spawn(async move {
@@ -176,40 +180,103 @@ impl App {
             })
             .await;
 
-            let mut stats = match result {
+            let stats = match result {
                 Ok(Ok(stats)) => stats,
                 _ => vec![],
             };
 
-            // Filter to only show pods with Kubernetes status "Running"
-            if !stats.is_empty() {
-                if let Ok(k8s_client) =
-                    K8sClient::new(kubeconfig.as_deref(), context.as_deref()).await
-                {
-                    let mut running_pods: HashSet<String> = HashSet::new();
-
-                    // Get all namespaces and collect running pods
-                    if let Ok(namespaces) = k8s_client.list_namespaces().await {
-                        for ns in namespaces {
-                            if let Ok(pods) = k8s_client.list_pods(&ns, None).await {
-                                for pod in pods {
-                                    if pod.status == "Running" {
-                                        running_pods.insert(pod.name.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Filter stats to only include running pods
-                    if !running_pods.is_empty() {
-                        stats.retain(|s| running_pods.contains(&s.name));
-                    }
-                }
-            }
-
+            // Send all pod stats - filtering is now done during merge
+            // with pending pods data (which has K8s status info)
             let _ = message_tx.send(AppMessage::PodStatsUpdated(stats)).await;
         });
+    }
+
+    pub(super) fn spawn_pending_pods_check(&self) {
+        if !matches!(self.cluster_status, ClusterStatus::Running) {
+            let message_tx = self.message_tx.clone();
+            tokio::spawn(async move {
+                let _ = message_tx
+                    .send(AppMessage::PendingPodsUpdated(vec![]))
+                    .await;
+            });
+            return;
+        }
+
+        let message_tx = self.message_tx.clone();
+        let kubeconfig = self.cluster_config.kubeconfig.clone();
+        let context = self.cluster_config.context.clone();
+        let timeout = self.refresh_config.docker_stats_timeout;
+
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(timeout, async {
+                let k8s_client = K8sClient::new(kubeconfig.as_deref(), context.as_deref()).await?;
+                k8s_client.list_pending_pods().await
+            })
+            .await;
+
+            let pending = match result {
+                Ok(Ok(pods)) => pods,
+                _ => vec![],
+            };
+
+            let _ = message_tx
+                .send(AppMessage::PendingPodsUpdated(pending))
+                .await;
+        });
+    }
+
+    /// Spawn streaming monitors for images currently being pulled.
+    /// Each monitor joins Docker's create_image stream for real-time byte-level progress.
+    pub(super) fn spawn_pull_progress_check(&mut self) {
+        if !matches!(self.cluster_status, ClusterStatus::Running) {
+            return;
+        }
+
+        let docker = match &self.docker_client {
+            Some(d) => d,
+            None => return,
+        };
+
+        // Get unique images from pending pods cache that are in pulling state
+        let pulling_images: std::collections::HashSet<String> = self
+            .pending_pods_cache
+            .iter()
+            .flat_map(|p| {
+                p.containers
+                    .iter()
+                    .filter(|c| c.reason == "ContainerCreating" || c.reason == "PodInitializing")
+                    .map(|c| c.image.clone())
+            })
+            .collect();
+
+        if pulling_images.is_empty() {
+            return;
+        }
+
+        // Spawn monitors for NEW pulling images only
+        for image in pulling_images {
+            if self.active_pull_monitors.contains(&image) {
+                continue; // Already monitoring this image
+            }
+            self.active_pull_monitors.insert(image.clone());
+
+            // Find the container name for this image (first match)
+            let container_name = self
+                .pending_pods_cache
+                .iter()
+                .flat_map(|p| &p.containers)
+                .find(|c| c.image == image)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+
+            let docker = docker.clone();
+            let message_tx = self.message_tx.clone();
+            let semaphore = Arc::clone(&MANIFEST_SEMAPHORE);
+
+            tokio::spawn(async move {
+                monitor_image_pull(docker, image, container_name, message_tx, semaphore).await;
+            });
+        }
     }
 
     pub(super) fn spawn_port_forwards_check(&self) {

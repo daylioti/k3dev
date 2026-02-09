@@ -17,7 +17,13 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::cluster::{ClusterConfig, ClusterManager, ClusterStatus};
+use bollard::Docker;
+
+use crate::cluster::{
+    ClusterConfig, ClusterManager, ClusterStatus, ContainerPullProgress, ContainerStats,
+};
+use crate::k8s::PendingPodInfo;
+use std::collections::{HashMap, HashSet};
 use crate::config::{
     Config, ConfigLoader, ConfigValidator, RefreshConfig, RefreshScheduler, RefreshTask,
 };
@@ -100,6 +106,16 @@ pub struct App {
     pending_hosts_update: bool,
     sudo_password: String,
     password_input: String,
+
+    // Cached data for pod stats merging
+    running_pods_cache: Vec<ContainerStats>,
+    pending_pods_cache: Vec<PendingPodInfo>,
+    /// Cache of image pull progress (image -> progress)
+    pull_progress_cache: HashMap<String, ContainerPullProgress>,
+    /// Tracks images with active streaming monitors
+    active_pull_monitors: HashSet<String>,
+    /// Bollard Docker client for spawning pull monitors
+    docker_client: Option<Docker>,
 
     // Async channels
     message_tx: mpsc::Sender<AppMessage>,
@@ -213,6 +229,16 @@ impl App {
             pending_hosts_update: false,
             sudo_password: String::new(),
             password_input: String::new(),
+            running_pods_cache: Vec::new(),
+            pending_pods_cache: Vec::new(),
+            pull_progress_cache: HashMap::new(),
+            active_pull_monitors: HashSet::new(),
+            docker_client: Docker::connect_with_unix(
+                "/var/run/docker.sock",
+                120,
+                bollard::API_DEFAULT_VERSION,
+            )
+            .ok(),
             message_tx,
             message_rx,
             cancel_token: None,
@@ -263,6 +289,8 @@ impl App {
                 match task {
                     RefreshTask::BlinkToggle => {
                         self.menu.toggle_blink();
+                        // Tick animation for pulling pods progress bars
+                        self.pod_stats.tick_animation();
                     }
                     RefreshTask::IngressRefresh => {
                         self.spawn_ingress_health_check();
@@ -275,6 +303,8 @@ impl App {
                     RefreshTask::StatsRefresh => {
                         self.spawn_resource_stats_check();
                         self.spawn_pod_stats_check();
+                        self.spawn_pending_pods_check();
+                        self.spawn_pull_progress_check();
                     }
                 }
             }

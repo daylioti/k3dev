@@ -46,6 +46,26 @@ pub struct PodInfo {
     pub ip: Option<String>,
 }
 
+/// Information about a container waiting for image pull or in error state
+#[derive(Debug, Clone)]
+pub struct ContainerWaitingInfo {
+    #[allow(dead_code)]
+    pub name: String,
+    pub image: String,
+    pub reason: String,  // "ContainerCreating", "ImagePullBackOff", "ErrImagePull"
+    #[allow(dead_code)]
+    pub message: Option<String>,
+}
+
+/// Information about a pending pod
+#[derive(Debug, Clone)]
+pub struct PendingPodInfo {
+    pub name: String,
+    pub namespace: String,
+    pub containers: Vec<ContainerWaitingInfo>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Kubernetes client wrapper
 #[derive(Clone)]
 pub struct K8sClient {
@@ -428,5 +448,126 @@ impl K8sClient {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         pods.delete(name, &DeleteParams::default()).await?;
         Ok(())
+    }
+
+    /// List pending pods with container waiting info
+    /// Returns pods that are in Pending phase or have containers in waiting state
+    pub async fn list_pending_pods(&self) -> Result<Vec<PendingPodInfo>> {
+        let namespaces = self.list_namespaces().await?;
+        let mut pending_pods = Vec::new();
+
+        for ns in namespaces {
+            let pods: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
+            let list = pods.list(&ListParams::default()).await?;
+
+            for pod in list.items {
+                let pod_name = pod.metadata.name.clone().unwrap_or_default();
+                let namespace = pod.metadata.namespace.clone().unwrap_or_default();
+
+                // Check pod phase
+                let phase = pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.phase.as_ref())
+                    .map(|s| s.as_str())
+                    .unwrap_or("Unknown");
+
+                // Skip Running and Succeeded pods
+                if phase == "Running" || phase == "Succeeded" {
+                    continue;
+                }
+
+                // Get start time
+                let started_at = pod
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.start_time.as_ref())
+                    .map(|t| t.0);
+
+                // Get container images from spec
+                let container_images: HashMap<String, String> = pod
+                    .spec
+                    .as_ref()
+                    .map(|spec| {
+                        spec.containers
+                            .iter()
+                            .map(|c| {
+                                (
+                                    c.name.clone(),
+                                    c.image.clone().unwrap_or_else(|| "unknown".to_string()),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // Check container statuses for waiting states
+                let mut waiting_containers = Vec::new();
+
+                if let Some(status) = &pod.status {
+                    // Check both container_statuses and init_container_statuses
+                    let all_statuses = status
+                        .container_statuses
+                        .iter()
+                        .flatten()
+                        .chain(status.init_container_statuses.iter().flatten());
+
+                    for cs in all_statuses {
+                        if let Some(state) = &cs.state {
+                            if let Some(waiting) = &state.waiting {
+                                let reason =
+                                    waiting.reason.clone().unwrap_or_else(|| "Unknown".to_string());
+                                let message = waiting.message.clone();
+                                let image = container_images
+                                    .get(&cs.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| cs.image.clone());
+
+                                waiting_containers.push(ContainerWaitingInfo {
+                                    name: cs.name.clone(),
+                                    image,
+                                    reason,
+                                    message,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Also add pods in Pending phase even if no container status yet
+                // (very early in creation, before containers are even created)
+                if !waiting_containers.is_empty() || phase == "Pending" || phase == "Failed" {
+                    // If no container status yet, create entries from spec
+                    if waiting_containers.is_empty() {
+                        if let Some(spec) = &pod.spec {
+                            for container in &spec.containers {
+                                waiting_containers.push(ContainerWaitingInfo {
+                                    name: container.name.clone(),
+                                    image: container
+                                        .image
+                                        .clone()
+                                        .unwrap_or_else(|| "unknown".to_string()),
+                                    reason: if phase == "Failed" {
+                                        "Failed".to_string()
+                                    } else {
+                                        "ContainerCreating".to_string()
+                                    },
+                                    message: None,
+                                });
+                            }
+                        }
+                    }
+
+                    pending_pods.push(PendingPodInfo {
+                        name: pod_name,
+                        namespace,
+                        containers: waiting_containers,
+                        started_at,
+                    });
+                }
+            }
+        }
+
+        Ok(pending_pods)
     }
 }

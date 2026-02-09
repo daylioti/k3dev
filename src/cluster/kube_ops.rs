@@ -249,6 +249,7 @@ impl KubeOps {
     }
 
     /// Delete a secret (ignores if not found)
+    #[allow(dead_code)]
     pub async fn delete_secret(&mut self, name: &str, namespace: &str) -> Result<()> {
         let client = self.client().await?;
         let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
@@ -601,6 +602,7 @@ impl KubeOps {
     }
 
     /// Delete a custom resource
+    #[allow(dead_code)]
     pub async fn delete_custom_resource(
         &mut self,
         api_version: &str,

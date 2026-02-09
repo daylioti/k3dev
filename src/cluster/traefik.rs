@@ -390,6 +390,7 @@ spec:
     }
 
     /// Uninstall Traefik configuration (removes HelmChartConfig, K3s will reset to defaults)
+    #[allow(dead_code)] // May be used for selective cleanup in the future
     pub async fn uninstall(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
         let _ = output_tx
             .send(OutputLine::info("Removing Traefik configuration..."))

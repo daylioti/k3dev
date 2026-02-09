@@ -3,10 +3,12 @@
 //! This module defines the AppMessage enum and the handle_message implementation.
 
 use crate::cluster::{
-    ClusterStatus, ContainerStats, IngressEntry, IngressHealthStatus, ResourceStats,
+    ClusterStatus, ContainerPullProgress, ContainerStats, IngressEntry, IngressHealthStatus,
+    ResourceStats,
 };
 use crate::config::RefreshTask;
-use crate::ui::components::{ActivePortForward, OutputLine, PodStat};
+use crate::k8s::PendingPodInfo;
+use crate::ui::components::{ActivePortForward, ContainerPullInfo, OutputLine, PodStat, PodState};
 use std::collections::{HashMap, HashSet};
 
 use super::App;
@@ -39,6 +41,15 @@ pub enum AppMessage {
 
     /// Active port forwards detected
     ActivePortForwardsUpdated(Vec<ActivePortForward>),
+
+    /// Pending pods (waiting for image pulls, etc.)
+    PendingPodsUpdated(Vec<PendingPodInfo>),
+
+    /// Image pull progress updated (image -> progress)
+    PullProgressUpdated(HashMap<String, ContainerPullProgress>),
+
+    /// A pull monitor stream has finished (image pull complete or errored)
+    ImagePullMonitorDone(String),
 
     /// Error message
     Error(String),
@@ -104,6 +115,7 @@ impl App {
                 }
 
                 self.cluster_status = status;
+                self.status_bar.update_connection_state(is_running);
 
                 // If cluster just became running, trigger refresh and show ports
                 if is_running && !was_running {
@@ -155,26 +167,63 @@ impl App {
                 self.status_bar.set_resource_stats(stats);
             }
             AppMessage::PodStatsUpdated(stats) => {
-                // Convert ContainerStats to PodStat
-                let mut pod_stats: Vec<PodStat> = stats
-                    .into_iter()
-                    .map(|s| PodStat {
-                        name: s.name,
-                        namespace: s.namespace,
-                        cpu_percent: s.cpu_percent,
-                        cpu_limit_millicores: s.cpu_limit_millicores,
-                        memory_used_mb: s.memory_used_mb,
-                        memory_limit_mb: s.memory_limit_mb,
-                        status: s.status,
+                // Cache the running pods and merge with pending
+                self.running_pods_cache = stats;
+                self.merge_and_update_pod_stats();
+            }
+            AppMessage::PendingPodsUpdated(pending) => {
+                // Cache the pending pods and merge with running
+                self.pending_pods_cache = pending;
+
+                // Clean up stale pull progress for images no longer pulling
+                let still_pulling: HashSet<String> = self
+                    .pending_pods_cache
+                    .iter()
+                    .flat_map(|p| {
+                        p.containers
+                            .iter()
+                            .filter(|c| {
+                                c.reason == "ContainerCreating"
+                                    || c.reason == "PodInitializing"
+                            })
+                            .map(|c| c.image.clone())
                     })
                     .collect();
-                // Sort by namespace first, then by pod name within each namespace
-                pod_stats.sort_by(|a, b| {
-                    a.namespace
-                        .cmp(&b.namespace)
-                        .then_with(|| a.name.cmp(&b.name))
-                });
-                self.pod_stats.set_pods(pod_stats);
+                self.pull_progress_cache
+                    .retain(|img, _| still_pulling.contains(img));
+
+                self.merge_and_update_pod_stats();
+            }
+            AppMessage::PullProgressUpdated(progress) => {
+                // Merge monotonically: never let downloaded/total bytes decrease
+                for (image, new_progress) in progress {
+                    let entry = self.pull_progress_cache.entry(image).or_insert_with(|| {
+                        ContainerPullProgress::new(&new_progress.container_name, &new_progress.image)
+                    });
+                    if new_progress.downloaded_bytes >= entry.downloaded_bytes {
+                        entry.downloaded_bytes = new_progress.downloaded_bytes;
+                    }
+                    if new_progress.total_bytes >= entry.total_bytes {
+                        entry.total_bytes = new_progress.total_bytes;
+                    }
+                    // Recompute percent from monotonic values
+                    if entry.total_bytes > 0 {
+                        entry.progress_percent =
+                            (entry.downloaded_bytes as f64 / entry.total_bytes as f64 * 100.0).min(100.0);
+                        entry.tracking_available = true;
+                    }
+                    // Pass through phase and layer counts
+                    entry.phase = new_progress.phase;
+                    entry.layers_done = new_progress.layers_done;
+                    entry.layers_total = new_progress.layers_total;
+                }
+                self.merge_and_update_pod_stats();
+            }
+            AppMessage::ImagePullMonitorDone(image) => {
+                // Pull finished or errored — remove from caches
+                self.pull_progress_cache.remove(&image);
+                self.active_pull_monitors.remove(&image);
+                self.merge_and_update_pod_stats();
             }
             AppMessage::ActivePortForwardsUpdated(forwards) => {
                 self.menu.set_active_port_forwards(forwards);
@@ -184,5 +233,120 @@ impl App {
                 self.output.add_error(&msg);
             }
         }
+    }
+
+    /// Merge running pods (from cgroups) with pending pods (from K8s API)
+    /// and update the pod_stats component
+    fn merge_and_update_pod_stats(&mut self) {
+        let mut pod_stats: Vec<PodStat> = Vec::new();
+
+        // Build a set of running pod names for quick lookup
+        let running_pod_names: HashSet<String> = self
+            .running_pods_cache
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+
+        // Add running pods with Running state
+        for s in &self.running_pods_cache {
+            pod_stats.push(PodStat {
+                name: s.name.clone(),
+                namespace: s.namespace.clone(),
+                state: PodState::Running,
+                cpu_percent: s.cpu_percent,
+                cpu_limit_millicores: s.cpu_limit_millicores,
+                memory_used_mb: s.memory_used_mb,
+                memory_limit_mb: s.memory_limit_mb,
+                status: s.status.clone(),
+            });
+        }
+
+        // Add pending pods (only if not already in running list)
+        for pending in &self.pending_pods_cache {
+            // Skip if this pod is already running (cgroups data is more accurate)
+            if running_pod_names.contains(&pending.name) {
+                continue;
+            }
+
+            // Check if any container is in a pulling state
+            let pulling_containers: Vec<_> = pending
+                .containers
+                .iter()
+                .filter(|c| c.reason == "ContainerCreating" || c.reason == "PodInitializing")
+                .collect();
+
+            let failed_container = pending
+                .containers
+                .iter()
+                .find(|c| {
+                    matches!(
+                        c.reason.as_str(),
+                        "ImagePullBackOff" | "ErrImagePull" | "InvalidImageName"
+                            | "CrashLoopBackOff" | "Error" | "Failed"
+                    )
+                });
+
+            // Determine state based on container waiting reasons
+            let state = if let Some(failed) = failed_container {
+                // If any container failed, show failure state
+                // Use short image name to avoid truncation in the UI
+                let short_image = failed.image.rsplit('/').next().unwrap_or(&failed.image);
+                PodState::Failed {
+                    reason: format!("{}: {}", failed.reason, short_image),
+                }
+            } else if !pulling_containers.is_empty() {
+                // Build container pull info for all pulling containers
+                let containers: Vec<ContainerPullInfo> = pulling_containers
+                    .iter()
+                    .map(|c| {
+                        // Look up progress from cache
+                        let progress = self.pull_progress_cache.get(&c.image);
+                        let mut info = ContainerPullInfo::new(&c.name, &c.image);
+                        if let Some(p) = progress {
+                            if p.tracking_available {
+                                info = info.with_progress(p.downloaded_bytes, p.total_bytes);
+                            }
+                            info.layers_done = p.layers_done;
+                            info.layers_total = p.layers_total;
+                            info.phase = p.phase.clone();
+                        }
+                        info
+                    })
+                    .collect();
+
+                PodState::Pulling {
+                    containers,
+                    started_at: pending.started_at,
+                }
+            } else if let Some(container) = pending.containers.first() {
+                PodState::Waiting {
+                    reason: container.reason.clone(),
+                }
+            } else {
+                PodState::Waiting {
+                    reason: "Pending".to_string(),
+                }
+            };
+
+            pod_stats.push(PodStat {
+                name: pending.name.clone(),
+                namespace: pending.namespace.clone(),
+                state,
+                cpu_percent: 0.0,
+                cpu_limit_millicores: 0.0,
+                memory_used_mb: 0.0,
+                memory_limit_mb: 0.0,
+                status: "Pending".to_string(),
+            });
+        }
+
+        // Sort by namespace first, then by pod name within each namespace
+        pod_stats.sort_by(|a, b| {
+            a.namespace
+                .cmp(&b.namespace)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        self.pod_stats.set_pods(pod_stats);
     }
 }

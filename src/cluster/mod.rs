@@ -1,5 +1,5 @@
 mod config;
-mod docker;
+pub(crate) mod docker;
 mod ingress;
 mod k3s;
 mod kube_ops;
@@ -10,7 +10,7 @@ mod traefik;
 pub use config::ClusterConfig;
 #[allow(unused_imports)]
 pub use docker::ContainerRunConfig;
-pub use docker::{ContainerStats, DockerManager, ResourceStats};
+pub use docker::{ContainerPullProgress, ContainerStats, DockerManager, PullPhase, ResourceStats};
 pub use ingress::{IngressEntry, IngressHealthChecker, IngressHealthStatus, IngressManager};
 pub use k3s::{ClusterStatus, K3sManager};
 pub use platform::PlatformInfo;
@@ -29,6 +29,7 @@ use crate::ui::components::OutputLine;
 pub struct ClusterManager {
     config: Arc<ClusterConfig>,
     k3s: Option<K3sManager>,
+    #[allow(dead_code)] // Used during start(), may be used for future operations
     traefik: TraefikManager,
     ingress: IngressManager,
     platform: PlatformInfo,
@@ -153,8 +154,8 @@ impl ClusterManager {
 
     /// Delete the cluster and cleanup
     pub async fn delete(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
-        // Uninstall Traefik
-        self.traefik.uninstall(output_tx.clone()).await?;
+        // Skip Traefik uninstall - resources live inside k3s container which is being deleted
+        // This saves ~2-3 seconds since we don't need to wait for K8s API calls
 
         // Delete k3s cluster
         if let Some(k3s) = &self.k3s {

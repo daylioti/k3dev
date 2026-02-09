@@ -427,61 +427,39 @@ impl K3sManager {
             .send(OutputLine::info("Deleting k3s cluster..."))
             .await;
 
-        // Stop and remove k3s container
+        // Force-remove k3s container (skip stop - force remove handles it)
         if self
             .docker
             .container_exists(&self.config.container_name)
             .await
         {
             let _ = output_tx
-                .send(OutputLine::info("Stopping k3s container..."))
+                .send(OutputLine::info("Removing k3s container..."))
                 .await;
             let _ = self
                 .docker
-                .stop_container(&self.config.container_name)
-                .await;
-            self.docker
                 .remove_container(&self.config.container_name, true)
-                .await?;
+                .await;
         }
 
-        // Cleanup k8s_* containers (managed pods) - must complete before network removal
-        let _ = output_tx
-            .send(OutputLine::info("Cleaning up pod containers..."))
-            .await;
-        self.docker.cleanup_containers_by_prefix("k8s_").await?;
-
-        // Run remaining cleanup tasks in parallel (all independent after containers are gone)
+        // Run all cleanup tasks in parallel:
+        // - Pod containers (k8s_*) can be force-removed in parallel
+        // - Network removal will fail if containers still attached, but we retry
+        // - Volumes and kubeconfig are independent
         let _ = output_tx
             .send(OutputLine::info("Cleaning up cluster resources..."))
             .await;
-        let (network_result, rancher_volume_result, pv_volume_result, kubeconfig_result) = tokio::join!(
-            async {
-                let _ = output_tx
-                    .send(OutputLine::info("Removing Docker network..."))
-                    .await;
-                self.docker.remove_network(&self.config.network_name).await
-            },
-            async {
-                let _ = output_tx
-                    .send(OutputLine::info("Removing rancher data volume..."))
-                    .await;
-                self.docker.remove_volume(Self::RANCHER_VOLUME_NAME).await
-            },
-            async {
-                let _ = output_tx
-                    .send(OutputLine::info("Removing PV storage volume..."))
-                    .await;
-                self.docker.remove_volume(Self::LOCAL_PV_VOLUME_NAME).await
-            },
-            async {
-                let _ = output_tx
-                    .send(OutputLine::info("Cleaning kubeconfig..."))
-                    .await;
-                self.cleanup_kubeconfig().await
-            },
+
+        let (pods_result, network_result, rancher_volume_result, pv_volume_result, kubeconfig_result) = tokio::join!(
+            self.docker.cleanup_containers_by_prefix("k8s_"),
+            self.docker.remove_network(&self.config.network_name),
+            self.docker.remove_volume(Self::RANCHER_VOLUME_NAME),
+            self.docker.remove_volume(Self::LOCAL_PV_VOLUME_NAME),
+            self.cleanup_kubeconfig(),
         );
-        // Propagate errors from cleanup operations
+
+        // Propagate errors (most operations ignore errors gracefully)
+        pods_result?;
         network_result?;
         rancher_volume_result?;
         pv_volume_result?;

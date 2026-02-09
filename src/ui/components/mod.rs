@@ -21,5 +21,5 @@ pub use output::{Output, OutputLine, OutputType};
 pub use output_popup::OutputPopup;
 pub use password_popup::PasswordPopup;
 pub use pod_context_menu::{PodAction, PodContextMenu};
-pub use pod_stats::{PodStat, PodStats};
+pub use pod_stats::{ContainerPullInfo, PodStat, PodState, PodStats};
 pub use status_bar::{ClusterStatus, StatusBar};

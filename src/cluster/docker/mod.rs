@@ -8,8 +8,10 @@
 
 #![allow(deprecated)]
 
+pub(crate) mod pull_progress;
 mod stats;
 
+pub use pull_progress::{ContainerPullProgress, PullPhase};
 pub use stats::{ContainerStats, ResourceStats};
 
 use anyhow::{anyhow, Context, Result};
@@ -225,14 +227,23 @@ impl DockerManager {
         Ok(names)
     }
 
-    /// Stop and remove all containers with a name prefix
+    /// Force-remove all containers with a name prefix (parallel)
     pub async fn cleanup_containers_by_prefix(&self, prefix: &str) -> Result<()> {
         let containers = self.list_containers_by_prefix(prefix).await?;
 
-        for container in containers {
-            let _ = self.stop_container(&container).await;
-            let _ = self.remove_container(&container, true).await;
+        if containers.is_empty() {
+            return Ok(());
         }
+
+        // Force-remove all containers in parallel (no need to stop first)
+        let futures: Vec<_> = containers
+            .into_iter()
+            .map(|container| async move {
+                let _ = self.remove_container(&container, true).await;
+            })
+            .collect();
+
+        futures_util::future::join_all(futures).await;
 
         Ok(())
     }

@@ -46,8 +46,8 @@ pub struct StatusBar {
     last_stats_time: Option<Instant>,
     net_rx_rate: f64, // bytes per second
     net_tx_rate: f64, // bytes per second
-    // Last refresh timestamp
-    last_refresh: Option<Instant>,
+    // Connection uptime
+    connected_since: Option<Instant>,
     // Panel resize hint
     resize_hint: Option<i16>,
     resize_hint_time: Option<Instant>,
@@ -71,7 +71,7 @@ impl StatusBar {
             last_stats_time: None,
             net_rx_rate: 0.0,
             net_tx_rate: 0.0,
-            last_refresh: None,
+            connected_since: None,
             resize_hint: None,
             resize_hint_time: None,
         }
@@ -82,9 +82,16 @@ impl StatusBar {
         self.selected_item = item;
     }
 
-    /// Mark data as refreshed (call when data is successfully updated)
-    pub fn mark_refreshed(&mut self) {
-        self.last_refresh = Some(Instant::now());
+    /// Update connection uptime tracking based on cluster status
+    pub fn update_connection_state(&mut self, connected: bool) {
+        if connected {
+            // Only set on first transition to connected
+            if self.connected_since.is_none() {
+                self.connected_since = Some(Instant::now());
+            }
+        } else {
+            self.connected_since = None;
+        }
     }
 
     pub fn set_executing(&mut self, executing: bool) {
@@ -107,7 +114,6 @@ impl StatusBar {
             self.prev_net_rx = stats.net_rx_mb;
             self.prev_net_tx = stats.net_tx_mb;
             self.last_stats_time = Some(Instant::now());
-            self.mark_refreshed();
         }
         self.resource_stats = stats;
     }
@@ -238,13 +244,15 @@ impl StatusBar {
             ClusterStatus::Unknown => ("[?]", self.styles.status_unknown),
         };
 
-        // Add last refresh timestamp if available
-        let refresh_text = if let Some(last) = self.last_refresh {
-            let elapsed = last.elapsed().as_secs();
+        // Add uptime if connected
+        let refresh_text = if let Some(since) = self.connected_since {
+            let elapsed = since.elapsed().as_secs();
             if elapsed < 60 {
                 format!(" {}s", elapsed)
-            } else {
+            } else if elapsed < 3600 {
                 format!(" {}m", elapsed / 60)
+            } else {
+                format!(" {}h{}m", elapsed / 3600, (elapsed % 3600) / 60)
             }
         } else {
             String::new()

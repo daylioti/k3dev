@@ -15,6 +15,7 @@ pub struct Styles {
     pub error_text: Style,
     pub success_text: Style,
     pub warning_text: Style,
+    pub info_text: Style,
     pub muted_text: Style,
     pub title: Style,
     pub primary: Style,
@@ -61,6 +62,7 @@ impl Styles {
             error_text: Style::default().fg(palette.error),
             success_text: Style::default().fg(palette.success),
             warning_text: Style::default().fg(palette.warning),
+            info_text: Style::default().fg(palette.primary),
             muted_text: Style::default().fg(palette.muted),
             title: Style::default()
                 .fg(palette.primary)
