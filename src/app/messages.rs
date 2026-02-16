@@ -2,6 +2,7 @@
 //!
 //! This module defines the AppMessage enum and the handle_message implementation.
 
+use crate::cluster::diagnostics::DiagnosticsReport;
 use crate::cluster::{
     ClusterStatus, ContainerPullProgress, ContainerStats, IngressEntry, IngressHealthStatus,
     ResourceStats,
@@ -50,6 +51,9 @@ pub enum AppMessage {
 
     /// A pull monitor stream has finished (image pull complete or errored)
     ImagePullMonitorDone(String),
+
+    /// Diagnostics state update (sent incrementally as tests complete)
+    DiagnosticsUpdated(DiagnosticsReport),
 
     /// Error message
     Error(String),
@@ -227,6 +231,9 @@ impl App {
                 self.pull_progress_cache.remove(&image);
                 self.active_pull_monitors.remove(&image);
                 self.merge_and_update_pod_stats();
+            }
+            AppMessage::DiagnosticsUpdated(report) => {
+                self.diagnostics_overlay.update(report);
             }
             AppMessage::ActivePortForwardsUpdated(forwards) => {
                 self.menu.set_active_port_forwards(forwards);

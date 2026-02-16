@@ -334,6 +334,14 @@ impl DockerManager {
         self.client.inspect_image(image).await.is_ok()
     }
 
+    /// Get labels from a Docker image
+    pub async fn get_image_labels(&self, image: &str) -> HashMap<String, String> {
+        match self.client.inspect_image(image).await {
+            Ok(info) => info.config.and_then(|c| c.labels).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
     /// Commit a running container to a new image
     pub async fn commit_container(
         &self,

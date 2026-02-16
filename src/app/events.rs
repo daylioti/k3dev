@@ -182,6 +182,28 @@ impl App {
             return;
         }
 
+        // Handle diagnostics overlay mode (modal)
+        if self.mode == AppMode::Diagnostics {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = AppMode::Normal;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.diagnostics_overlay.scroll_up();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.diagnostics_overlay.scroll_down();
+                }
+                KeyCode::Char('r') => {
+                    if self.diagnostics_overlay.is_finished() {
+                        self.run_diagnostics();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Don't handle other keys while executing
         if self.is_executing {
             return;

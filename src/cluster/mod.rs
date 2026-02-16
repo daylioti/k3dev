@@ -1,8 +1,9 @@
 mod config;
+pub mod diagnostics;
 pub(crate) mod docker;
 mod ingress;
 mod k3s;
-mod kube_ops;
+pub(crate) mod kube_ops;
 mod platform;
 mod port_forward;
 mod traefik;
@@ -79,14 +80,18 @@ impl ClusterManager {
         }
 
         // Start k3s cluster (core components only)
-        if let Some(k3s) = &mut self.k3s {
-            k3s.start(output_tx.clone()).await?;
+        let outcome = if let Some(k3s) = &mut self.k3s {
+            k3s.start(output_tx.clone()).await?
         } else {
             let _ = output_tx
                 .send(OutputLine::error("Failed to initialize cluster manager"))
                 .await;
             return Ok(());
-        }
+        };
+
+        // Determine if we need to create a deep snapshot after Traefik + hooks
+        let needs_deep_snapshot = matches!(outcome, k3s::StartOutcome::FreshCreated)
+            && self.config.speedup.use_snapshot;
 
         // Deploy Traefik (ingress controller) in background for faster cluster availability
         let _ = output_tx
@@ -97,6 +102,7 @@ impl ClusterManager {
 
         let mut traefik_manager = TraefikManager::new(Arc::clone(&self.config));
         let config = Arc::clone(&self.config);
+        let socket_path = self.platform.docker_socket_path().await?;
         let tx = output_tx.clone();
 
         // Spawn background task for Traefik deployment and post-deployment tasks
@@ -129,6 +135,47 @@ impl ClusterManager {
             let _ = tx
                 .send(OutputLine::success("All services deployed successfully!"))
                 .await;
+
+            // Create deep snapshot after all services are deployed
+            if needs_deep_snapshot {
+                match DockerManager::new(socket_path) {
+                    Ok(docker) => {
+                        let snapshot_image =
+                            K3sManager::compute_snapshot_image_name(&config);
+
+                        if let Err(e) = K3sManager::create_deep_snapshot(
+                            &config.container_name,
+                            &docker,
+                            &config,
+                            &tx,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e, "Deep snapshot creation failed");
+                            let _ = tx
+                                .send(OutputLine::warning(format!(
+                                    "Deep snapshot creation failed: {}",
+                                    e
+                                )))
+                                .await;
+                        } else if config.speedup.snapshot_auto_cleanup {
+                            if let Err(e) =
+                                K3sManager::cleanup_old_snapshots_static(
+                                    &docker,
+                                    &snapshot_image,
+                                    &tx,
+                                )
+                                .await
+                            {
+                                tracing::warn!(error = %e, "Snapshot cleanup failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to create DockerManager for deep snapshot");
+                    }
+                }
+            }
         });
 
         let _ = output_tx
@@ -164,6 +211,14 @@ impl ClusterManager {
 
         // Note: /etc/hosts entries are kept on purpose - user can manually update with 'H' key
 
+        Ok(())
+    }
+
+    /// Delete all snapshot images
+    pub async fn delete_snapshots(&self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
+        if let Some(k3s) = &self.k3s {
+            k3s.delete_snapshots(&output_tx).await?;
+        }
         Ok(())
     }
 

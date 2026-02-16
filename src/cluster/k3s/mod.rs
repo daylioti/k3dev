@@ -17,6 +17,18 @@ mod status;
 
 pub use status::ClusterStatus;
 
+/// Outcome of a cluster start operation
+pub enum StartOutcome {
+    /// Cluster was already running
+    AlreadyRunning,
+    /// Existing stopped container was started
+    StartedExisting,
+    /// Cluster was started from a snapshot
+    StartedFromSnapshot,
+    /// Fresh cluster was created (no snapshot existed)
+    FreshCreated,
+}
+
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,7 +103,7 @@ impl K3sManager {
     }
 
     /// Start the k3s cluster (create if not exists)
-    pub async fn start(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
+    pub async fn start(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<StartOutcome> {
         tracing::info!(
             container_name = %self.config.container_name,
             k3s_version = %self.config.k3s_version,
@@ -118,7 +130,7 @@ impl K3sManager {
             let _ = output_tx
                 .send(OutputLine::info("Cluster is already running"))
                 .await;
-            return Ok(());
+            return Ok(StartOutcome::AlreadyRunning);
         }
 
         // Check if container exists but stopped
@@ -143,7 +155,7 @@ impl K3sManager {
                     .await?;
             }
 
-            return Ok(());
+            return Ok(StartOutcome::StartedExisting);
         }
 
         // Create new cluster - check snapshot first
@@ -152,10 +164,14 @@ impl K3sManager {
 
             // Fast path: use snapshot if it exists
             if self.docker.image_exists(&snapshot_image).await {
+                let is_deep =
+                    K3sManager::is_deep_snapshot(&self.docker, &snapshot_image).await;
                 let _ = output_tx
                     .send(OutputLine::info("Using snapshot for faster startup..."))
                     .await;
-                return self.start_from_snapshot(&snapshot_image, &output_tx).await;
+                self.start_from_snapshot(&snapshot_image, is_deep, &output_tx)
+                    .await?;
+                return Ok(StartOutcome::StartedFromSnapshot);
             }
 
             // Slow path: create cluster and snapshot
@@ -181,10 +197,11 @@ impl K3sManager {
                 }
             }
 
-            Ok(())
+            Ok(StartOutcome::FreshCreated)
         } else {
             // Snapshots disabled, use normal path
-            self.create_cluster(&output_tx).await
+            self.create_cluster(&output_tx).await?;
+            Ok(StartOutcome::FreshCreated)
         }
     }
 
@@ -263,20 +280,25 @@ impl K3sManager {
         let k3s_command = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
-            "mkdir -p /run/k3s /sys/fs/cgroup/kubepods && \
-             /bin/k3s server \
-             --docker \
-             --disable=metrics-server \
-             --disable=servicelb \
-             --disable-cloud-controller \
-             --disable-network-policy \
-             --service-node-port-range 80-32767 \
-             --kubelet-arg=root-dir=/var/lib/docker/kubelet \
-             --kubelet-arg=cgroup-driver=cgroupfs \
-             --kube-apiserver-arg=profiling=false \
-             --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
-             --kube-controller-manager-arg=concurrent-deployment-syncs=1"
-                .to_string(),
+            format!(
+                "nsenter --mount=/proc/1/ns/mnt modprobe br_netfilter 2>/dev/null || true && \
+                 sysctl -w net.bridge.bridge-nf-call-iptables=1 2>/dev/null || true && \
+                 mkdir -p /run/k3s /sys/fs/cgroup/kubepods && \
+                 /bin/k3s server \
+                 --docker \
+                 --disable=metrics-server \
+                 --disable=servicelb \
+                 --disable-cloud-controller \
+                 --disable-network-policy \
+                 --default-local-storage-path {} \
+                 --service-node-port-range 80-32767 \
+                 --kubelet-arg=root-dir=/var/lib/docker/kubelet \
+                 --kubelet-arg=cgroup-driver=cgroupfs \
+                 --kube-apiserver-arg=profiling=false \
+                 --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
+                 --kube-controller-manager-arg=concurrent-deployment-syncs=1",
+                Self::LOCAL_PV_STORAGE_PATH
+            ),
         ];
 
         // Run k3s container
@@ -482,7 +504,8 @@ impl K3sManager {
     pub async fn restart(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
         self.stop(output_tx.clone()).await?;
         sleep(Duration::from_secs(2)).await;
-        self.start(output_tx).await
+        self.start(output_tx).await?;
+        Ok(())
     }
 
     /// Get cluster info

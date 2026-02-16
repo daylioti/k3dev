@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -54,40 +55,28 @@ pub struct IngressEntry {
 pub struct IngressHealthChecker;
 
 impl IngressHealthChecker {
-    /// Check health of a single endpoint (host + path) using curl
+    /// Check health of a single endpoint (host + path)
     pub async fn check_endpoint(host: &str, path: &str) -> IngressHealthStatus {
-        // Use curl with short timeout to check endpoint health
-        // -s: silent, -o /dev/null: discard output, -w: write status code
-        // --connect-timeout: connection timeout, -m: max time
         let url = format!("http://{}{}", host, path);
-        let output = Command::new("curl")
-            .args([
-                "-s",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "--connect-timeout",
-                "2",
-                "-m",
-                "5",
-                "-k", // Allow self-signed certs
-                &url,
-            ])
-            .output()
-            .await;
 
-        match output {
-            Ok(out) if out.status.success() => {
-                let code = String::from_utf8_lossy(&out.stdout);
-                match code.trim().parse::<u16>() {
-                    Ok(200..=299) => IngressHealthStatus::Healthy,
-                    Ok(300..=499) => IngressHealthStatus::Warning,
-                    Ok(_) => IngressHealthStatus::Error,
-                    Err(_) => IngressHealthStatus::Error,
-                }
-            }
-            _ => IngressHealthStatus::Error,
+        let client = match reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return IngressHealthStatus::Error,
+        };
+
+        match client.get(&url).send().await {
+            Ok(resp) => match resp.status().as_u16() {
+                200..=299 => IngressHealthStatus::Healthy,
+                300..=499 => IngressHealthStatus::Warning,
+                _ => IngressHealthStatus::Error,
+            },
+            Err(_) => IngressHealthStatus::Error,
         }
     }
 

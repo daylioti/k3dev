@@ -108,6 +108,20 @@ impl CommandPalette {
                 category: CommandCategory::Cluster,
                 description: Some("Show cluster status and configuration".to_string()),
             },
+            PaletteCommand {
+                id: PaletteCommandId::ClusterDeleteSnapshots,
+                name: "Delete Snapshots".to_string(),
+                shortcut: None,
+                category: CommandCategory::Cluster,
+                description: Some("Remove all snapshot images (next start will be slower)".to_string()),
+            },
+            PaletteCommand {
+                id: PaletteCommandId::ClusterDiagnostics,
+                name: "Run Diagnostics".to_string(),
+                shortcut: None,
+                category: CommandCategory::Cluster,
+                description: Some("Run cluster health checks and diagnostics".to_string()),
+            },
             // Application commands
             PaletteCommand {
                 id: PaletteCommandId::AppRefresh,

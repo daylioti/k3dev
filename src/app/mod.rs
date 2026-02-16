@@ -30,8 +30,8 @@ use crate::k8s::PendingPodInfo;
 use crate::keybindings::KeybindingResolver;
 use crate::ui::components::{
     ActionBar, ClusterAction, ClusterStatus as UiClusterStatus, CommandPalette, ConfirmPopup,
-    HelpOverlay, InputForm, Menu, Output, OutputPopup, PasswordPopup, PodContextMenu, PodStats,
-    StatusBar,
+    DiagnosticsOverlay, HelpOverlay, InputForm, Menu, Output, OutputPopup, PasswordPopup,
+    PodContextMenu, PodStats, StatusBar,
 };
 use crate::ui::{AppLayout, Styles};
 use std::collections::{HashMap, HashSet};
@@ -57,6 +57,7 @@ pub enum AppMode {
     OutputPopup,
     ConfirmDestroy,
     PodContextMenu,
+    Diagnostics,
 }
 
 /// Main application
@@ -85,6 +86,7 @@ pub struct App {
     password_popup: PasswordPopup,
     confirm_popup: ConfirmPopup,
     pod_context_menu: PodContextMenu,
+    diagnostics_overlay: DiagnosticsOverlay,
     #[allow(dead_code)]
     styles: Styles,
 
@@ -217,6 +219,7 @@ impl App {
             password_popup: PasswordPopup::with_theme(theme),
             confirm_popup: ConfirmPopup::with_theme(theme),
             pod_context_menu: PodContextMenu::with_theme(theme),
+            diagnostics_overlay: DiagnosticsOverlay::with_theme(theme),
             styles: Styles::from_theme(theme),
             focus: FocusArea::Content,
             mode: AppMode::Normal,
@@ -400,6 +403,11 @@ impl App {
         // Render pod context menu if in pod context menu mode
         if self.mode == AppMode::PodContextMenu {
             self.pod_context_menu.render(frame, frame.area());
+        }
+
+        // Render diagnostics overlay if in diagnostics mode
+        if self.mode == AppMode::Diagnostics {
+            self.diagnostics_overlay.render(frame, frame.area());
         }
     }
 }

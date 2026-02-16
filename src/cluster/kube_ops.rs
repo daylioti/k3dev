@@ -96,6 +96,7 @@ impl KubeOps {
     }
 
     /// Rollout restart a deployment by updating pod template annotation
+    #[allow(dead_code)]
     pub async fn rollout_restart_deployment(&mut self, name: &str, namespace: &str) -> Result<()> {
         let client = self.client().await?;
         let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
@@ -119,6 +120,7 @@ impl KubeOps {
     }
 
     /// Wait for deployment rollout to complete
+    #[allow(dead_code)]
     pub async fn wait_for_rollout(
         &mut self,
         name: &str,
@@ -150,6 +152,7 @@ impl KubeOps {
     // ==================== ConfigMap Operations ====================
 
     /// Get ConfigMap data field
+    #[allow(dead_code)]
     pub async fn get_configmap_data(
         &mut self,
         name: &str,
@@ -163,6 +166,7 @@ impl KubeOps {
     }
 
     /// Patch ConfigMap data
+    #[allow(dead_code)]
     pub async fn patch_configmap_data(
         &mut self,
         name: &str,
@@ -183,6 +187,7 @@ impl KubeOps {
     }
 
     /// Remove annotation from a resource
+    #[allow(dead_code)]
     pub async fn remove_configmap_annotation(
         &mut self,
         name: &str,

@@ -28,6 +28,7 @@ pub enum ClusterAction {
     Restart,
     Destroy,
     Info,
+    DeleteSnapshots,
 }
 
 impl ClusterAction {
@@ -38,6 +39,7 @@ impl ClusterAction {
             ClusterAction::Restart => "restart",
             ClusterAction::Destroy => "destroy",
             ClusterAction::Info => "info",
+            ClusterAction::DeleteSnapshots => "delete-snapshots",
         }
     }
 }

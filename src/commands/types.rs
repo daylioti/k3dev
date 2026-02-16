@@ -17,6 +17,8 @@ pub enum PaletteCommandId {
     ClusterRestart,
     ClusterDestroy,
     ClusterInfo,
+    ClusterDeleteSnapshots,
+    ClusterDiagnostics,
 
     // Application commands
     AppRefresh,
@@ -42,6 +44,8 @@ impl PaletteCommandId {
             "cluster:restart" => Some(Self::ClusterRestart),
             "cluster:destroy" => Some(Self::ClusterDestroy),
             "cluster:info" => Some(Self::ClusterInfo),
+            "cluster:delete-snapshots" => Some(Self::ClusterDeleteSnapshots),
+            "cluster:diagnostics" => Some(Self::ClusterDiagnostics),
             "app:refresh" => Some(Self::AppRefresh),
             "app:update-hosts" => Some(Self::AppUpdateHosts),
             "app:help" => Some(Self::AppHelp),
@@ -60,6 +64,8 @@ impl PaletteCommandId {
             Self::ClusterRestart => "cluster:restart",
             Self::ClusterDestroy => "cluster:destroy",
             Self::ClusterInfo => "cluster:info",
+            Self::ClusterDeleteSnapshots => "cluster:delete-snapshots",
+            Self::ClusterDiagnostics => "cluster:diagnostics",
             Self::AppRefresh => "app:refresh",
             Self::AppUpdateHosts => "app:update-hosts",
             Self::AppHelp => "app:help",
@@ -91,6 +97,7 @@ impl PaletteCommandId {
             Self::ClusterRestart => Some(ClusterAction::Restart),
             Self::ClusterDestroy => Some(ClusterAction::Destroy),
             Self::ClusterInfo => Some(ClusterAction::Info),
+            Self::ClusterDeleteSnapshots => Some(ClusterAction::DeleteSnapshots),
             _ => None,
         }
     }
@@ -104,6 +111,8 @@ impl PaletteCommandId {
                 | Self::ClusterRestart
                 | Self::ClusterDestroy
                 | Self::ClusterInfo
+                | Self::ClusterDeleteSnapshots
+                | Self::ClusterDiagnostics
         )
     }
 
@@ -128,6 +137,8 @@ impl PaletteCommandId {
             Self::ClusterRestart,
             Self::ClusterDestroy,
             Self::ClusterInfo,
+            Self::ClusterDeleteSnapshots,
+            Self::ClusterDiagnostics,
             Self::AppRefresh,
             Self::AppUpdateHosts,
             Self::AppHelp,

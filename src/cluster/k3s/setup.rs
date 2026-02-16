@@ -5,10 +5,8 @@
 //! - Socat binary installation
 //! - Kubeconfig management
 //! - Deployment readiness waiting
-//! - Local path provisioner configuration
 
 use anyhow::{anyhow, Context, Result};
-use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::mpsc;
@@ -266,14 +264,6 @@ impl K3sManager {
         coredns_result??;
         provisioner_result??;
 
-        // Configure local-path-provisioner to use our custom storage path
-        let _ = output_tx
-            .send(OutputLine::info(
-                "Configuring local-path-provisioner storage path...",
-            ))
-            .await;
-        self.configure_local_path_provisioner(output_tx).await?;
-
         Ok(())
     }
 
@@ -318,123 +308,4 @@ impl K3sManager {
         }
     }
 
-    /// Configure local-path-provisioner to use our custom storage path.
-    /// Removes k3s addon annotation to prevent config reversion.
-    pub(super) async fn configure_local_path_provisioner(
-        &mut self,
-        output_tx: &mpsc::Sender<OutputLine>,
-    ) -> Result<()> {
-        // Build the new config.json for local-path-provisioner
-        // This path must be accessible to Docker containers (pod containers in --docker mode)
-        let config_json = format!(
-            r#"{{"nodePathMap":[{{"node":"DEFAULT_PATH_FOR_NON_LISTED_NODES","paths":["{}"]}}]}}"#,
-            Self::LOCAL_PV_STORAGE_PATH
-        );
-
-        let _ = self
-            .kube_ops
-            .remove_configmap_annotation(
-                "local-path-config",
-                "kube-system",
-                "objectset.rio.cattle.io/applied",
-            )
-            .await;
-
-        // Retry the patch up to 3 times in case of transient failures
-        let mut patch_success = false;
-        for attempt in 1..=3 {
-            let mut data = BTreeMap::new();
-            data.insert("config.json".to_string(), config_json.clone());
-
-            match self
-                .kube_ops
-                .patch_configmap_data("local-path-config", "kube-system", data)
-                .await
-            {
-                Ok(_) => {
-                    patch_success = true;
-                    break;
-                }
-                Err(e) => {
-                    if attempt < 3 {
-                        let _ = output_tx
-                            .send(OutputLine::info(format!(
-                                "ConfigMap patch attempt {} failed, retrying...",
-                                attempt
-                            )))
-                            .await;
-                        sleep(Duration::from_secs(1)).await;
-                    } else {
-                        let _ = output_tx.send(OutputLine::warning(
-                            format!("Failed to configure local-path-provisioner after 3 attempts: {}. PVCs may not work correctly.", e)
-                        )).await;
-                    }
-                }
-            }
-        }
-
-        if !patch_success {
-            return Ok(()); // Don't fail cluster creation, but config may not be correct
-        }
-
-        // Verify the ConfigMap was actually updated
-        let current_config = self
-            .kube_ops
-            .get_configmap_data("local-path-config", "kube-system", "config.json")
-            .await
-            .unwrap_or(None)
-            .unwrap_or_default();
-
-        if !current_config.contains(Self::LOCAL_PV_STORAGE_PATH) {
-            let _ = output_tx.send(OutputLine::warning(
-                format!("ConfigMap verification failed: config doesn't contain {}. The k3s addon controller may have reverted the change.", Self::LOCAL_PV_STORAGE_PATH)
-            )).await;
-            // Try one more time after a brief wait (give k3s time to settle)
-            sleep(Duration::from_secs(2)).await;
-            let mut data = BTreeMap::new();
-            data.insert("config.json".to_string(), config_json.clone());
-            let _ = self
-                .kube_ops
-                .patch_configmap_data("local-path-config", "kube-system", data)
-                .await;
-        }
-
-        // Restart the local-path-provisioner deployment to pick up the new config
-        if let Err(e) = self
-            .kube_ops
-            .rollout_restart_deployment("local-path-provisioner", "kube-system")
-            .await
-        {
-            let _ = output_tx
-                .send(OutputLine::warning(format!(
-                    "Failed to restart local-path-provisioner: {}",
-                    e
-                )))
-                .await;
-        }
-
-        // Wait for the rollout to complete (up to 30 seconds)
-        if !self
-            .kube_ops
-            .wait_for_rollout("local-path-provisioner", "kube-system", 30)
-            .await
-            .unwrap_or(false)
-        {
-            let _ = output_tx
-                .send(OutputLine::warning(
-                    "local-path-provisioner restart did not complete within timeout",
-                ))
-                .await;
-            // Still continue - it will eventually restart
-        }
-
-        let _ = output_tx
-            .send(OutputLine::info(format!(
-                "Configured local-path-provisioner to use {}",
-                Self::LOCAL_PV_STORAGE_PATH
-            )))
-            .await;
-
-        Ok(())
-    }
 }

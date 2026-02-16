@@ -3,6 +3,7 @@
 //! This module provides snapshot functionality for faster cluster startup:
 //! - Creating snapshots of initialized clusters
 //! - Starting clusters from snapshots
+//! - Deep snapshots (post-Traefik) for skipping wait_for_cluster_ready
 //! - Cleaning up old snapshots
 
 use anyhow::Result;
@@ -11,7 +12,8 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 use super::K3sManager;
-use crate::cluster::docker::ContainerRunConfig;
+use crate::cluster::config::ClusterConfig;
+use crate::cluster::docker::{ContainerRunConfig, DockerManager};
 use crate::config::HookEvent;
 use crate::hooks::HookExecutor;
 use crate::ui::components::OutputLine;
@@ -27,40 +29,51 @@ impl K3sManager {
     /// Calculate config hash from fields that affect cluster state
     /// Excludes: cluster_name, speedup settings, logging config
     pub(super) fn calculate_config_hash(&self) -> String {
-        let mut hasher = Sha256::new();
+        Self::calculate_config_hash_static(&self.config)
+    }
 
-        // Hash fields that affect cluster runtime state
-        hasher.update(self.config.k3s_version.as_bytes());
-        hasher.update(self.config.domain.as_bytes());
-        hasher.update(self.config.api_port.to_string().as_bytes());
-        hasher.update(self.config.http_port.to_string().as_bytes());
-        hasher.update(self.config.https_port.to_string().as_bytes());
-
-        // Hash additional ports
-        for (host, container) in &self.config.additional_ports {
-            hasher.update(format!("{}:{}", host, container).as_bytes());
-        }
-
-        // Hash volume paths (constants for now, but might be configurable later)
-        hasher.update(Self::RANCHER_DATA_PATH.as_bytes());
-        hasher.update(Self::LOCAL_PV_STORAGE_PATH.as_bytes());
-
-        // Hash k3s command flags (hardcoded for now)
-        hasher.update(b"--docker");
-        hasher.update(b"--disable=metrics-server");
-        hasher.update(b"--disable=servicelb");
-
-        let result = hasher.finalize();
-        format!("{:x}", result)[..8].to_string()
+    /// Compute snapshot image name from config (static version)
+    pub(crate) fn compute_snapshot_image_name(config: &ClusterConfig) -> String {
+        let version = Self::sanitize_version(&config.k3s_version);
+        let hash = Self::calculate_config_hash_static(config);
+        format!("k3dev-snapshot-{}-{}", version, hash)
     }
 
     /// Get snapshot image name based on config hash
     /// Format: k3dev-snapshot-{version}-{hash}
     /// Example: k3dev-snapshot-v1-33-4-k3s1-a7b3c2d1
     pub(super) fn get_snapshot_image_name(&self) -> String {
-        let version = Self::sanitize_version(&self.config.k3s_version);
-        let hash = self.calculate_config_hash();
-        format!("k3dev-snapshot-{}-{}", version, hash)
+        Self::compute_snapshot_image_name(&self.config)
+    }
+
+    /// Check if a snapshot image is a deep snapshot (created after Traefik + hooks)
+    pub(crate) async fn is_deep_snapshot(docker: &DockerManager, image: &str) -> bool {
+        docker
+            .get_image_labels(image)
+            .await
+            .get("k3dev.snapshot.deep")
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
+
+    /// Static version of calculate_config_hash
+    fn calculate_config_hash_static(config: &ClusterConfig) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(config.k3s_version.as_bytes());
+        hasher.update(config.domain.as_bytes());
+        hasher.update(config.api_port.to_string().as_bytes());
+        hasher.update(config.http_port.to_string().as_bytes());
+        hasher.update(config.https_port.to_string().as_bytes());
+        for (host, container) in &config.additional_ports {
+            hasher.update(format!("{}:{}", host, container).as_bytes());
+        }
+        hasher.update(Self::RANCHER_DATA_PATH.as_bytes());
+        hasher.update(Self::LOCAL_PV_STORAGE_PATH.as_bytes());
+        hasher.update(b"--docker");
+        hasher.update(b"--disable=metrics-server");
+        hasher.update(b"--disable=servicelb");
+        let result = hasher.finalize();
+        format!("{:x}", result)[..8].to_string()
     }
 
     /// Create a snapshot of the current running cluster
@@ -153,18 +166,91 @@ impl K3sManager {
         }
     }
 
-    /// Start cluster from a snapshot image (fast path)
-    pub(super) async fn start_from_snapshot(
-        &mut self,
-        snapshot_image: &str,
+    /// Create a deep snapshot after Traefik + hooks have completed.
+    /// This is a static method so it can be called from a background task.
+    pub(crate) async fn create_deep_snapshot(
+        container_name: &str,
+        docker: &DockerManager,
+        config: &ClusterConfig,
         output_tx: &mpsc::Sender<OutputLine>,
     ) -> Result<()> {
+        let snapshot_image = Self::compute_snapshot_image_name(config);
+
         let _ = output_tx
             .send(OutputLine::info(format!(
-                "Starting from snapshot: {}",
+                "Creating deep snapshot: {}...",
                 snapshot_image
             )))
             .await;
+
+        // Copy volume data into container filesystem for snapshot
+        let copy_cmd = format!(
+            "mkdir -p /snapshot-data && \
+             rm -rf /snapshot-data/rancher /snapshot-data/pv && \
+             cp -a {} /snapshot-data/rancher && \
+             cp -a {} /snapshot-data/pv",
+            Self::RANCHER_DATA_PATH,
+            Self::LOCAL_PV_STORAGE_PATH
+        );
+
+        docker
+            .exec_in_container(container_name, &["sh", "-c", &copy_cmd])
+            .await?;
+
+        // Prepare labels — same as regular snapshot but with deep flag
+        let mut labels = HashMap::new();
+        labels.insert(
+            "k3dev.snapshot.created".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        labels.insert(
+            "k3dev.k3s_version".to_string(),
+            config.k3s_version.clone(),
+        );
+        labels.insert(
+            "k3dev.config_hash".to_string(),
+            Self::calculate_config_hash_static(config),
+        );
+        labels.insert("k3dev.domain".to_string(), config.domain.clone());
+        labels.insert("k3dev.snapshot.deep".to_string(), "true".to_string());
+
+        docker
+            .commit_container(container_name, &snapshot_image, labels)
+            .await?;
+
+        let _ = output_tx
+            .send(OutputLine::success(format!(
+                "Deep snapshot created: {}",
+                snapshot_image
+            )))
+            .await;
+
+        Ok(())
+    }
+
+    /// Start cluster from a snapshot image (fast path)
+    /// If `is_deep` is true, skip wait_for_cluster_ready (coredns, local-path-provisioner, configmap)
+    pub(super) async fn start_from_snapshot(
+        &mut self,
+        snapshot_image: &str,
+        is_deep: bool,
+        output_tx: &mpsc::Sender<OutputLine>,
+    ) -> Result<()> {
+        if is_deep {
+            let _ = output_tx
+                .send(OutputLine::info(format!(
+                    "Deep snapshot detected: {} (skipping deployment waits)",
+                    snapshot_image
+                )))
+                .await;
+        } else {
+            let _ = output_tx
+                .send(OutputLine::info(format!(
+                    "Starting from snapshot: {}",
+                    snapshot_image
+                )))
+                .await;
+        }
 
         // Get docker socket path
         let socket_path = self.platform.docker_socket_path().await?;
@@ -197,6 +283,8 @@ impl K3sManager {
                    cp -a /snapshot-data/pv/. {}/ 2>/dev/null || true && \
                    echo 'Cluster state restored'; \
                  fi && \
+                 nsenter --mount=/proc/1/ns/mnt modprobe br_netfilter 2>/dev/null || true && \
+                 sysctl -w net.bridge.bridge-nf-call-iptables=1 2>/dev/null || true && \
                  mkdir -p /run/k3s /sys/fs/cgroup/kubepods && \
                  /bin/k3s server \
                  --docker \
@@ -204,6 +292,7 @@ impl K3sManager {
                  --disable=servicelb \
                  --disable-cloud-controller \
                  --disable-network-policy \
+                 --default-local-storage-path {} \
                  --service-node-port-range 80-32767 \
                  --kubelet-arg=root-dir=/var/lib/docker/kubelet \
                  --kubelet-arg=cgroup-driver=cgroupfs \
@@ -213,6 +302,7 @@ impl K3sManager {
                 Self::RANCHER_DATA_PATH,
                 Self::LOCAL_PV_STORAGE_PATH,
                 Self::RANCHER_DATA_PATH,
+                Self::LOCAL_PV_STORAGE_PATH,
                 Self::LOCAL_PV_STORAGE_PATH
             ),
         ];
@@ -284,9 +374,10 @@ impl K3sManager {
             .await;
         self.setup_kubeconfig().await?;
 
-        // Wait for cluster to be fully ready (deployments, etc.)
-        // Even though snapshot has pre-initialized cluster, deployments still need to start
-        self.wait_for_cluster_ready(output_tx).await?;
+        if !is_deep {
+            // Legacy snapshot: wait for cluster to be fully ready (deployments, etc.)
+            self.wait_for_cluster_ready(output_tx).await?;
+        }
 
         // Execute on_cluster_available hooks
         if self.config.hooks.has_hooks() {
@@ -303,15 +394,13 @@ impl K3sManager {
         Ok(())
     }
 
-    /// Cleanup old snapshots (delete all k3dev-snapshot-* images except current)
-    pub(super) async fn cleanup_old_snapshots(
-        &self,
+    /// Cleanup old snapshots (static version for use from background tasks)
+    pub(crate) async fn cleanup_old_snapshots_static(
+        docker: &DockerManager,
         current_snapshot: &str,
         output_tx: &mpsc::Sender<OutputLine>,
     ) -> Result<()> {
-        // List all k3dev-snapshot-* images
-        let snapshots = self
-            .docker
+        let snapshots = docker
             .list_images_by_pattern("k3dev-snapshot-")
             .await?;
 
@@ -319,18 +408,12 @@ impl K3sManager {
             return Ok(());
         }
 
-        let _ = output_tx
-            .send(OutputLine::info("Cleaning up old snapshots..."))
-            .await;
-
         let mut removed_count = 0;
         for snapshot in snapshots {
-            // Skip the current snapshot
             if snapshot.starts_with(current_snapshot) {
                 continue;
             }
-
-            match self.docker.remove_image(&snapshot).await {
+            match docker.remove_image(&snapshot).await {
                 Ok(()) => {
                     tracing::debug!(snapshot = %snapshot, "Removed old snapshot");
                     removed_count += 1;
@@ -345,6 +428,55 @@ impl K3sManager {
             let _ = output_tx
                 .send(OutputLine::info(format!(
                     "Cleaned up {} old snapshot(s)",
+                    removed_count
+                )))
+                .await;
+        }
+
+        Ok(())
+    }
+
+    /// Cleanup old snapshots (delete all k3dev-snapshot-* images except current)
+    pub(super) async fn cleanup_old_snapshots(
+        &self,
+        current_snapshot: &str,
+        output_tx: &mpsc::Sender<OutputLine>,
+    ) -> Result<()> {
+        Self::cleanup_old_snapshots_static(&self.docker, current_snapshot, output_tx).await
+    }
+
+    /// Delete all snapshot images for this cluster
+    pub async fn delete_snapshots(&self, output_tx: &mpsc::Sender<OutputLine>) -> Result<()> {
+        let snapshots = self
+            .docker
+            .list_images_by_pattern("k3dev-snapshot-")
+            .await?;
+
+        if snapshots.is_empty() {
+            return Ok(());
+        }
+
+        let _ = output_tx
+            .send(OutputLine::info("Removing snapshot images..."))
+            .await;
+
+        let mut removed_count = 0;
+        for snapshot in snapshots {
+            match self.docker.remove_image(&snapshot).await {
+                Ok(()) => {
+                    tracing::debug!(snapshot = %snapshot, "Removed snapshot");
+                    removed_count += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(snapshot = %snapshot, error = %e, "Failed to remove snapshot");
+                }
+            }
+        }
+
+        if removed_count > 0 {
+            let _ = output_tx
+                .send(OutputLine::info(format!(
+                    "Removed {} snapshot image(s)",
                     removed_count
                 )))
                 .await;

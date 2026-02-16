@@ -214,7 +214,7 @@ impl PodStats {
     }
 
     /// Compute the visual line offset of the pod at `target_idx`,
-    /// accounting for namespace headers and multi-line pods.
+    /// accounting for namespace headers, multi-line pods, and separators.
     fn line_index_of_pod(&self, target_idx: usize) -> usize {
         let mut line = 0;
         let mut current_ns = String::new();
@@ -227,20 +227,28 @@ impl PodStats {
                 return line;
             }
             line += Self::pod_line_count(pod);
+            // Separator line between pods
+            if i + 1 < self.pods.len() {
+                line += 1;
+            }
         }
         line
     }
 
-    /// Total number of visual lines (namespace headers + all pod lines).
+    /// Total number of visual lines (namespace headers + pod lines + separators).
     fn total_visual_lines(&self) -> usize {
         let mut total = 0;
         let mut current_ns = String::new();
-        for pod in &self.pods {
+        for (i, pod) in self.pods.iter().enumerate() {
             if pod.namespace != current_ns {
                 current_ns = pod.namespace.clone();
                 total += 1; // namespace header
             }
             total += Self::pod_line_count(pod);
+            // Separator line between pods
+            if i + 1 < self.pods.len() {
+                total += 1;
+            }
         }
         total
     }
@@ -345,6 +353,10 @@ impl PodStats {
                     line_idx += 1; // namespace header
                 }
                 line_idx += Self::pod_line_count(pod);
+                // Separator between pods
+                if idx + 1 < self.pods.len() {
+                    line_idx += 1;
+                }
                 continue;
             }
 
@@ -704,6 +716,16 @@ impl PodStats {
 
             line_idx += lines.len();
             text_lines.extend(lines);
+
+            // Add separator between pods
+            if idx + 1 < self.pods.len() && text_lines.len() < visible_lines {
+                let sep_width = available_width.saturating_sub(1); // -1 for scrollbar
+                text_lines.push(Line::from(Span::styled(
+                    "─".repeat(sep_width),
+                    self.styles.border_unfocused,
+                )));
+                line_idx += 1;
+            }
         }
 
         let paragraph = Paragraph::new(text_lines);

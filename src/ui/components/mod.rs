@@ -1,6 +1,7 @@
 mod action_bar;
 mod command_palette;
 mod confirm_popup;
+mod diagnostics_overlay;
 mod help_overlay;
 mod input_form;
 mod menu;
@@ -14,6 +15,7 @@ mod status_bar;
 pub use action_bar::{ActionBar, ClusterAction};
 pub use command_palette::CommandPalette;
 pub use confirm_popup::ConfirmPopup;
+pub use diagnostics_overlay::DiagnosticsOverlay;
 pub use help_overlay::HelpOverlay;
 pub use input_form::InputForm;
 pub use menu::{ActivePortForward, Menu};

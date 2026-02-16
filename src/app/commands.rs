@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::cluster::diagnostics::run_all_diagnostics;
 use crate::cluster::{ClusterManager, IngressManager};
 use crate::commands::{CommandContext, PaletteCommandId};
 use crate::config::{get_exec_placeholders, CommandEntry, RefreshTask};
@@ -62,6 +63,12 @@ impl App {
         // Handle custom commands from config
         if let Some(path) = cmd_id.custom_path() {
             self.execute_custom_command(path);
+            return;
+        }
+
+        // Handle diagnostics (cluster command but not a ClusterAction)
+        if matches!(cmd_id, PaletteCommandId::ClusterDiagnostics) {
+            self.run_diagnostics();
             return;
         }
 
@@ -159,6 +166,17 @@ impl App {
             return;
         }
 
+        // Show confirmation for delete snapshots action
+        if action == ClusterAction::DeleteSnapshots {
+            self.pending_cluster_action = Some(action);
+            self.confirm_popup.set_content(
+                "Delete Snapshots",
+                "This will remove all snapshot images. Next cluster start will be slower.",
+            );
+            self.mode = AppMode::ConfirmDestroy;
+            return;
+        }
+
         self.do_execute_cluster_action(action);
     }
 
@@ -209,6 +227,7 @@ impl App {
                     ClusterAction::Restart => manager.restart(tx).await,
                     ClusterAction::Destroy => manager.delete(tx).await,
                     ClusterAction::Info => manager.info(tx).await,
+                    ClusterAction::DeleteSnapshots => manager.delete_snapshots(tx).await,
                 };
 
                 action_result.map_err(|e| format!("Error: {}", e))
@@ -431,6 +450,19 @@ impl App {
                     .map_err(|e| format!("Failed to update /etc/hosts: {}", e))
             })
             .await;
+        });
+    }
+
+    /// Run cluster diagnostics
+    pub(super) fn run_diagnostics(&mut self) {
+        self.diagnostics_overlay.reset();
+        self.mode = AppMode::Diagnostics;
+
+        let message_tx = self.message_tx.clone();
+        let cluster_config = Arc::clone(&self.cluster_config);
+
+        tokio::spawn(async move {
+            run_all_diagnostics(cluster_config, message_tx).await;
         });
     }
 
