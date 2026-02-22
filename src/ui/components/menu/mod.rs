@@ -133,6 +133,24 @@ impl Menu {
         &self.ingress_entries
     }
 
+    /// Get all flat menu items
+    pub fn flat_items(&self) -> &[FlatMenuItem] {
+        &self.flat_items
+    }
+
+    /// Get the currently selected index into flat_items
+    pub fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    /// Get the original commands for a group by index
+    pub fn group_commands(&self, group_index: usize) -> &[CommandEntry] {
+        self.items
+            .get(group_index)
+            .map(|g| g.commands.as_slice())
+            .unwrap_or(&[])
+    }
+
     // === Search Mode ===
 
     /// Check if in search mode

@@ -1,5 +1,7 @@
 //! Pod stats component showing running pods with Docker-based metrics
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use ratatui::{
     layout::Rect,
@@ -158,6 +160,8 @@ pub struct PodStats {
     /// Animation tick (currently unused, kept for API compat)
     #[allow(dead_code)]
     animation_tick: u8,
+    /// Pod names that should be highlighted (e.g., targets of selected menu command)
+    highlighted_pods: HashSet<String>,
 }
 
 impl PodStats {
@@ -172,6 +176,7 @@ impl PodStats {
             selected_index: 0,
             styles: Styles::from_theme(theme),
             animation_tick: 0,
+            highlighted_pods: HashSet::new(),
         }
     }
 
@@ -202,6 +207,27 @@ impl PodStats {
     /// Get the currently selected pod (if any)
     pub fn selected_pod(&self) -> Option<&PodStat> {
         self.pods.get(self.selected_index)
+    }
+
+    /// Get all pods
+    pub fn pods(&self) -> &[PodStat] {
+        &self.pods
+    }
+
+    /// Set which pod names should be highlighted
+    pub fn set_highlighted_pods(&mut self, pods: HashSet<String>) {
+        self.highlighted_pods = pods;
+    }
+
+    /// Select a pod by index and adjust scroll
+    pub fn select_index(&mut self, index: usize) {
+        if index < self.pods.len() {
+            self.selected_index = index;
+            let pod_line = self.line_index_of_pod(self.selected_index);
+            if pod_line < self.scroll_offset {
+                self.scroll_offset = pod_line;
+            }
+        }
     }
 
     /// How many visual lines a pod occupies.
@@ -307,6 +333,12 @@ impl PodStats {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        self.render_inner(frame, inner, focused);
+    }
+
+    /// Render pod list content into the given area (no outer border).
+    /// Used when the outer block is drawn by the parent layout.
+    pub fn render_inner(&self, frame: &mut Frame, inner: Rect, focused: bool) {
         if self.pods.is_empty() {
             let empty_msg = Paragraph::new(Line::from(Span::styled(
                 "No pods running",
@@ -389,6 +421,8 @@ impl PodStats {
             // Extract short name from k8s container name
             let short_name = self.extract_pod_name(&pod.name);
 
+            let is_highlighted = self.highlighted_pods.contains(&pod.name);
+
             // Name style - color based on pod state, highlight if selected
             let name_style = match &pod.state {
                 PodState::Failed { .. } => {
@@ -409,6 +443,10 @@ impl PodStats {
                 _ => {
                     if is_selected {
                         self.styles.selected
+                    } else if is_highlighted {
+                        Style::default()
+                            .fg(self.styles.palette.highlight)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         self.styles.normal_text
                     }

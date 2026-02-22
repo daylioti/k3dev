@@ -8,11 +8,13 @@ use crate::cluster::{
     ResourceStats,
 };
 use crate::config::RefreshTask;
-use crate::k8s::PendingPodInfo;
-use crate::ui::components::{ActivePortForward, ContainerPullInfo, OutputLine, PodStat, PodState};
+use crate::k8s::{PendingPodInfo, PodTimeline, ShellSessionHandle};
+use crate::ui::components::{
+    ActivePortForward, ContainerPullInfo, DetailTab, OutputLine, PodStat, PodState,
+};
 use std::collections::{HashMap, HashSet};
 
-use super::App;
+use super::{App, AppMode};
 
 /// Async message types for communication between tasks and the app
 pub enum AppMessage {
@@ -54,6 +56,33 @@ pub enum AppMessage {
 
     /// Diagnostics state update (sent incrementally as tests complete)
     DiagnosticsUpdated(DiagnosticsReport),
+
+    /// Pod startup timeline loaded
+    PodTimelineLoaded(PodTimeline),
+
+    /// Pod logs loaded for detail panel
+    PodLogsLoaded(Vec<String>),
+
+    /// Pod describe loaded for detail panel
+    PodDescribeLoaded(Vec<String>),
+
+    /// Raw output bytes from interactive shell
+    ShellOutput(Vec<u8>),
+
+    /// Shell session handle delivered to App
+    ShellSessionReady(ShellSessionHandle),
+
+    /// Shell session closed (optional error message)
+    ShellSessionEnded(Option<String>),
+
+    /// Pod resolved for a shell command — open shell tab and send command
+    ShellCommandPodResolved {
+        pod_name: String,
+        namespace: String,
+        container: String,
+        workdir: String,
+        command: String,
+    },
 
     /// Error message
     Error(String),
@@ -235,8 +264,131 @@ impl App {
             AppMessage::DiagnosticsUpdated(report) => {
                 self.diagnostics_overlay.update(report);
             }
+            AppMessage::PodTimelineLoaded(timeline) => {
+                // Only apply if the detail panel is open for this pod
+                if self.pod_detail_panel.is_open()
+                    && self.pod_detail_panel.pod_name() == timeline.pod_name
+                {
+                    self.pod_detail_panel.set_timeline(timeline);
+                }
+            }
+            AppMessage::PodLogsLoaded(lines) => {
+                if self.pod_detail_panel.is_open() {
+                    self.pod_detail_panel.set_logs(lines);
+                }
+            }
+            AppMessage::PodDescribeLoaded(lines) => {
+                if self.pod_detail_panel.is_open() {
+                    self.pod_detail_panel.set_describe(lines);
+                }
+            }
             AppMessage::ActivePortForwardsUpdated(forwards) => {
                 self.menu.set_active_port_forwards(forwards);
+            }
+            AppMessage::ShellOutput(bytes) => {
+                if self.pod_detail_panel.is_open() && self.pod_detail_panel.has_shell_view() {
+                    self.pod_detail_panel.feed_shell_output(&bytes);
+                }
+            }
+            AppMessage::ShellSessionReady(handle) => {
+                // Only accept if shell tab is still active for this pod
+                if self.pod_detail_panel.is_open()
+                    && self.pod_detail_panel.active_tab() == DetailTab::Shell
+                    && self.pod_detail_panel.pod_name() == handle.pod_name()
+                {
+                    self.pod_detail_panel.set_shell_connected();
+                    self.shell_session = Some(handle);
+
+                    // If a command is pending, send it now and enter shell mode
+                    if let Some(cmd) = self.pending_shell_command.take() {
+                        if let Some(session) = &self.shell_session {
+                            session.write(cmd.as_bytes());
+                        }
+                        self.mode = AppMode::Shell;
+                        self.pod_detail_panel.set_shell_interactive(true);
+                    }
+                } else {
+                    // Shell tab was closed/changed while connecting
+                    handle.close();
+                }
+            }
+            AppMessage::ShellSessionEnded(error) => {
+                self.shell_session = None;
+                self.pending_shell_command = None;
+                self.pod_detail_panel.set_shell_interactive(false);
+                if let Some(err) = error {
+                    self.pod_detail_panel.set_shell_error(err);
+                } else {
+                    self.pod_detail_panel.set_shell_disconnected();
+                }
+                if self.mode == AppMode::Shell {
+                    self.mode = AppMode::Normal;
+                }
+            }
+            AppMessage::ShellCommandPodResolved {
+                pod_name,
+                namespace,
+                container,
+                workdir,
+                command,
+            } => {
+                // Build the shell command string
+                let shell_cmd = if workdir.is_empty() {
+                    format!("{}\n", command)
+                } else {
+                    format!("cd {} && {}\n", workdir, command)
+                };
+
+                // Find and select the pod in the pod list
+                let pod_index = self
+                    .pod_stats
+                    .pods()
+                    .iter()
+                    .position(|p| p.name == pod_name);
+
+                if let Some(idx) = pod_index {
+                    self.pod_stats.select_index(idx);
+                }
+
+                // Focus on PodStats and open Shell tab
+                self.focus = super::FocusArea::PodStats;
+                self.pod_detail_panel
+                    .open(pod_name.clone(), namespace.clone(), DetailTab::Shell);
+
+                // Check if we already have a connected shell session for this pod
+                let same_pod_session = self
+                    .shell_session
+                    .as_ref()
+                    .map(|s| s.pod_name() == pod_name && s.namespace() == namespace)
+                    .unwrap_or(false);
+
+                if same_pod_session {
+                    // Session already connected — send command immediately
+                    if let Some(session) = &self.shell_session {
+                        // Ensure shell_view exists
+                        if !self.pod_detail_panel.has_shell_view() {
+                            let (rows, cols) = self.calculate_shell_dimensions();
+                            self.pod_detail_panel.init_shell_view(rows, cols);
+                            self.pod_detail_panel.set_shell_connected();
+                        }
+                        session.write(shell_cmd.as_bytes());
+                    }
+                    self.mode = AppMode::Shell;
+                    self.pod_detail_panel.set_shell_interactive(true);
+                } else {
+                    // Close old session if any
+                    if let Some(old_session) = self.shell_session.take() {
+                        old_session.close();
+                    }
+                    // Store pending command and start new shell session
+                    self.pending_shell_command = Some(shell_cmd);
+                    let container_opt = if container.is_empty() {
+                        None
+                    } else {
+                        Some(container.as_str())
+                    };
+                    self.spawn_shell_session(&pod_name, &namespace, container_opt);
+                }
             }
             AppMessage::Error(msg) => {
                 tracing::error!("{}", msg);
@@ -359,5 +511,8 @@ impl App {
         });
 
         self.pod_stats.set_pods(pod_stats);
+
+        // Auto-open detail panel when a pod is selected
+        self.ensure_detail_panel_synced();
     }
 }

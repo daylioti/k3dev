@@ -16,6 +16,7 @@ pub enum PodAction {
     ViewLogs,
     ExecShell,
     Describe,
+    Timeline,
     Delete,
     Restart,
 }
@@ -26,6 +27,7 @@ impl PodAction {
             PodAction::ViewLogs => "View Logs",
             PodAction::ExecShell => "Exec Shell",
             PodAction::Describe => "Describe",
+            PodAction::Timeline => "Timeline",
             PodAction::Delete => "Delete",
             PodAction::Restart => "Restart",
         }
@@ -36,6 +38,7 @@ impl PodAction {
             PodAction::ViewLogs => "📋",
             PodAction::ExecShell => "💻",
             PodAction::Describe => "📄",
+            PodAction::Timeline => "⏱️",
             PodAction::Delete => "🗑️",
             PodAction::Restart => "🔄",
         }
@@ -46,6 +49,7 @@ impl PodAction {
             PodAction::ViewLogs => 'l',
             PodAction::ExecShell => 'e',
             PodAction::Describe => 'd',
+            PodAction::Timeline => 't',
             PodAction::Delete => 'x',
             PodAction::Restart => 'r',
         }
@@ -56,6 +60,7 @@ impl PodAction {
             PodAction::ViewLogs,
             PodAction::ExecShell,
             PodAction::Describe,
+            PodAction::Timeline,
             PodAction::Delete,
             PodAction::Restart,
         ]

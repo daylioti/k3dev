@@ -3,10 +3,9 @@
 //! This module contains command execution functions including cluster actions,
 //! pod commands, and palette command handling.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::cluster::diagnostics::run_all_diagnostics;
@@ -14,7 +13,7 @@ use crate::cluster::{ClusterManager, IngressManager};
 use crate::commands::{CommandContext, PaletteCommandId};
 use crate::config::{get_exec_placeholders, CommandEntry, RefreshTask};
 use crate::k8s::PodExecutor;
-use crate::ui::components::{ClusterAction, OutputLine};
+use crate::ui::components::{ClusterAction, DetailTab, OutputLine};
 
 use super::{App, AppMessage, AppMode, FocusArea};
 
@@ -307,29 +306,6 @@ impl App {
             }
         };
 
-        self.output.clear();
-        self.output.set_title(&cmd.name);
-        self.output_popup.clear();
-        self.output_popup.set_title(&cmd.name);
-        self.is_executing = true;
-        self.status_bar.set_executing(true);
-        // Show output popup immediately when command starts
-        self.mode = super::AppMode::OutputPopup;
-
-        let cancel_token = CancellationToken::new();
-        self.cancel_token = Some(cancel_token.clone());
-
-        let (tx, mut rx) = mpsc::channel::<OutputLine>(100);
-        let message_tx = self.message_tx.clone();
-
-        // Spawn output forwarder
-        let msg_tx = message_tx.clone();
-        tokio::spawn(async move {
-            while let Some(line) = rx.recv().await {
-                let _ = msg_tx.send(AppMessage::OutputLine(line)).await;
-            }
-        });
-
         let namespace = exec.target.namespace.clone();
         let selector = exec.target.selector.clone();
         let pod_name = exec.target.pod_name.clone();
@@ -337,9 +313,10 @@ impl App {
         let workdir = exec.workdir.clone();
         let command = exec.cmd.clone();
         let executor = PodExecutor::new(k8s_client);
+        let message_tx = self.message_tx.clone();
 
+        // Resolve target pod async, then send ShellCommandPodResolved
         tokio::spawn(async move {
-            // Find pod
             let pod = match executor
                 .find_pod(
                     &namespace,
@@ -361,48 +338,19 @@ impl App {
                     let _ = message_tx
                         .send(AppMessage::Error(format!("Pod not found: {}", e)))
                         .await;
-                    let _ = message_tx.send(AppMessage::CommandComplete(1)).await;
                     return;
                 }
             };
 
             let _ = message_tx
-                .send(AppMessage::OutputLine(OutputLine::info(format!(
-                    "Executing on pod: {}",
-                    pod.name
-                ))))
+                .send(AppMessage::ShellCommandPodResolved {
+                    pod_name: pod.name,
+                    namespace,
+                    container,
+                    workdir,
+                    command,
+                })
                 .await;
-
-            // Execute command
-            let result = executor
-                .exec_with_workdir_streaming(
-                    &namespace,
-                    &pod.name,
-                    if container.is_empty() {
-                        None
-                    } else {
-                        Some(container.as_str())
-                    },
-                    &workdir,
-                    &command,
-                    tx,
-                    cancel_token,
-                )
-                .await;
-
-            match result {
-                Ok(exit_code) => {
-                    let _ = message_tx
-                        .send(AppMessage::CommandComplete(exit_code))
-                        .await;
-                }
-                Err(e) => {
-                    let _ = message_tx
-                        .send(AppMessage::Error(format!("Execution error: {}", e)))
-                        .await;
-                    let _ = message_tx.send(AppMessage::CommandComplete(1)).await;
-                }
-            }
         });
     }
 
@@ -475,6 +423,28 @@ impl App {
     ) {
         use crate::ui::components::PodAction;
 
+        // View actions route to the detail panel (no k8s_client needed here)
+        match action {
+            PodAction::ViewLogs => {
+                self.open_or_switch_detail_tab(DetailTab::Logs);
+                return;
+            }
+            PodAction::Describe => {
+                self.open_or_switch_detail_tab(DetailTab::Describe);
+                return;
+            }
+            PodAction::Timeline => {
+                self.open_or_switch_detail_tab(DetailTab::Timeline);
+                return;
+            }
+            PodAction::ExecShell => {
+                self.open_or_switch_detail_tab(DetailTab::Shell);
+                return;
+            }
+            PodAction::Delete | PodAction::Restart => {}
+        }
+
+        // Destructive actions need k8s_client and output popup
         let k8s_client = match &self.k8s_client {
             Some(c) => c.clone(),
             None => {
@@ -492,81 +462,6 @@ impl App {
             .set_title(format!("{} - {}", action_name, pod_name));
 
         match action {
-            PodAction::ViewLogs => {
-                self.is_executing = true;
-                self.status_bar.set_executing(true);
-                self.mode = super::AppMode::OutputPopup;
-
-                let (tx, mut rx) = mpsc::channel::<OutputLine>(100);
-                let message_tx = self.message_tx.clone();
-
-                // Spawn output forwarder
-                let msg_tx = message_tx.clone();
-                tokio::spawn(async move {
-                    while let Some(line) = rx.recv().await {
-                        let _ = msg_tx.send(AppMessage::OutputLine(line)).await;
-                    }
-                });
-
-                let namespace = namespace.to_string();
-                let pod_name = pod_name.to_string();
-
-                tokio::spawn(async move {
-                    match k8s_client
-                        .get_pod_logs(&namespace, &pod_name, None, Some(100))
-                        .await
-                    {
-                        Ok(logs) => {
-                            for line in logs.lines() {
-                                let _ = tx.send(OutputLine::info(line.to_string())).await;
-                            }
-                            let _ = message_tx.send(AppMessage::CommandComplete(0)).await;
-                        }
-                        Err(e) => {
-                            let _ = message_tx
-                                .send(AppMessage::Error(format!("Failed to get logs: {}", e)))
-                                .await;
-                            let _ = message_tx.send(AppMessage::CommandComplete(1)).await;
-                        }
-                    }
-                });
-            }
-            PodAction::Describe => {
-                self.is_executing = true;
-                self.status_bar.set_executing(true);
-                self.mode = super::AppMode::OutputPopup;
-
-                let (tx, mut rx) = mpsc::channel::<OutputLine>(100);
-                let message_tx = self.message_tx.clone();
-
-                // Spawn output forwarder
-                let msg_tx = message_tx.clone();
-                tokio::spawn(async move {
-                    while let Some(line) = rx.recv().await {
-                        let _ = msg_tx.send(AppMessage::OutputLine(line)).await;
-                    }
-                });
-
-                let namespace = namespace.to_string();
-                let pod_name = pod_name.to_string();
-
-                tokio::spawn(async move {
-                    match k8s_client.describe_pod(&namespace, &pod_name).await {
-                        Ok(description) => {
-                            for line in description.lines() {
-                                let _ = tx.send(OutputLine::info(line.to_string())).await;
-                            }
-                            let _ = message_tx.send(AppMessage::CommandComplete(0)).await;
-                        }
-                        Err(e) => {
-                            let _ = message_tx
-                                .send(AppMessage::Error(format!("Failed to describe pod: {}", e)))
-                                .await;
-                            let _ = message_tx.send(AppMessage::CommandComplete(1)).await;
-                        }
-                    }
-                });
-            }
             PodAction::Delete => {
                 self.is_executing = true;
                 self.status_bar.set_executing(true);
@@ -639,18 +534,347 @@ impl App {
                     }
                 });
             }
-            PodAction::ExecShell => {
-                // ExecShell requires interactive terminal - show info message
-                self.output.add_info(format!(
-                    "To exec into pod, run: kubectl exec -it -n {} {} -- /bin/sh",
-                    namespace, pod_name
-                ));
-                self.output_popup.add_line(OutputLine::info(format!(
-                    "Interactive shell not supported in TUI mode.\n\nRun this command in a separate terminal:\n\nkubectl exec -it -n {} {} -- /bin/sh",
-                    namespace, pod_name
-                )));
-                self.mode = super::AppMode::OutputPopup;
+            // View actions already handled above
+            _ => {}
+        }
+    }
+
+    /// Auto-open detail panel when a pod is selected, close when no pods
+    pub(super) fn ensure_detail_panel_synced(&mut self) {
+        if let Some(pod) = self.pod_stats.selected_pod() {
+            let name = pod.name.clone();
+            let ns = pod.namespace.clone();
+            if !self.pod_detail_panel.is_open() {
+                // First open — default to Logs tab
+                self.pod_detail_panel.open(name, ns, DetailTab::Logs);
+                self.load_active_tab();
+            } else if self.pod_detail_panel.pod_name() != name {
+                // Pod changed (e.g. pod list shifted) — refresh
+                let tab = self.pod_detail_panel.active_tab();
+                self.pod_detail_panel.open(name, ns, tab);
+                self.load_active_tab();
+            }
+        } else if self.pod_detail_panel.is_open() {
+            // No pods left — close panel and shell session
+            self.pod_detail_panel.close();
+            if let Some(session) = self.shell_session.take() {
+                session.close();
+            }
+            if self.mode == AppMode::Shell {
+                self.mode = AppMode::Normal;
             }
         }
     }
+
+    /// Open detail panel on a tab (or switch tab if already open)
+    pub(super) fn open_or_switch_detail_tab(&mut self, tab: DetailTab) {
+        if let Some(pod) = self.pod_stats.selected_pod() {
+            let name = pod.name.clone();
+            let ns = pod.namespace.clone();
+            if !self.pod_detail_panel.is_open() || self.pod_detail_panel.pod_name() != name {
+                self.pod_detail_panel.open(name, ns, tab);
+            } else {
+                self.pod_detail_panel.set_tab(tab);
+            }
+            self.load_active_tab();
+        }
+    }
+
+    /// Load data for the currently active tab
+    pub(super) fn load_active_tab(&mut self) {
+        let tab = self.pod_detail_panel.active_tab();
+        let pod_name = self.pod_detail_panel.pod_name().to_string();
+        let namespace = self.pod_detail_panel.namespace().to_string();
+
+        match tab {
+            DetailTab::Logs => self.load_detail_logs(&pod_name, &namespace),
+            DetailTab::Describe => self.load_detail_describe(&pod_name, &namespace),
+            DetailTab::Timeline => self.load_detail_timeline(&pod_name, &namespace),
+            DetailTab::Shell => self.activate_shell_tab(),
+        }
+    }
+
+    fn load_detail_logs(&mut self, pod_name: &str, namespace: &str) {
+        let k8s_client = match &self.k8s_client {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        self.pod_detail_panel.set_loading(DetailTab::Logs, true);
+
+        let message_tx = self.message_tx.clone();
+        let namespace = namespace.to_string();
+        let pod_name = pod_name.to_string();
+
+        tokio::spawn(async move {
+            match k8s_client
+                .get_pod_logs(&namespace, &pod_name, None, Some(100))
+                .await
+            {
+                Ok(logs) => {
+                    let lines: Vec<String> = logs.lines().map(|l| l.to_string()).collect();
+                    let _ = message_tx.send(AppMessage::PodLogsLoaded(lines)).await;
+                }
+                Err(e) => {
+                    let _ = message_tx
+                        .send(AppMessage::Error(format!("Failed to get logs: {}", e)))
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn load_detail_describe(&mut self, pod_name: &str, namespace: &str) {
+        let k8s_client = match &self.k8s_client {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        self.pod_detail_panel.set_loading(DetailTab::Describe, true);
+
+        let message_tx = self.message_tx.clone();
+        let namespace = namespace.to_string();
+        let pod_name = pod_name.to_string();
+
+        tokio::spawn(async move {
+            match k8s_client.describe_pod(&namespace, &pod_name).await {
+                Ok(description) => {
+                    let lines: Vec<String> =
+                        description.lines().map(|l| l.to_string()).collect();
+                    let _ = message_tx
+                        .send(AppMessage::PodDescribeLoaded(lines))
+                        .await;
+                }
+                Err(e) => {
+                    let _ = message_tx
+                        .send(AppMessage::Error(format!("Failed to describe pod: {}", e)))
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn load_detail_timeline(&mut self, pod_name: &str, namespace: &str) {
+        let k8s_client = match &self.k8s_client {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        self.pod_detail_panel
+            .set_loading(DetailTab::Timeline, true);
+
+        let client = k8s_client.client().clone();
+        let message_tx = self.message_tx.clone();
+        let namespace = namespace.to_string();
+        let pod_name = pod_name.to_string();
+
+        tokio::spawn(async move {
+            match crate::k8s::get_pod_timeline(&client, &namespace, &pod_name).await {
+                Ok(timeline) => {
+                    let _ = message_tx
+                        .send(AppMessage::PodTimelineLoaded(timeline))
+                        .await;
+                }
+                Err(e) => {
+                    let _ = message_tx
+                        .send(AppMessage::Error(format!(
+                            "Failed to load timeline: {}",
+                            e
+                        )))
+                        .await;
+                }
+            }
+        });
+    }
+
+    /// Activate the shell tab — reuse existing session or start a new one
+    fn activate_shell_tab(&mut self) {
+        let pod_name = self.pod_detail_panel.pod_name().to_string();
+        let namespace = self.pod_detail_panel.namespace().to_string();
+
+        // Reuse existing session if it's for the same pod
+        if let Some(session) = &self.shell_session {
+            if session.pod_name() == pod_name && session.namespace() == namespace {
+                // Ensure shell_view exists (might have been cleared by open())
+                if !self.pod_detail_panel.has_shell_view() {
+                    let (rows, cols) = self.calculate_shell_dimensions();
+                    self.pod_detail_panel.init_shell_view(rows, cols);
+                    self.pod_detail_panel.set_shell_connected();
+                }
+                return;
+            }
+            // Different pod — close old session
+            session.close();
+            self.shell_session = None;
+        }
+
+        // Start new session
+        self.spawn_shell_session(&pod_name, &namespace, None);
+    }
+
+    /// Spawn a new shell session for the given pod
+    pub(super) fn spawn_shell_session(
+        &mut self,
+        pod_name: &str,
+        namespace: &str,
+        container: Option<&str>,
+    ) {
+        let k8s_client = match &self.k8s_client {
+            Some(c) => c.clone(),
+            None => {
+                self.pod_detail_panel
+                    .set_shell_error("Kubernetes client not connected".into());
+                return;
+            }
+        };
+
+        let (rows, cols) = self.calculate_shell_dimensions();
+        self.pod_detail_panel.init_shell_view(rows, cols);
+        self.shell_area_size = (rows, cols);
+
+        let client = k8s_client.client().clone();
+        let message_tx = self.message_tx.clone();
+        let pod_name = pod_name.to_string();
+        let namespace = namespace.to_string();
+        let container = container.map(|s| s.to_string());
+
+        tokio::spawn(async move {
+            crate::k8s::shell_session::start_shell_session(
+                client, pod_name, namespace, container, message_tx,
+            )
+            .await;
+        });
+    }
+
+    /// Calculate shell content area dimensions from current layout
+    pub(super) fn calculate_shell_dimensions(&self) -> (u16, u16) {
+        let layout = match &self.current_layout {
+            Some(l) => l,
+            None => return (24, 80),
+        };
+        let area = layout.pod_stats;
+        // Outer block: -2 rows (borders), -2 cols (borders)
+        // 50% split for pod list, 1 row separator, rest for detail
+        // Detail: -1 row for tab bar
+        let inner_height = area.height.saturating_sub(2);
+        let pod_list_height = inner_height / 2;
+        let detail_height = inner_height.saturating_sub(pod_list_height + 1);
+        let content_height = detail_height.saturating_sub(1);
+        let content_width = area.width.saturating_sub(2);
+        (content_height, content_width)
+    }
+
+    /// Compute which pod names should be highlighted based on the selected menu item
+    pub(super) fn compute_highlighted_pods(&self) -> HashSet<String> {
+        let mut result = HashSet::new();
+
+        let items = self.menu.flat_items();
+        let selected = match self.menu.selected_item() {
+            Some(s) => s,
+            None => return result,
+        };
+
+        // Collect owned TargetConfigs to match against pods
+        let mut targets: Vec<crate::config::TargetConfig> = Vec::new();
+
+        // For leaf commands, use the target directly
+        if let Some(cmd) = &selected.command {
+            if let Some(exec) = &cmd.exec {
+                targets.push(exec.target.clone());
+            }
+        }
+
+        // For groups/parents, collect child targets
+        if selected.has_children || selected.is_group {
+            if selected.is_group {
+                // Top-level group — use original command data (works even if collapsed)
+                let group_cmds = self.menu.group_commands(selected.group_index);
+                collect_targets_recursive(group_cmds, &mut targets);
+            } else {
+                // Nested parent with children — walk flat_items forward
+                let selected_level = selected.level;
+                let selected_idx = self.menu.selected_index();
+
+                for item in items.iter().skip(selected_idx + 1) {
+                    if item.level <= selected_level {
+                        break;
+                    }
+                    if let Some(cmd) = &item.command {
+                        if let Some(exec) = &cmd.exec {
+                            targets.push(exec.target.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Match targets against pods
+        let pods = self.pod_stats.pods();
+        for target in &targets {
+            for pod in pods {
+                if matches_target(target, pod) {
+                    result.insert(pod.name.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Update pod highlights based on currently selected menu item
+    pub(super) fn update_pod_highlights(&mut self) {
+        if self.focus == FocusArea::Content {
+            let highlighted = self.compute_highlighted_pods();
+            if !highlighted.is_empty() {
+                tracing::debug!(count = highlighted.len(), pods = ?highlighted, "Highlighting pods");
+            }
+            self.pod_stats.set_highlighted_pods(highlighted);
+        } else {
+            self.pod_stats.set_highlighted_pods(HashSet::new());
+        }
+    }
+}
+
+/// Recursively collect all TargetConfigs from a list of command entries
+fn collect_targets_recursive(
+    entries: &[crate::config::CommandEntry],
+    targets: &mut Vec<crate::config::TargetConfig>,
+) {
+    for entry in entries {
+        if let Some(exec) = &entry.exec {
+            targets.push(exec.target.clone());
+        }
+        if !entry.commands.is_empty() {
+            collect_targets_recursive(&entry.commands, targets);
+        }
+    }
+}
+
+/// Check if a target config matches a pod
+fn matches_target(
+    target: &crate::config::TargetConfig,
+    pod: &crate::ui::components::PodStat,
+) -> bool {
+    // Check namespace if specified
+    if !target.namespace.is_empty() && target.namespace != pod.namespace {
+        return false;
+    }
+
+    // Match by pod_name
+    if !target.pod_name.is_empty() {
+        return pod.name.contains(&target.pod_name);
+    }
+
+    // Match by selector (extract values from key=value pairs)
+    if !target.selector.is_empty() {
+        for part in target.selector.split(',') {
+            let part: &str = part.trim();
+            if let Some((_key, value)) = part.split_once('=') {
+                if pod.name.contains(value) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // If only namespace specified, match all pods in that namespace
+    !target.namespace.is_empty()
 }

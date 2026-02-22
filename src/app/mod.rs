@@ -10,7 +10,7 @@ mod refresh;
 
 use anyhow::Result;
 use crossterm::event::{self, Event};
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::{Constraint, Layout}, Terminal};
 use std::io::Stdout;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,13 +25,13 @@ use crate::cluster::{
 use crate::config::{
     Config, ConfigLoader, ConfigValidator, RefreshConfig, RefreshScheduler, RefreshTask,
 };
-use crate::k8s::K8sClient;
+use crate::k8s::{K8sClient, ShellSessionHandle};
 use crate::k8s::PendingPodInfo;
 use crate::keybindings::KeybindingResolver;
 use crate::ui::components::{
     ActionBar, ClusterAction, ClusterStatus as UiClusterStatus, CommandPalette, ConfirmPopup,
-    DiagnosticsOverlay, HelpOverlay, InputForm, Menu, Output, OutputPopup, PasswordPopup,
-    PodContextMenu, PodStats, StatusBar,
+    DetailTab, DiagnosticsOverlay, HelpOverlay, InputForm, Menu, Output, OutputPopup,
+    PasswordPopup, PodContextMenu, PodDetailPanel, PodStats, StatusBar,
 };
 use crate::ui::{AppLayout, Styles};
 use std::collections::{HashMap, HashSet};
@@ -58,6 +58,7 @@ pub enum AppMode {
     ConfirmDestroy,
     PodContextMenu,
     Diagnostics,
+    Shell,
 }
 
 /// Main application
@@ -87,6 +88,7 @@ pub struct App {
     confirm_popup: ConfirmPopup,
     pod_context_menu: PodContextMenu,
     diagnostics_overlay: DiagnosticsOverlay,
+    pod_detail_panel: PodDetailPanel,
     #[allow(dead_code)]
     styles: Styles,
 
@@ -118,6 +120,13 @@ pub struct App {
     active_pull_monitors: HashSet<String>,
     /// Bollard Docker client for spawning pull monitors
     docker_client: Option<Docker>,
+
+    // Interactive shell session
+    shell_session: Option<ShellSessionHandle>,
+    shell_area_size: (u16, u16),
+
+    // Pending command to send to shell once session is ready
+    pending_shell_command: Option<String>,
 
     // Async channels
     message_tx: mpsc::Sender<AppMessage>,
@@ -220,6 +229,7 @@ impl App {
             confirm_popup: ConfirmPopup::with_theme(theme),
             pod_context_menu: PodContextMenu::with_theme(theme),
             diagnostics_overlay: DiagnosticsOverlay::with_theme(theme),
+            pod_detail_panel: PodDetailPanel::with_theme(theme),
             styles: Styles::from_theme(theme),
             focus: FocusArea::Content,
             mode: AppMode::Normal,
@@ -242,6 +252,9 @@ impl App {
                 bollard::API_DEFAULT_VERSION,
             )
             .ok(),
+            shell_session: None,
+            shell_area_size: (0, 0),
+            pending_shell_command: None,
             message_tx,
             message_rx,
             cancel_token: None,
@@ -312,6 +325,21 @@ impl App {
                 }
             }
 
+            // Handle shell area resize
+            if self.pod_detail_panel.is_open()
+                && self.pod_detail_panel.active_tab() == DetailTab::Shell
+                && self.pod_detail_panel.has_shell_view()
+            {
+                let (rows, cols) = self.calculate_shell_dimensions();
+                if rows > 0 && cols > 0 && (rows, cols) != self.shell_area_size {
+                    self.shell_area_size = (rows, cols);
+                    self.pod_detail_panel.resize_shell(rows, cols);
+                    if let Some(session) = &self.shell_session {
+                        session.resize(rows, cols);
+                    }
+                }
+            }
+
             if self.should_quit {
                 break;
             }
@@ -337,9 +365,60 @@ impl App {
         self.menu
             .render(frame, layout.menu, self.focus == FocusArea::Content);
 
-        // Render pod stats panel (now takes full right side)
-        self.pod_stats
-            .render(frame, layout.pod_stats, self.focus == FocusArea::PodStats);
+        // Render pod stats panel
+        let focused = self.focus == FocusArea::PodStats;
+        if self.pod_detail_panel.is_open() {
+            // Unified outer block for the entire right panel
+            let border_style = if focused {
+                self.styles.border_focused
+            } else {
+                self.styles.border_unfocused
+            };
+            let border_type = if focused {
+                ratatui::widgets::BorderType::Double
+            } else {
+                ratatui::widgets::BorderType::Rounded
+            };
+            let title = if focused { " \u{25cf} Pods " } else { "   Pods " };
+            let title_style = if focused {
+                self.styles.title.add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                self.styles.normal_text
+            };
+            let block = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .border_type(border_type)
+                .border_style(border_style)
+                .title(ratatui::text::Span::styled(title, title_style));
+
+            let inner = block.inner(layout.pod_stats);
+            frame.render_widget(block, layout.pod_stats);
+
+            // Split inner: pod list (top) | separator (1 row) | detail (bottom)
+            let split = Layout::vertical([
+                Constraint::Percentage(50),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+
+            self.pod_stats.render_inner(frame, split[0], focused);
+
+            // Thin separator line
+            let sep_line = ratatui::text::Line::from(
+                "\u{2500}".repeat(split[1].width as usize),
+            );
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(sep_line)
+                    .style(self.styles.border_unfocused),
+                split[1],
+            );
+
+            self.pod_detail_panel.render(frame, split[2]);
+        } else {
+            self.pod_stats
+                .render(frame, layout.pod_stats, focused);
+        }
 
         // Update selected item in status bar based on focus
         let selected_item = match self.focus {

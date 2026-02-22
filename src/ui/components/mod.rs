@@ -9,7 +9,9 @@ mod output;
 mod output_popup;
 mod password_popup;
 mod pod_context_menu;
+mod pod_detail_panel;
 mod pod_stats;
+pub mod shell_view;
 mod status_bar;
 
 pub use action_bar::{ActionBar, ClusterAction};
@@ -23,5 +25,6 @@ pub use output::{Output, OutputLine, OutputType};
 pub use output_popup::OutputPopup;
 pub use password_popup::PasswordPopup;
 pub use pod_context_menu::{PodAction, PodContextMenu};
+pub use pod_detail_panel::{DetailTab, PodDetailPanel};
 pub use pod_stats::{ContainerPullInfo, PodStat, PodState, PodStats};
 pub use status_bar::{ClusterStatus, StatusBar};

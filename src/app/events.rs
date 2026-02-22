@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEven
 
 use crate::config::RefreshTask;
 use crate::keybindings::KeyAction;
+use crate::ui::components::DetailTab;
 
 use super::{App, AppMode, FocusArea};
 
@@ -17,6 +18,27 @@ impl App {
         // Handle Quit action first - should always work regardless of mode
         if matches!(action, KeyAction::Quit) && self.mode == AppMode::Normal {
             self.should_quit = true;
+            return;
+        }
+
+        // Handle shell mode — must be before Cancel so Ctrl+C goes to shell
+        if self.mode == AppMode::Shell {
+            // Esc or Ctrl+] exits shell mode
+            if code == KeyCode::Esc
+                || (code == KeyCode::Char(']') && modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.mode = AppMode::Normal;
+                self.pod_detail_panel.set_shell_interactive(false);
+                return;
+            }
+            // Forward all other keys to shell stdin
+            if let Some(session) = &self.shell_session {
+                if let Some(bytes) =
+                    crate::ui::components::shell_view::key_to_bytes(code, modifiers)
+                {
+                    session.write(&bytes);
+                }
+            }
             return;
         }
 
@@ -214,6 +236,7 @@ impl App {
             match code {
                 KeyCode::Esc => {
                     self.menu.exit_search_mode();
+                    self.update_pod_highlights();
                 }
                 KeyCode::Enter => {
                     // Execute selected item and exit search mode
@@ -222,15 +245,19 @@ impl App {
                 }
                 KeyCode::Up | KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
                     self.menu.move_up();
+                    self.update_pod_highlights();
                 }
                 KeyCode::Down | KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
                     self.menu.move_down();
+                    self.update_pod_highlights();
                 }
                 KeyCode::Up => {
                     self.menu.move_up();
+                    self.update_pod_highlights();
                 }
                 KeyCode::Down => {
                     self.menu.move_down();
+                    self.update_pod_highlights();
                 }
                 KeyCode::Backspace => {
                     self.menu.search_handle_backspace();
@@ -238,9 +265,11 @@ impl App {
                     if self.menu.search_query().is_empty() {
                         self.menu.exit_search_mode();
                     }
+                    self.update_pod_highlights();
                 }
                 KeyCode::Char(c) => {
                     self.menu.search_handle_char(c);
+                    self.update_pod_highlights();
                 }
                 _ => {}
             }
@@ -274,14 +303,18 @@ impl App {
                 match c {
                     '1' => {
                         self.focus = FocusArea::Content;
+                        self.update_pod_highlights();
                         return;
                     }
                     '2' => {
                         self.focus = FocusArea::PodStats;
+                        self.ensure_detail_panel_synced();
+                        self.update_pod_highlights();
                         return;
                     }
                     '3' => {
                         self.focus = FocusArea::ActionBar;
+                        self.update_pod_highlights();
                         return;
                     }
                     _ => {}
@@ -308,6 +341,50 @@ impl App {
         let count = self.pending_count.parse::<usize>().unwrap_or(1).max(1);
         self.pending_count.clear();
         self.status_bar.set_pending_count(None);
+
+        // Handle pod detail panel shortcuts when PodStats is focused
+        if self.focus == FocusArea::PodStats {
+            if let KeyCode::Char(c) = code {
+                match c {
+                    'l' | 'd' | 't' | 'e' => {
+                        let tab = match c {
+                            'l' => DetailTab::Logs,
+                            'd' => DetailTab::Describe,
+                            't' => DetailTab::Timeline,
+                            _ => DetailTab::Shell,
+                        };
+                        self.open_or_switch_detail_tab(tab);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            // Detail panel open: PageUp/PageDown scroll
+            if self.pod_detail_panel.is_open() {
+                match code {
+                    KeyCode::PageUp => {
+                        self.pod_detail_panel.scroll_up();
+                        return;
+                    }
+                    KeyCode::PageDown => {
+                        let h = self.detail_visible_height();
+                        self.pod_detail_panel.scroll_down(h);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            // Enter shell mode when Shell tab is active with connected session
+            if self.pod_detail_panel.is_open()
+                && self.pod_detail_panel.active_tab() == DetailTab::Shell
+                && self.shell_session.is_some()
+                && code == KeyCode::Enter
+            {
+                self.mode = AppMode::Shell;
+                self.pod_detail_panel.set_shell_interactive(true);
+                return;
+            }
+        }
 
         // Handle actions via keybinding resolver
         match action {
@@ -481,27 +558,48 @@ impl App {
             FocusArea::Content => FocusArea::PodStats,
             FocusArea::PodStats => FocusArea::ActionBar,
         };
+        if self.focus == FocusArea::PodStats {
+            self.ensure_detail_panel_synced();
+        }
+        self.update_pod_highlights();
     }
 
     fn handle_up(&mut self) {
         match self.focus {
-            FocusArea::Content => self.menu.move_up(),
-            FocusArea::PodStats => self.pod_stats.scroll_up(),
+            FocusArea::Content => {
+                self.menu.move_up();
+                self.update_pod_highlights();
+            }
+            FocusArea::PodStats => {
+                let old_pod = self.pod_stats.selected_pod().map(|p| p.name.clone());
+                self.pod_stats.scroll_up();
+                self.refresh_detail_on_pod_change(old_pod);
+            }
             FocusArea::ActionBar => {}
         }
     }
 
     fn handle_down(&mut self) {
         match self.focus {
-            FocusArea::Content => self.menu.move_down(),
+            FocusArea::Content => {
+                self.menu.move_down();
+                self.update_pod_highlights();
+            }
             FocusArea::PodStats => {
-                // Get visible lines for scroll calculation
-                let visible = self
+                let old_pod = self.pod_stats.selected_pod().map(|p| p.name.clone());
+                // Halve visible height when detail panel is open
+                let full_height = self
                     .current_layout
                     .as_ref()
                     .map(|l| l.pod_stats.height.saturating_sub(2) as usize)
                     .unwrap_or(20);
+                let visible = if self.pod_detail_panel.is_open() {
+                    full_height / 2
+                } else {
+                    full_height
+                };
                 self.pod_stats.scroll_down(visible);
+                self.refresh_detail_on_pod_change(old_pod);
             }
             FocusArea::ActionBar => {}
         }
@@ -510,16 +608,32 @@ impl App {
     fn handle_left(&mut self) {
         match self.focus {
             FocusArea::ActionBar => self.action_bar.move_left(),
-            FocusArea::Content => self.menu.collapse(),
-            FocusArea::PodStats => {}
+            FocusArea::Content => {
+                self.menu.collapse();
+                self.update_pod_highlights();
+            }
+            FocusArea::PodStats => {
+                if self.pod_detail_panel.is_open() {
+                    self.pod_detail_panel.prev_tab();
+                    self.load_active_tab();
+                }
+            }
         }
     }
 
     fn handle_right(&mut self) {
         match self.focus {
             FocusArea::ActionBar => self.action_bar.move_right(),
-            FocusArea::Content => self.menu.expand(),
-            FocusArea::PodStats => {}
+            FocusArea::Content => {
+                self.menu.expand();
+                self.update_pod_highlights();
+            }
+            FocusArea::PodStats => {
+                if self.pod_detail_panel.is_open() {
+                    self.pod_detail_panel.next_tab();
+                    self.load_active_tab();
+                }
+            }
         }
     }
 
@@ -541,6 +655,7 @@ impl App {
                 if let Some(item) = self.menu.selected_item() {
                     if item.has_children {
                         self.menu.toggle();
+                        self.update_pod_highlights();
                     } else if let Some(cmd) = &item.command {
                         self.execute_command(cmd.clone());
                     }
@@ -566,5 +681,33 @@ impl App {
         self.pod_context_menu.reset();
 
         self.execute_pod_action(action, &pod_name, &namespace);
+    }
+
+    /// If detail panel is open and pod selection changed, reload content
+    fn refresh_detail_on_pod_change(&mut self, old_pod: Option<String>) {
+        if self.pod_detail_panel.is_open() {
+            let new_pod = self.pod_stats.selected_pod();
+            if new_pod.map(|p| &p.name) != old_pod.as_ref() {
+                if let Some(pod) = new_pod {
+                    let name = pod.name.clone();
+                    let ns = pod.namespace.clone();
+                    let tab = self.pod_detail_panel.active_tab();
+                    self.pod_detail_panel.open(name, ns, tab);
+                    self.load_active_tab();
+                }
+            }
+        }
+    }
+
+    /// Compute visible height for detail panel content area
+    fn detail_visible_height(&self) -> usize {
+        self.current_layout
+            .as_ref()
+            .map(|l| {
+                // Detail panel takes 50% of pod_stats area, minus tab bar (1) and borders (2)
+                let half = l.pod_stats.height / 2;
+                half.saturating_sub(3) as usize
+            })
+            .unwrap_or(10)
     }
 }
