@@ -47,10 +47,7 @@ pub async fn get_pod_timeline(
     pod_name: &str,
 ) -> Result<PodTimeline> {
     let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let pod = pods
-        .get(pod_name)
-        .await
-        .context("Failed to fetch pod")?;
+    let pod = pods.get(pod_name).await.context("Failed to fetch pod")?;
 
     let events_api: Api<Event> = Api::namespaced(client.clone(), namespace);
     let lp = ListParams::default().fields(&format!(
@@ -63,11 +60,7 @@ pub async fn get_pod_timeline(
         .context("Failed to fetch events")?;
 
     // Extract timestamps from pod metadata and status
-    let creation_ts = pod
-        .metadata
-        .creation_timestamp
-        .as_ref()
-        .map(|t| t.0);
+    let creation_ts = pod.metadata.creation_timestamp.as_ref().map(|t| t.0);
 
     let status = pod.status.as_ref();
 
@@ -89,21 +82,40 @@ pub async fn get_pod_timeline(
         .any(|c| c.type_ == "Ready" && c.status == "True");
 
     // Extract container start time from container_statuses
-    let container_start_ts = status
-        .and_then(|s| s.container_statuses.as_ref())
-        .and_then(|statuses| {
-            statuses.iter().filter_map(|cs| {
-                cs.state.as_ref()?.running.as_ref()?.started_at.as_ref().map(|t| t.0)
-            }).min()
-        });
+    let container_start_ts =
+        status
+            .and_then(|s| s.container_statuses.as_ref())
+            .and_then(|statuses| {
+                statuses
+                    .iter()
+                    .filter_map(|cs| {
+                        cs.state
+                            .as_ref()?
+                            .running
+                            .as_ref()?
+                            .started_at
+                            .as_ref()
+                            .map(|t| t.0)
+                    })
+                    .min()
+            });
 
     // Extract init container finish time
     let init_finished_ts = status
         .and_then(|s| s.init_container_statuses.as_ref())
         .and_then(|statuses| {
-            statuses.iter().filter_map(|cs| {
-                cs.state.as_ref()?.terminated.as_ref()?.finished_at.as_ref().map(|t| t.0)
-            }).max()
+            statuses
+                .iter()
+                .filter_map(|cs| {
+                    cs.state
+                        .as_ref()?
+                        .terminated
+                        .as_ref()?
+                        .finished_at
+                        .as_ref()
+                        .map(|t| t.0)
+                })
+                .max()
         });
 
     let has_init_containers = status
@@ -114,11 +126,11 @@ pub async fn get_pod_timeline(
     let pulled_event_ts = event_list
         .items
         .iter()
-        .filter(|e| {
-            e.reason.as_deref() == Some("Pulled")
-        })
+        .filter(|e| e.reason.as_deref() == Some("Pulled"))
         .filter_map(|e| {
-            e.last_timestamp.as_ref().map(|t| t.0)
+            e.last_timestamp
+                .as_ref()
+                .map(|t| t.0)
                 .or_else(|| e.event_time.as_ref().map(|t| t.0))
         })
         .max();
@@ -194,7 +206,9 @@ pub async fn get_pod_timeline(
     }
 
     // Phase 5: Readiness (ContainersReady or container start → Ready)
-    let readiness_start = containers_ready_ts.or(container_start_ts).or(container_start_phase_start);
+    let readiness_start = containers_ready_ts
+        .or(container_start_ts)
+        .or(container_start_phase_start);
     if let (Some(start), Some(end)) = (readiness_start, ready_ts) {
         if end > start {
             phases.push(TimelinePhase {

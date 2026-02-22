@@ -296,10 +296,7 @@ fn should_skip(report: &DiagnosticsReport, test_idx: usize) -> Option<&'static s
 }
 
 /// Run all diagnostic tests, sending incremental updates to the UI
-pub async fn run_all_diagnostics(
-    config: Arc<ClusterConfig>,
-    tx: mpsc::Sender<AppMessage>,
-) {
+pub async fn run_all_diagnostics(config: Arc<ClusterConfig>, tx: mpsc::Sender<AppMessage>) {
     let mut report = DiagnosticsReport::new();
 
     // Send initial state (all Pending)
@@ -326,11 +323,8 @@ pub async fn run_all_diagnostics(
         // Execute with per-test timeout
         let start = Instant::now();
         let test_id = report.results[i].id;
-        let result = tokio::time::timeout(
-            test_timeout(test_id),
-            execute_test(test_id, &config),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(test_timeout(test_id), execute_test(test_id, &config)).await;
 
         let elapsed = start.elapsed();
         report.results[i].duration = Some(elapsed);
@@ -339,8 +333,7 @@ pub async fn run_all_diagnostics(
             Ok(Ok(msg)) => {
                 // Update name with extra info if provided
                 if let Some(detail) = msg {
-                    report.results[i].name =
-                        format!("{} ({})", report.results[i].name, detail);
+                    report.results[i].name = format!("{} ({})", report.results[i].name, detail);
                 }
                 report.results[i].status = DiagnosticStatus::Passed;
             }
@@ -348,8 +341,7 @@ pub async fn run_all_diagnostics(
                 report.results[i].status = DiagnosticStatus::Failed(reason);
             }
             Err(_) => {
-                report.results[i].status =
-                    DiagnosticStatus::Failed("timed out".to_string());
+                report.results[i].status = DiagnosticStatus::Failed("timed out".to_string());
             }
         }
 
@@ -366,10 +358,7 @@ pub async fn run_all_diagnostics(
 
 /// Execute a single diagnostic test by ID.
 /// Returns Ok(Some(detail)) for passed with extra info, Ok(None) for simple pass, Err(reason) for failure.
-async fn execute_test(
-    test_id: &str,
-    config: &ClusterConfig,
-) -> Result<Option<String>, String> {
+async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<String>, String> {
     match test_id {
         "docker_accessible" => {
             let platform = PlatformInfo::detect().map_err(|e| e.to_string())?;
@@ -389,8 +378,7 @@ async fn execute_test(
         }
         "container_running" => {
             let socket_path = PathBuf::from("/var/run/docker.sock");
-            let docker =
-                DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
             if docker.container_running(&config.container_name).await {
                 Ok(None)
             } else {
@@ -398,12 +386,9 @@ async fn execute_test(
             }
         }
         "k8s_api_reachable" => {
-            let k8s = K8sClient::new(
-                config.kubeconfig.as_deref(),
-                config.context.as_deref(),
-            )
-            .await
-            .map_err(|e| format!("client init failed: {}", e))?;
+            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
+                .await
+                .map_err(|e| format!("client init failed: {}", e))?;
             if k8s.is_connected().await {
                 Ok(None)
             } else {
@@ -419,25 +404,18 @@ async fn execute_test(
             if nodes.is_empty() {
                 return Err("no nodes found".to_string());
             }
-            let not_ready: Vec<_> = nodes
-                .iter()
-                .filter(|n| n.status != "Ready")
-                .collect();
+            let not_ready: Vec<_> = nodes.iter().filter(|n| n.status != "Ready").collect();
             if not_ready.is_empty() {
                 Ok(Some(format!("{} node(s)", nodes.len())))
             } else {
-                let names: Vec<_> =
-                    not_ready.iter().map(|n| n.name.as_str()).collect();
+                let names: Vec<_> = not_ready.iter().map(|n| n.name.as_str()).collect();
                 Err(format!("not ready: {}", names.join(", ")))
             }
         }
         "coredns_running" => {
-            let k8s = K8sClient::new(
-                config.kubeconfig.as_deref(),
-                config.context.as_deref(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
             let pods = k8s
                 .list_pods("kube-system", Some("k8s-app=kube-dns"))
                 .await
@@ -458,12 +436,9 @@ async fn execute_test(
             }
         }
         "local_path_provisioner" => {
-            let k8s = K8sClient::new(
-                config.kubeconfig.as_deref(),
-                config.context.as_deref(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
             let pods = k8s
                 .list_pods("kube-system", Some("app=local-path-provisioner"))
                 .await
@@ -517,12 +492,7 @@ async fn execute_test(
             let health = IngressHealthChecker::check_endpoints(&entries).await;
             let unhealthy: Vec<_> = health
                 .iter()
-                .filter(|(_, s)| {
-                    matches!(
-                        s,
-                        crate::cluster::IngressHealthStatus::Error
-                    )
-                })
+                .filter(|(_, s)| matches!(s, crate::cluster::IngressHealthStatus::Error))
                 .map(|(url, _)| url.as_str())
                 .collect();
             if unhealthy.is_empty() {
@@ -538,12 +508,9 @@ async fn execute_test(
             }
         }
         "no_stuck_pods" => {
-            let k8s = K8sClient::new(
-                config.kubeconfig.as_deref(),
-                config.context.as_deref(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
             let pending = k8s
                 .list_pending_pods()
                 .await
@@ -551,8 +518,7 @@ async fn execute_test(
             if pending.is_empty() {
                 Ok(None)
             } else {
-                let names: Vec<_> =
-                    pending.iter().take(3).map(|p| p.name.as_str()).collect();
+                let names: Vec<_> = pending.iter().take(3).map(|p| p.name.as_str()).collect();
                 let suffix = if pending.len() > 3 {
                     format!(" (+{})", pending.len() - 3)
                 } else {
@@ -562,12 +528,9 @@ async fn execute_test(
             }
         }
         "no_pull_errors" => {
-            let k8s = K8sClient::new(
-                config.kubeconfig.as_deref(),
-                config.context.as_deref(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
             let pending = k8s
                 .list_pending_pods()
                 .await
@@ -575,12 +538,9 @@ async fn execute_test(
             let pull_errors: Vec<_> = pending
                 .iter()
                 .filter(|p| {
-                    p.containers.iter().any(|c| {
-                        matches!(
-                            c.reason.as_str(),
-                            "ImagePullBackOff" | "ErrImagePull"
-                        )
-                    })
+                    p.containers
+                        .iter()
+                        .any(|c| matches!(c.reason.as_str(), "ImagePullBackOff" | "ErrImagePull"))
                 })
                 .collect();
             if pull_errors.is_empty() {
@@ -617,7 +577,11 @@ async fn wait_for_pod_running(
     let start = Instant::now();
     loop {
         if start.elapsed() > timeout {
-            return Err(format!("pod '{}' not ready within {}s", name, timeout.as_secs()));
+            return Err(format!(
+                "pod '{}' not ready within {}s",
+                name,
+                timeout.as_secs()
+            ));
         }
         match k8s.get_pod(namespace, name).await {
             Ok(pod) if pod.status == "Running" && pod.ready => return Ok(()),
@@ -645,7 +609,9 @@ async fn deep_setup(config: &ClusterConfig) -> Result<Option<String>, String> {
     let namespaces: Api<Namespace> = Api::all(client.clone());
 
     // Delete stale namespace if it exists
-    let _ = namespaces.delete(DIAG_NAMESPACE, &DeleteParams::default()).await;
+    let _ = namespaces
+        .delete(DIAG_NAMESPACE, &DeleteParams::default())
+        .await;
 
     // Wait for namespace to be fully gone
     let start = Instant::now();
@@ -759,7 +725,10 @@ async fn deep_connectivity(config: &ClusterConfig) -> Result<Option<String>, Str
         metadata: ObjectMeta {
             name: Some("diag-nginx".to_string()),
             namespace: Some(DIAG_NAMESPACE.to_string()),
-            labels: Some(BTreeMap::from([("app".to_string(), "diag-nginx".to_string())])),
+            labels: Some(BTreeMap::from([(
+                "app".to_string(),
+                "diag-nginx".to_string(),
+            )])),
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -789,7 +758,10 @@ async fn deep_connectivity(config: &ClusterConfig) -> Result<Option<String>, Str
             ..Default::default()
         },
         spec: Some(ServiceSpec {
-            selector: Some(BTreeMap::from([("app".to_string(), "diag-nginx".to_string())])),
+            selector: Some(BTreeMap::from([(
+                "app".to_string(),
+                "diag-nginx".to_string(),
+            )])),
             ports: Some(vec![ServicePort {
                 port: 80,
                 target_port: Some(IntOrString::Int(80)),
@@ -856,7 +828,9 @@ async fn deep_connectivity(config: &ClusterConfig) -> Result<Option<String>, Str
     // Cleanup pods and service
     delete_pod_if_exists(&client, DIAG_NAMESPACE, "diag-nginx").await;
     delete_pod_if_exists(&client, DIAG_NAMESPACE, "diag-client").await;
-    let _ = services_api.delete("diag-nginx", &DeleteParams::default()).await;
+    let _ = services_api
+        .delete("diag-nginx", &DeleteParams::default())
+        .await;
 
     if result.exit_code == 0 {
         Ok(Some("pod-to-service OK".to_string()))
@@ -994,7 +968,10 @@ async fn deep_cleanup(config: &ClusterConfig) -> Result<Option<String>, String> 
     let namespaces: Api<Namespace> = Api::all(client);
 
     // Delete namespace (cascades all resources)
-    match namespaces.delete(DIAG_NAMESPACE, &DeleteParams::default()).await {
+    match namespaces
+        .delete(DIAG_NAMESPACE, &DeleteParams::default())
+        .await
+    {
         Ok(_) => Ok(Some(format!("deleted {}", DIAG_NAMESPACE))),
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(Some("already clean".to_string())),
         Err(e) => Err(format!("failed to delete namespace: {}", e)),
@@ -1015,10 +992,7 @@ mod tests {
     #[test]
     fn test_categories_in_order() {
         let tests = build_test_list();
-        let categories: Vec<&str> = tests
-            .iter()
-            .map(|t| t.category)
-            .collect::<Vec<_>>();
+        let categories: Vec<&str> = tests.iter().map(|t| t.category).collect::<Vec<_>>();
         // Categories should appear in order
         let mut seen = Vec::new();
         for cat in &categories {
@@ -1043,8 +1017,7 @@ mod tests {
     fn test_skip_on_prerequisite_failure() {
         let mut report = DiagnosticsReport::new();
         // Fail a prerequisite
-        report.results[0].status =
-            DiagnosticStatus::Failed("docker not available".to_string());
+        report.results[0].status = DiagnosticStatus::Failed("docker not available".to_string());
 
         // Cluster test should be skipped
         let cluster_idx = report
@@ -1074,8 +1047,7 @@ mod tests {
             .iter()
             .position(|r| r.category == CAT_CLUSTER)
             .unwrap();
-        report.results[cluster_idx].status =
-            DiagnosticStatus::Failed("not running".to_string());
+        report.results[cluster_idx].status = DiagnosticStatus::Failed("not running".to_string());
 
         // Core services test should be skipped
         let core_idx = report
@@ -1124,8 +1096,7 @@ mod tests {
             .iter()
             .position(|r| r.category == CAT_CORE_SERVICES)
             .unwrap();
-        report.results[core_idx].status =
-            DiagnosticStatus::Failed("not running".to_string());
+        report.results[core_idx].status = DiagnosticStatus::Failed("not running".to_string());
 
         // Deep verification tests should be skipped
         let deep_idx = report

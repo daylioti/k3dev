@@ -637,11 +637,8 @@ impl App {
         tokio::spawn(async move {
             match k8s_client.describe_pod(&namespace, &pod_name).await {
                 Ok(description) => {
-                    let lines: Vec<String> =
-                        description.lines().map(|l| l.to_string()).collect();
-                    let _ = message_tx
-                        .send(AppMessage::PodDescribeLoaded(lines))
-                        .await;
+                    let lines: Vec<String> = description.lines().map(|l| l.to_string()).collect();
+                    let _ = message_tx.send(AppMessage::PodDescribeLoaded(lines)).await;
                 }
                 Err(e) => {
                     let _ = message_tx
@@ -657,8 +654,7 @@ impl App {
             Some(c) => c.clone(),
             None => return,
         };
-        self.pod_detail_panel
-            .set_loading(DetailTab::Timeline, true);
+        self.pod_detail_panel.set_loading(DetailTab::Timeline, true);
 
         let client = k8s_client.client().clone();
         let message_tx = self.message_tx.clone();
@@ -674,10 +670,7 @@ impl App {
                 }
                 Err(e) => {
                     let _ = message_tx
-                        .send(AppMessage::Error(format!(
-                            "Failed to load timeline: {}",
-                            e
-                        )))
+                        .send(AppMessage::Error(format!("Failed to load timeline: {}", e)))
                         .await;
                 }
             }

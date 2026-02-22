@@ -176,14 +176,8 @@ impl DiagnosticsOverlay {
             .title(" Cluster Diagnostics ")
             .title_bottom(
                 Line::from(vec![
-                    Span::styled(
-                        " Esc close ",
-                        self.styles.muted_text,
-                    ),
-                    Span::styled(
-                        " r re-run ",
-                        self.styles.muted_text,
-                    ),
+                    Span::styled(" Esc close ", self.styles.muted_text),
+                    Span::styled(" r re-run ", self.styles.muted_text),
                     Span::styled(
                         summary,
                         if failed > 0 {

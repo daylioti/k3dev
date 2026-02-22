@@ -164,8 +164,7 @@ impl K3sManager {
 
             // Fast path: use snapshot if it exists
             if self.docker.image_exists(&snapshot_image).await {
-                let is_deep =
-                    K3sManager::is_deep_snapshot(&self.docker, &snapshot_image).await;
+                let is_deep = K3sManager::is_deep_snapshot(&self.docker, &snapshot_image).await;
                 let _ = output_tx
                     .send(OutputLine::info("Using snapshot for faster startup..."))
                     .await;

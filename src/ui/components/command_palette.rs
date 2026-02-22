@@ -113,7 +113,9 @@ impl CommandPalette {
                 name: "Delete Snapshots".to_string(),
                 shortcut: None,
                 category: CommandCategory::Cluster,
-                description: Some("Remove all snapshot images (next start will be slower)".to_string()),
+                description: Some(
+                    "Remove all snapshot images (next start will be slower)".to_string(),
+                ),
             },
             PaletteCommand {
                 id: PaletteCommandId::ClusterDiagnostics,

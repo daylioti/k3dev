@@ -10,7 +10,11 @@ mod refresh;
 
 use anyhow::Result;
 use crossterm::event::{self, Event};
-use ratatui::{backend::CrosstermBackend, layout::{Constraint, Layout}, Terminal};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Layout},
+    Terminal,
+};
 use std::io::Stdout;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,8 +29,8 @@ use crate::cluster::{
 use crate::config::{
     Config, ConfigLoader, ConfigValidator, RefreshConfig, RefreshScheduler, RefreshTask,
 };
-use crate::k8s::{K8sClient, ShellSessionHandle};
 use crate::k8s::PendingPodInfo;
+use crate::k8s::{K8sClient, ShellSessionHandle};
 use crate::keybindings::KeybindingResolver;
 use crate::ui::components::{
     ActionBar, ClusterAction, ClusterStatus as UiClusterStatus, CommandPalette, ConfirmPopup,
@@ -379,9 +383,15 @@ impl App {
             } else {
                 ratatui::widgets::BorderType::Rounded
             };
-            let title = if focused { " \u{25cf} Pods " } else { "   Pods " };
+            let title = if focused {
+                " \u{25cf} Pods "
+            } else {
+                "   Pods "
+            };
             let title_style = if focused {
-                self.styles.title.add_modifier(ratatui::style::Modifier::BOLD)
+                self.styles
+                    .title
+                    .add_modifier(ratatui::style::Modifier::BOLD)
             } else {
                 self.styles.normal_text
             };
@@ -405,19 +415,15 @@ impl App {
             self.pod_stats.render_inner(frame, split[0], focused);
 
             // Thin separator line
-            let sep_line = ratatui::text::Line::from(
-                "\u{2500}".repeat(split[1].width as usize),
-            );
+            let sep_line = ratatui::text::Line::from("\u{2500}".repeat(split[1].width as usize));
             frame.render_widget(
-                ratatui::widgets::Paragraph::new(sep_line)
-                    .style(self.styles.border_unfocused),
+                ratatui::widgets::Paragraph::new(sep_line).style(self.styles.border_unfocused),
                 split[1],
             );
 
             self.pod_detail_panel.render(frame, split[2]);
         } else {
-            self.pod_stats
-                .render(frame, layout.pod_stats, focused);
+            self.pod_stats.render(frame, layout.pod_stats, focused);
         }
 
         // Update selected item in status bar based on focus

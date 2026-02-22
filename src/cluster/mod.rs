@@ -90,8 +90,8 @@ impl ClusterManager {
         };
 
         // Determine if we need to create a deep snapshot after Traefik + hooks
-        let needs_deep_snapshot = matches!(outcome, k3s::StartOutcome::FreshCreated)
-            && self.config.speedup.use_snapshot;
+        let needs_deep_snapshot =
+            matches!(outcome, k3s::StartOutcome::FreshCreated) && self.config.speedup.use_snapshot;
 
         // Deploy Traefik (ingress controller) in background for faster cluster availability
         let _ = output_tx
@@ -140,8 +140,7 @@ impl ClusterManager {
             if needs_deep_snapshot {
                 match DockerManager::new(socket_path) {
                     Ok(docker) => {
-                        let snapshot_image =
-                            K3sManager::compute_snapshot_image_name(&config);
+                        let snapshot_image = K3sManager::compute_snapshot_image_name(&config);
 
                         if let Err(e) = K3sManager::create_deep_snapshot(
                             &config.container_name,
@@ -159,13 +158,12 @@ impl ClusterManager {
                                 )))
                                 .await;
                         } else if config.speedup.snapshot_auto_cleanup {
-                            if let Err(e) =
-                                K3sManager::cleanup_old_snapshots_static(
-                                    &docker,
-                                    &snapshot_image,
-                                    &tx,
-                                )
-                                .await
+                            if let Err(e) = K3sManager::cleanup_old_snapshots_static(
+                                &docker,
+                                &snapshot_image,
+                                &tx,
+                            )
+                            .await
                             {
                                 tracing::warn!(error = %e, "Snapshot cleanup failed");
                             }

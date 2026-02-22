@@ -384,10 +384,7 @@ impl PodDetailPanel {
         lines.push(Line::from(""));
 
         // Events section
-        lines.push(Line::from(Span::styled(
-            "  Events:",
-            self.styles.title,
-        )));
+        lines.push(Line::from(Span::styled("  Events:", self.styles.title)));
 
         if timeline.events.is_empty() {
             lines.push(Line::from(Span::styled(

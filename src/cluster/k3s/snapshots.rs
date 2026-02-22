@@ -203,10 +203,7 @@ impl K3sManager {
             "k3dev.snapshot.created".to_string(),
             chrono::Utc::now().to_rfc3339(),
         );
-        labels.insert(
-            "k3dev.k3s_version".to_string(),
-            config.k3s_version.clone(),
-        );
+        labels.insert("k3dev.k3s_version".to_string(), config.k3s_version.clone());
         labels.insert(
             "k3dev.config_hash".to_string(),
             Self::calculate_config_hash_static(config),
@@ -400,9 +397,7 @@ impl K3sManager {
         current_snapshot: &str,
         output_tx: &mpsc::Sender<OutputLine>,
     ) -> Result<()> {
-        let snapshots = docker
-            .list_images_by_pattern("k3dev-snapshot-")
-            .await?;
+        let snapshots = docker.list_images_by_pattern("k3dev-snapshot-").await?;
 
         if snapshots.is_empty() {
             return Ok(());

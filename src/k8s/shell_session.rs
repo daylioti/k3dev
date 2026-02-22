@@ -174,7 +174,5 @@ pub async fn start_shell_session(
     // Keep _attached alive until here so the WebSocket connection stays open
     drop(attached);
 
-    let _ = message_tx
-        .send(AppMessage::ShellSessionEnded(error))
-        .await;
+    let _ = message_tx.send(AppMessage::ShellSessionEnded(error)).await;
 }

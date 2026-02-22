@@ -135,6 +135,7 @@ impl PodExecutor {
     }
 
     /// Execute a command with streaming output
+    #[allow(dead_code)]
     pub async fn exec_streaming(
         &self,
         namespace: &str,
@@ -262,6 +263,7 @@ impl PodExecutor {
     }
 
     /// Execute with workdir and streaming output
+    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub async fn exec_with_workdir_streaming(
         &self,
