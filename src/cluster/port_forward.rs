@@ -198,9 +198,7 @@ async fn get_process_cmdline_macos(pid: u32) -> String {
         .output()
         .await
     {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
 }

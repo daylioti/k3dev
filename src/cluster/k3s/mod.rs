@@ -82,7 +82,10 @@ impl K3sManager {
 
         // Negotiate API version for compatibility with older Docker versions
         if let Err(e) = docker.negotiate_api_version().await {
-            tracing::warn!("Docker API version negotiation failed (using default): {:#}", e);
+            tracing::warn!(
+                "Docker API version negotiation failed (using default): {:#}",
+                e
+            );
         }
 
         let kube_ops = KubeOps::new();
@@ -317,9 +320,7 @@ impl K3sManager {
                  --kube-apiserver-arg=profiling=false \
                  --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
                  --kube-controller-manager-arg=concurrent-deployment-syncs=1",
-                pv_storage_path,
-                kubelet_root,
-                cgroup_driver
+                pv_storage_path, kubelet_root, cgroup_driver
             ),
         ];
 

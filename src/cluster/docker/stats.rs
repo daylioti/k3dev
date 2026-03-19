@@ -470,12 +470,7 @@ fn derive_v1_memory_path(cpu_path: &std::path::Path) -> Option<std::path::PathBu
 }
 
 /// Calculate CPU percentage using global cached delta (shared between v1 and v2)
-fn calculate_cpu_percent(
-    container_id: &str,
-    usage_usec: u64,
-    now_usec: u64,
-    num_cpus: f64,
-) -> f64 {
+fn calculate_cpu_percent(container_id: &str, usage_usec: u64, now_usec: u64, num_cpus: f64) -> f64 {
     let prev = CPU_CACHE
         .read()
         .ok()
@@ -552,10 +547,7 @@ fn find_container_cgroup(container_id: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Recursively search for a container cgroup directory by container ID
-fn search_cgroup_dir(
-    dir: &std::path::Path,
-    container_id: &str,
-) -> Option<std::path::PathBuf> {
+fn search_cgroup_dir(dir: &std::path::Path, container_id: &str) -> Option<std::path::PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();

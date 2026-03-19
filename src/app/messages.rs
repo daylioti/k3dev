@@ -576,13 +576,10 @@ impl App {
 
         // Check if any running pods need architecture info (avoid duplicate checks)
         if !self.image_arch_check_pending {
-            let has_uncached = self
-                .running_pods_cache
-                .iter()
-                .any(|s| {
-                    let key = format!("{}/{}", s.namespace, s.name);
-                    !self.image_arch_cache.contains_key(&key)
-                });
+            let has_uncached = self.running_pods_cache.iter().any(|s| {
+                let key = format!("{}/{}", s.namespace, s.name);
+                !self.image_arch_cache.contains_key(&key)
+            });
             if has_uncached {
                 self.image_arch_check_pending = true;
                 self.spawn_image_arch_check();

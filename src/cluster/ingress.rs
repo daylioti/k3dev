@@ -432,9 +432,7 @@ impl IngressManager {
                     )))
                     .await;
             }
-            return Ok(HostsUpdateResult::WrittenDirectly {
-                count: hosts.len(),
-            });
+            return Ok(HostsUpdateResult::WrittenDirectly { count: hosts.len() });
         }
 
         // Needs elevated privileges — caller must handle this

@@ -155,12 +155,8 @@ mod tests {
 
     #[test]
     fn test_parse_pvc_dir_name() {
-        let result =
-            parse_pvc_dir_name("pvc-a1b2c3d4-e5f6-7890-abcd-ef1234567890_default_my-data");
-        assert_eq!(
-            result,
-            Some(("default".to_string(), "my-data".to_string()))
-        );
+        let result = parse_pvc_dir_name("pvc-a1b2c3d4-e5f6-7890-abcd-ef1234567890_default_my-data");
+        assert_eq!(result, Some(("default".to_string(), "my-data".to_string())));
     }
 
     #[test]

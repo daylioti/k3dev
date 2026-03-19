@@ -241,10 +241,7 @@ impl PlatformInfo {
                     }
                 }
                 // Also check iptables --version output
-                if let Ok(output) = std::process::Command::new(path)
-                    .arg("--version")
-                    .output()
-                {
+                if let Ok(output) = std::process::Command::new(path).arg("--version").output() {
                     let version = String::from_utf8_lossy(&output.stdout);
                     if version.contains("nf_tables") {
                         return "nft";

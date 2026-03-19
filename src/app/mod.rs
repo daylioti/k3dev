@@ -390,10 +390,7 @@ impl App {
 
         // Exit raw mode so sudo can interact with the terminal
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::LeaveAlternateScreen
-        );
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
 
         // Print a message so the user knows what's happening
         let mut stdout = std::io::stdout();
@@ -445,10 +442,7 @@ impl App {
         let _ = std::fs::remove_file(&temp_path);
 
         // Re-enter raw mode and alternate screen
-        let _ = crossterm::execute!(
-            std::io::stdout(),
-            crossterm::terminal::EnterAlternateScreen
-        );
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
         let _ = crossterm::terminal::enable_raw_mode();
 
         // Force terminal to clear and redraw

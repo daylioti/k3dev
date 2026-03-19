@@ -140,10 +140,7 @@ impl App {
                     Err(_) => return Err(anyhow::anyhow!("Failed to create DockerManager")),
                 };
                 // Try agent first, fall back to direct cgroup reads
-                match docker
-                    .get_container_stats_via_agent(&container_name)
-                    .await
-                {
+                match docker.get_container_stats_via_agent(&container_name).await {
                     Ok(stats) => Ok(stats),
                     Err(_) => docker.get_container_stats(&container_name).await,
                 }
@@ -310,13 +307,16 @@ impl App {
                     .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
 
                 // 1. Get volume stats via docker exec + container mounts (PVC dirs, sizes, pod mapping)
-                let volume_stats = docker.get_volume_stats(&container_name, &storage_path).await;
+                let volume_stats = docker
+                    .get_volume_stats(&container_name, &storage_path)
+                    .await;
 
                 // 2. Get PVC metadata from K8s API (single call: capacity, phase, storage_class)
-                let pvc_metadata = match K8sClient::new(kubeconfig.as_deref(), context.as_deref()).await {
-                    Ok(k8s) => k8s.list_pvc_metadata().await.unwrap_or_default(),
-                    Err(_) => std::collections::HashMap::new(),
-                };
+                let pvc_metadata =
+                    match K8sClient::new(kubeconfig.as_deref(), context.as_deref()).await {
+                        Ok(k8s) => k8s.list_pvc_metadata().await.unwrap_or_default(),
+                        Err(_) => std::collections::HashMap::new(),
+                    };
 
                 // 3. Merge: filesystem data + K8s metadata → Vec<PvcInfo>
                 let fs_stats = volume_stats.unwrap_or_default();

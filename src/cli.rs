@@ -92,10 +92,13 @@ pub async fn run_cli_action(action: ClusterAction, config_path: Option<&str>) ->
 fn print_output_line(line: &OutputLine) {
     let timestamp = line.timestamp.format("[%H:%M:%S]");
     let (color_code, reset) = match line.output_type {
-        OutputType::Info => ("\x1b[0m", "\x1b[0m"),       // default
-        OutputType::Success => ("\x1b[32m", "\x1b[0m"),   // green
-        OutputType::Error => ("\x1b[31m", "\x1b[0m"),     // red
-        OutputType::Warning => ("\x1b[33m", "\x1b[0m"),   // yellow
+        OutputType::Info => ("\x1b[0m", "\x1b[0m"),     // default
+        OutputType::Success => ("\x1b[32m", "\x1b[0m"), // green
+        OutputType::Error => ("\x1b[31m", "\x1b[0m"),   // red
+        OutputType::Warning => ("\x1b[33m", "\x1b[0m"), // yellow
     };
-    println!("\x1b[90m{}\x1b[0m {}{}{}", timestamp, color_code, line.content, reset);
+    println!(
+        "\x1b[90m{}\x1b[0m {}{}{}",
+        timestamp, color_code, line.content, reset
+    );
 }

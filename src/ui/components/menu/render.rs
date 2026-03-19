@@ -117,14 +117,22 @@ impl Menu {
         // Forwarded ports section
         for (host_port, container_port) in &self.forwarded_ports {
             // "    {port} → k3s:{port}"
-            let port_w = 4 + host_port.to_string().len() as u16 + 7 + container_port.to_string().len() as u16;
+            let port_w = 4
+                + host_port.to_string().len() as u16
+                + 7
+                + container_port.to_string().len() as u16;
             if port_w > max_width {
                 max_width = port_w;
             }
         }
         for pf in &self.active_port_forwards {
             // "    {port} → {port} ({target})"
-            let pf_w = 4 + pf.local_port.to_string().len() as u16 + 3 + pf.remote_port.to_string().len() as u16 + 3 + pf.target.chars().count() as u16;
+            let pf_w = 4
+                + pf.local_port.to_string().len() as u16
+                + 3
+                + pf.remote_port.to_string().len() as u16
+                + 3
+                + pf.target.chars().count() as u16;
             if pf_w > max_width {
                 max_width = pf_w;
             }

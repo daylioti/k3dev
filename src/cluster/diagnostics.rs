@@ -407,17 +407,17 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 // AppArmor is active — check if Docker's default profile could interfere
                 // The k3s container now uses security_opt=apparmor:unconfined, so warn
                 // only if AppArmor is in enforcing mode
-                let profiles = std::fs::read_to_string(
-                    "/sys/kernel/security/apparmor/profiles",
-                )
-                .unwrap_or_default();
+                let profiles = std::fs::read_to_string("/sys/kernel/security/apparmor/profiles")
+                    .unwrap_or_default();
 
                 let docker_profile_enforcing = profiles
                     .lines()
                     .any(|l| l.contains("docker-default") && l.contains("(enforce)"));
 
                 if docker_profile_enforcing {
-                    Ok(Some("active, docker-default enforcing (k3s uses unconfined)".to_string()))
+                    Ok(Some(
+                        "active, docker-default enforcing (k3s uses unconfined)".to_string(),
+                    ))
                 } else {
                     Ok(Some("active".to_string()))
                 }
@@ -437,10 +437,9 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
 
                 if br_loaded {
                     // Also check sysctl value
-                    let sysctl_val = std::fs::read_to_string(
-                        "/proc/sys/net/bridge/bridge-nf-call-iptables",
-                    )
-                    .unwrap_or_default();
+                    let sysctl_val =
+                        std::fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-iptables")
+                            .unwrap_or_default();
                     if sysctl_val.trim() == "1" {
                         Ok(Some("loaded, bridge-nf-call-iptables=1".to_string()))
                     } else {

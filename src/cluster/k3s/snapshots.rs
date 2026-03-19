@@ -13,8 +13,8 @@ use tokio::sync::mpsc;
 
 use super::K3sManager;
 use crate::cluster::config::ClusterConfig;
-use crate::cluster::platform::PlatformInfo;
 use crate::cluster::docker::{ContainerRunConfig, DockerManager};
+use crate::cluster::platform::PlatformInfo;
 use crate::config::HookEvent;
 use crate::hooks::HookExecutor;
 use crate::ui::components::OutputLine;
@@ -347,9 +347,7 @@ impl K3sManager {
                     "volume".to_string(),
                 ),
             ],
-            env: vec![
-                ("IPTABLES_MODE".to_string(), iptables_mode.to_string()),
-            ],
+            env: vec![("IPTABLES_MODE".to_string(), iptables_mode.to_string())],
             network: Some(self.config.network_name.clone()),
             cgroupns_host: true,
             pid_host: true,
@@ -381,10 +379,8 @@ impl K3sManager {
         let _ = output_tx
             .send(OutputLine::info("Setting up kubeconfig..."))
             .await;
-        let (kubeconfig_result, agent_result) = tokio::join!(
-            self.setup_kubeconfig(),
-            self.install_agent(),
-        );
+        let (kubeconfig_result, agent_result) =
+            tokio::join!(self.setup_kubeconfig(), self.install_agent(),);
         kubeconfig_result?;
         if let Err(e) = &agent_result {
             let _ = output_tx

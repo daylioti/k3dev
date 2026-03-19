@@ -510,16 +510,14 @@ impl PodStats {
                         ("", name_width)
                     };
 
-                    let mut line_spans = vec![
-                        Span::styled(
-                            cursor,
-                            if is_selected {
-                                self.styles.warning_text
-                            } else {
-                                self.styles.muted_text
-                            },
-                        ),
-                    ];
+                    let mut line_spans = vec![Span::styled(
+                        cursor,
+                        if is_selected {
+                            self.styles.warning_text
+                        } else {
+                            self.styles.muted_text
+                        },
+                    )];
 
                     if pod.arch_mismatch {
                         line_spans.push(Span::styled(arch_prefix, self.styles.warning_text));
