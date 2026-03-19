@@ -133,13 +133,20 @@ impl App {
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let socket_path = std::path::PathBuf::from("/var/run/docker.sock");
+                let socket_path = crate::cluster::PlatformInfo::find_docker_socket_sync();
 
                 let docker = match DockerManager::new(socket_path) {
                     Ok(d) => d,
                     Err(_) => return Err(anyhow::anyhow!("Failed to create DockerManager")),
                 };
-                docker.get_container_stats(&container_name).await
+                // Try agent first, fall back to direct cgroup reads
+                match docker
+                    .get_container_stats_via_agent(&container_name)
+                    .await
+                {
+                    Ok(stats) => Ok(stats),
+                    Err(_) => docker.get_container_stats(&container_name).await,
+                }
             })
             .await;
 
@@ -170,13 +177,17 @@ impl App {
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let socket_path = std::path::PathBuf::from("/var/run/docker.sock");
+                let socket_path = crate::cluster::PlatformInfo::find_docker_socket_sync();
 
                 let docker = match DockerManager::new(socket_path) {
                     Ok(d) => d,
                     Err(_) => return Err(anyhow::anyhow!("Failed to create DockerManager")),
                 };
-                docker.get_pod_stats(&container_name).await
+                // Try agent first, fall back to direct cgroup reads
+                match docker.get_pod_stats_via_agent(&container_name).await {
+                    Ok(stats) => Ok(stats),
+                    Err(_) => docker.get_pod_stats(&container_name).await,
+                }
             })
             .await;
 
@@ -279,6 +290,100 @@ impl App {
         }
     }
 
+    pub(super) fn spawn_volume_stats_check(&self) {
+        if !matches!(self.cluster_status, ClusterStatus::Running) {
+            return;
+        }
+
+        let message_tx = self.message_tx.clone();
+        let kubeconfig = self.cluster_config.kubeconfig.clone();
+        let context = self.cluster_config.context.clone();
+        let timeout = self.refresh_config.volume_timeout;
+        let storage_path = crate::cluster::K3sManager::LOCAL_PV_STORAGE_PATH.to_string();
+        let container_name = self.cluster_config.container_name.clone();
+
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(timeout, async {
+                let socket_path = crate::cluster::PlatformInfo::find_docker_socket_sync();
+
+                let docker = DockerManager::new(socket_path)
+                    .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
+
+                // 1. Get volume stats via docker exec + container mounts (PVC dirs, sizes, pod mapping)
+                let volume_stats = docker.get_volume_stats(&container_name, &storage_path).await;
+
+                // 2. Get PVC metadata from K8s API (single call: capacity, phase, storage_class)
+                let pvc_metadata = match K8sClient::new(kubeconfig.as_deref(), context.as_deref()).await {
+                    Ok(k8s) => k8s.list_pvc_metadata().await.unwrap_or_default(),
+                    Err(_) => std::collections::HashMap::new(),
+                };
+
+                // 3. Merge: filesystem data + K8s metadata → Vec<PvcInfo>
+                let fs_stats = volume_stats.unwrap_or_default();
+                let mut results = Vec::new();
+
+                // PVCs found on filesystem
+                let mut seen_keys = std::collections::HashSet::new();
+                for vs in &fs_stats {
+                    let key = format!("{}/{}", vs.namespace, vs.pvc_name);
+                    seen_keys.insert(key.clone());
+
+                    if let Some(meta) = pvc_metadata.get(&key) {
+                        results.push(crate::k8s::PvcInfo {
+                            name: vs.pvc_name.clone(),
+                            namespace: vs.namespace.clone(),
+                            capacity_bytes: meta.capacity_bytes,
+                            used_bytes: Some(vs.used_bytes),
+                            phase: meta.phase.clone(),
+                            storage_class: meta.storage_class.clone(),
+                            pods: vs.pods.clone(),
+                        });
+                    } else {
+                        // On filesystem but not in K8s (cleanup in progress?)
+                        results.push(crate::k8s::PvcInfo {
+                            name: vs.pvc_name.clone(),
+                            namespace: vs.namespace.clone(),
+                            capacity_bytes: 0,
+                            used_bytes: Some(vs.used_bytes),
+                            phase: "Unknown".to_string(),
+                            storage_class: String::new(),
+                            pods: vs.pods.clone(),
+                        });
+                    }
+                }
+
+                // PVCs in K8s but not on filesystem (Pending, not yet provisioned)
+                for (key, meta) in &pvc_metadata {
+                    if !seen_keys.contains(key) {
+                        results.push(crate::k8s::PvcInfo {
+                            name: meta.name.clone(),
+                            namespace: meta.namespace.clone(),
+                            capacity_bytes: meta.capacity_bytes,
+                            used_bytes: None,
+                            phase: meta.phase.clone(),
+                            storage_class: meta.storage_class.clone(),
+                            pods: Vec::new(),
+                        });
+                    }
+                }
+
+                results.sort_by(|a, b| a.namespace.cmp(&b.namespace).then(a.name.cmp(&b.name)));
+
+                Ok::<Vec<crate::k8s::PvcInfo>, anyhow::Error>(results)
+            })
+            .await;
+
+            let entries = match result {
+                Ok(Ok(e)) => e,
+                _ => vec![],
+            };
+
+            let _ = message_tx
+                .send(AppMessage::VolumeStatsUpdated(entries))
+                .await;
+        });
+    }
+
     pub(super) fn spawn_port_forwards_check(&self) {
         if !matches!(self.cluster_status, ClusterStatus::Running) {
             let message_tx = self.message_tx.clone();
@@ -303,6 +408,34 @@ impl App {
             let _ = message_tx
                 .send(AppMessage::ActivePortForwardsUpdated(forwards))
                 .await;
+        });
+    }
+
+    /// Check image architectures for running pods (spawned when new pods appear)
+    pub(super) fn spawn_image_arch_check(&self) {
+        if !matches!(self.cluster_status, ClusterStatus::Running) {
+            return;
+        }
+
+        let message_tx = self.message_tx.clone();
+        let timeout = self.refresh_config.docker_stats_timeout;
+
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(timeout, async {
+                let socket_path = crate::cluster::PlatformInfo::find_docker_socket_sync();
+                let docker = DockerManager::new(socket_path)
+                    .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
+                Ok::<_, anyhow::Error>(docker.get_pod_image_architectures().await)
+            })
+            .await;
+
+            if let Ok(Ok(arch_data)) = result {
+                if !arch_data.is_empty() {
+                    let _ = message_tx
+                        .send(AppMessage::ImageArchUpdated(arch_data))
+                        .await;
+                }
+            }
         });
     }
 

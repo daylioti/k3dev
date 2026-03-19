@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::cluster::{IngressEntry, IngressHealthStatus};
 use crate::config::{CommandEntry, CommandGroup, Config};
+use crate::k8s::PvcInfo;
 use crate::ui::styles::Styles;
 use crate::ui::theme::Theme;
 
@@ -63,6 +64,9 @@ pub struct Menu {
     pub(super) ingress_selected: bool,
     pub(super) selected_ingress_entry: usize, // Index into ingress_entries
     pub(super) selected_ingress_path: usize,  // Index into paths within the entry
+    // Volume/PVC entries
+    pub(super) volume_entries: Vec<PvcInfo>,
+    pub(super) volumes_expanded: bool,
 }
 
 impl Menu {
@@ -91,6 +95,8 @@ impl Menu {
             ingress_selected: false,
             selected_ingress_entry: 0,
             selected_ingress_path: 0,
+            volume_entries: Vec::new(),
+            volumes_expanded: true,
         }
     }
 
@@ -124,6 +130,11 @@ impl Menu {
     /// Update active port forwards (from kubectl port-forward, etc.)
     pub fn set_active_port_forwards(&mut self, forwards: Vec<ActivePortForward>) {
         self.active_port_forwards = forwards;
+    }
+
+    /// Update volume/PVC entries
+    pub fn set_volume_entries(&mut self, entries: Vec<PvcInfo>) {
+        self.volume_entries = entries;
     }
 
     // === Getters ===

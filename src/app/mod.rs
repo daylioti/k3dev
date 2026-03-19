@@ -35,7 +35,7 @@ use crate::keybindings::KeybindingResolver;
 use crate::ui::components::{
     ActionBar, ClusterAction, ClusterStatus as UiClusterStatus, CommandPalette, ConfirmPopup,
     DetailTab, DiagnosticsOverlay, HelpOverlay, InputForm, Menu, Output, OutputPopup,
-    PasswordPopup, PodContextMenu, PodDetailPanel, PodStats, StatusBar,
+    PodContextMenu, PodDetailPanel, PodStats, StatusBar,
 };
 use crate::ui::{AppLayout, Styles};
 use std::collections::{HashMap, HashSet};
@@ -55,7 +55,6 @@ pub enum FocusArea {
 pub enum AppMode {
     Normal,
     Input,
-    SudoPassword,
     Help,
     CommandPalette,
     OutputPopup,
@@ -88,7 +87,6 @@ pub struct App {
     input_form: InputForm,
     help_overlay: HelpOverlay,
     command_palette: CommandPalette,
-    password_popup: PasswordPopup,
     confirm_popup: ConfirmPopup,
     pod_context_menu: PodContextMenu,
     diagnostics_overlay: DiagnosticsOverlay,
@@ -109,11 +107,11 @@ pub struct App {
     // Pending command for input
     pending_command: Option<crate::config::CommandEntry>,
 
-    // Pending cluster action (waiting for sudo password)
+    // Pending cluster action (waiting for confirmation)
     pending_cluster_action: Option<ClusterAction>,
-    pending_hosts_update: bool,
-    sudo_password: String,
-    password_input: String,
+
+    // Pending interactive sudo for hosts update (content, host_count)
+    pending_sudo_hosts_content: Option<(String, usize)>,
 
     // Cached data for pod stats merging
     running_pods_cache: Vec<ContainerStats>,
@@ -124,6 +122,11 @@ pub struct App {
     active_pull_monitors: HashSet<String>,
     /// Bollard Docker client for spawning pull monitors
     docker_client: Option<Docker>,
+
+    /// Cache of pod image architectures (pod_key → architecture)
+    image_arch_cache: HashMap<String, String>,
+    /// Whether an image arch check is currently in flight
+    image_arch_check_pending: bool,
 
     // Interactive shell session
     shell_session: Option<ShellSessionHandle>,
@@ -182,9 +185,8 @@ impl App {
 
         let _ = crate::logging::init_logging(&config.logging, &config.infrastructure.cluster_name);
 
-        let k8s_client = K8sClient::new(kubeconfig.as_deref(), context.as_deref())
-            .await
-            .ok();
+        // K8s client is created lazily - not at startup.
+        let k8s_client: Option<K8sClient> = None;
 
         let cluster_manager = ClusterManager::new(Arc::clone(&cluster_config)).await.ok();
         let (message_tx, message_rx) = mpsc::channel(100);
@@ -229,7 +231,6 @@ impl App {
             input_form: InputForm::with_theme(theme),
             help_overlay,
             command_palette,
-            password_popup: PasswordPopup::with_theme(theme),
             confirm_popup: ConfirmPopup::with_theme(theme),
             pod_context_menu: PodContextMenu::with_theme(theme),
             diagnostics_overlay: DiagnosticsOverlay::with_theme(theme),
@@ -243,19 +244,14 @@ impl App {
             pending_count: String::new(),
             pending_command: None,
             pending_cluster_action: None,
-            pending_hosts_update: false,
-            sudo_password: String::new(),
-            password_input: String::new(),
+            pending_sudo_hosts_content: None,
             running_pods_cache: Vec::new(),
             pending_pods_cache: Vec::new(),
             pull_progress_cache: HashMap::new(),
             active_pull_monitors: HashSet::new(),
-            docker_client: Docker::connect_with_unix(
-                "/var/run/docker.sock",
-                120,
-                bollard::API_DEFAULT_VERSION,
-            )
-            .ok(),
+            docker_client: Docker::connect_with_defaults().ok(),
+            image_arch_cache: HashMap::new(),
+            image_arch_check_pending: false,
             shell_session: None,
             shell_area_size: (0, 0),
             pending_shell_command: None,
@@ -301,6 +297,11 @@ impl App {
                 self.handle_message(msg);
             }
 
+            // Handle pending interactive sudo (needs terminal access)
+            if let Some((content, count)) = self.pending_sudo_hosts_content.take() {
+                self.run_interactive_sudo_hosts_update(terminal, &content, count);
+            }
+
             // Tick spinner animation
             self.status_bar.tick_spinner();
 
@@ -326,6 +327,9 @@ impl App {
                         self.spawn_pending_pods_check();
                         self.spawn_pull_progress_check();
                     }
+                    RefreshTask::VolumeRefresh => {
+                        self.spawn_volume_stats_check();
+                    }
                 }
             }
 
@@ -350,6 +354,114 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Run sudo interactively by temporarily exiting TUI raw mode.
+    /// This allows native sudo auth (password prompt, TouchID on macOS, etc.)
+    fn run_interactive_sudo_hosts_update(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        content: &str,
+        count: usize,
+    ) {
+        use std::io::Write;
+
+        let hosts_path = if cfg!(windows) {
+            if let Ok(windir) = std::env::var("SystemRoot") {
+                std::path::PathBuf::from(windir)
+                    .join("System32")
+                    .join("drivers")
+                    .join("etc")
+                    .join("hosts")
+            } else {
+                std::path::PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts")
+            }
+        } else {
+            std::path::PathBuf::from("/etc/hosts")
+        };
+
+        // Write content to temp file
+        let temp_path = std::env::temp_dir().join("k3dev-hosts");
+        if std::fs::write(&temp_path, content).is_err() {
+            self.output
+                .add_error("Failed to write temporary hosts file");
+            return;
+        }
+
+        // Exit raw mode so sudo can interact with the terminal
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::LeaveAlternateScreen
+        );
+
+        // Print a message so the user knows what's happening
+        let mut stdout = std::io::stdout();
+        let _ = writeln!(stdout, "\nUpdating /etc/hosts ({} entries)...\n", count);
+        let _ = stdout.flush();
+
+        // Run sudo cp interactively (allows TouchID, password prompt, etc.)
+        let hosts_str = hosts_path.to_string_lossy();
+        let temp_str = temp_path.to_string_lossy();
+
+        let success = if cfg!(windows) {
+            // On Windows, try direct copy
+            std::process::Command::new("cmd")
+                .args(["/C", "copy", &temp_str, &hosts_str])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        } else {
+            let cp_ok = std::process::Command::new("sudo")
+                .args(["cp", &temp_str, &hosts_str])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            // On Linux, restore SELinux label if copy succeeded
+            #[cfg(target_os = "linux")]
+            if cp_ok {
+                let _ = std::process::Command::new("sudo")
+                    .args(["restorecon", &hosts_str])
+                    .status();
+            }
+
+            cp_ok
+        };
+
+        if success {
+            let _ = writeln!(stdout, "\nUpdated /etc/hosts with {} entries.", count);
+        } else {
+            let _ = writeln!(stdout, "\nFailed to update /etc/hosts.");
+        }
+        let _ = writeln!(stdout, "Press Enter to return to k3dev...");
+        let _ = stdout.flush();
+
+        // Wait for user to press Enter before returning to TUI
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_line(&mut buf);
+
+        // Cleanup temp file
+        let _ = std::fs::remove_file(&temp_path);
+
+        // Re-enter raw mode and alternate screen
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen
+        );
+        let _ = crossterm::terminal::enable_raw_mode();
+
+        // Force terminal to clear and redraw
+        let _ = terminal.clear();
+
+        // Update status message
+        if success {
+            self.output
+                .add_success(format!("Updated /etc/hosts with {} entries", count));
+        } else {
+            self.output
+                .add_error("Failed to update /etc/hosts (sudo cancelled or failed)");
+        }
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
@@ -462,12 +574,6 @@ impl App {
         // Render command palette if in command palette mode
         if self.mode == AppMode::CommandPalette {
             self.command_palette.render(frame, frame.area());
-        }
-
-        // Render password popup if in sudo password mode
-        if self.mode == AppMode::SudoPassword {
-            self.password_popup
-                .render(frame, frame.area(), &self.password_input);
         }
 
         // Render input form as popup if in input mode

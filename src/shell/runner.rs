@@ -119,15 +119,20 @@ impl ShellRunner {
         }
     }
 
-    /// Run a shell command (via /bin/sh -c)
+    /// Run a shell command (via platform-appropriate shell)
     pub async fn run_shell(
         &self,
         command: &str,
         output_tx: mpsc::Sender<OutputLine>,
         cancel_token: CancellationToken,
     ) -> Result<CommandResult> {
-        self.run_streaming("sh", &["-c", command], output_tx, cancel_token)
-            .await
+        if cfg!(windows) {
+            self.run_streaming("cmd", &["/C", command], output_tx, cancel_token)
+                .await
+        } else {
+            self.run_streaming("sh", &["-c", command], output_tx, cancel_token)
+                .await
+        }
     }
 
     /// Run a script file with arguments
@@ -140,8 +145,13 @@ impl ShellRunner {
     ) -> Result<CommandResult> {
         let mut all_args = vec![script_path];
         all_args.extend(args);
-        self.run_streaming("bash", &all_args, output_tx, cancel_token)
-            .await
+        if cfg!(windows) {
+            self.run_streaming("cmd", &["/C", script_path], output_tx, cancel_token)
+                .await
+        } else {
+            self.run_streaming("bash", &all_args, output_tx, cancel_token)
+                .await
+        }
     }
 
     /// Check if a command exists in PATH

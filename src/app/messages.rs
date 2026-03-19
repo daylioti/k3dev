@@ -8,7 +8,7 @@ use crate::cluster::{
     ResourceStats,
 };
 use crate::config::RefreshTask;
-use crate::k8s::{PendingPodInfo, PodTimeline, ShellSessionHandle};
+use crate::k8s::{PendingPodInfo, PodTimeline, PvcInfo, ShellSessionHandle};
 use crate::ui::components::{
     ActivePortForward, ContainerPullInfo, DetailTab, OutputLine, PodStat, PodState,
 };
@@ -83,6 +83,18 @@ pub enum AppMessage {
         workdir: String,
         command: String,
     },
+
+    /// Volume/PVC stats updated
+    VolumeStatsUpdated(Vec<PvcInfo>),
+
+    /// K8s client initialized (lazy, triggered when cluster becomes running)
+    K8sClientReady(Option<crate::k8s::K8sClient>),
+
+    /// Image architecture data for pods (pod_key → architecture string)
+    ImageArchUpdated(HashMap<String, String>),
+
+    /// Hosts update requires sudo — contains the file content to write
+    NeedsSudoHostsWrite { content: String, count: usize },
 
     /// Error message
     Error(String),
@@ -167,9 +179,25 @@ impl App {
                     self.spawn_ingress_refresh();
                     self.spawn_missing_hosts_check();
                     self.spawn_port_forwards_check();
+                    self.spawn_volume_stats_check();
+                    // Lazily init K8s client now that cluster is running
+                    if self.k8s_client.is_none() {
+                        let tx = self.message_tx.clone();
+                        let kubeconfig = self.cluster_config.kubeconfig.clone();
+                        let context = self.cluster_config.context.clone();
+                        tokio::spawn(async move {
+                            let kc = kubeconfig.as_deref();
+                            let ctx = context.as_deref();
+                            let client = crate::k8s::K8sClient::new(kc, ctx).await.ok();
+                            let _ = tx.send(AppMessage::K8sClientReady(client)).await;
+                        });
+                    }
                     // Reset scheduler timers for tasks we just triggered
-                    self.scheduler
-                        .mark_run_multiple(&[RefreshTask::IngressRefresh, RefreshTask::HostsCheck]);
+                    self.scheduler.mark_run_multiple(&[
+                        RefreshTask::IngressRefresh,
+                        RefreshTask::HostsCheck,
+                        RefreshTask::VolumeRefresh,
+                    ]);
                 }
 
                 // If cluster stopped running, clear cluster-specific data
@@ -183,6 +211,7 @@ impl App {
                         .set_missing_hosts(std::collections::HashSet::new());
                     self.status_bar.set_resource_stats(None);
                     self.pod_stats.set_pods(Vec::new());
+                    self.menu.set_volume_entries(Vec::new());
                 }
             }
             AppMessage::IngressEntriesLoaded(entries) => {
@@ -284,6 +313,9 @@ impl App {
             }
             AppMessage::ActivePortForwardsUpdated(forwards) => {
                 self.menu.set_active_port_forwards(forwards);
+            }
+            AppMessage::VolumeStatsUpdated(entries) => {
+                self.menu.set_volume_entries(entries);
             }
             AppMessage::ShellOutput(bytes) => {
                 if self.pod_detail_panel.is_open() && self.pod_detail_panel.has_shell_view() {
@@ -390,11 +422,41 @@ impl App {
                     self.spawn_shell_session(&pod_name, &namespace, container_opt);
                 }
             }
+            AppMessage::ImageArchUpdated(arch_data) => {
+                self.image_arch_cache.extend(arch_data);
+                self.image_arch_check_pending = false;
+                self.merge_and_update_pod_stats();
+            }
+            AppMessage::NeedsSudoHostsWrite { content, count } => {
+                // Store for the main event loop to handle (needs terminal access)
+                self.pending_sudo_hosts_content = Some((content, count));
+            }
+            AppMessage::K8sClientReady(client) => {
+                self.k8s_client = client;
+            }
             AppMessage::Error(msg) => {
                 tracing::error!("{}", msg);
                 self.output.add_error(&msg);
             }
         }
+    }
+
+    /// The host's expected image architecture
+    fn host_image_arch() -> &'static str {
+        if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "amd64"
+        }
+    }
+
+    /// Check if a pod's image has a mismatched architecture
+    fn is_arch_mismatch(&self, namespace: &str, pod_name: &str) -> bool {
+        let key = format!("{}/{}", namespace, pod_name);
+        self.image_arch_cache
+            .get(&key)
+            .map(|arch| arch != Self::host_image_arch())
+            .unwrap_or(false)
     }
 
     /// Merge running pods (from cgroups) with pending pods (from K8s API)
@@ -420,6 +482,7 @@ impl App {
                 memory_used_mb: s.memory_used_mb,
                 memory_limit_mb: s.memory_limit_mb,
                 status: s.status.clone(),
+                arch_mismatch: self.is_arch_mismatch(&s.namespace, &s.name),
             });
         }
 
@@ -500,6 +563,7 @@ impl App {
                 memory_used_mb: 0.0,
                 memory_limit_mb: 0.0,
                 status: "Pending".to_string(),
+                arch_mismatch: false, // Pending pods don't have image arch info yet
             });
         }
 
@@ -509,6 +573,21 @@ impl App {
                 .cmp(&b.namespace)
                 .then_with(|| a.name.cmp(&b.name))
         });
+
+        // Check if any running pods need architecture info (avoid duplicate checks)
+        if !self.image_arch_check_pending {
+            let has_uncached = self
+                .running_pods_cache
+                .iter()
+                .any(|s| {
+                    let key = format!("{}/{}", s.namespace, s.name);
+                    !self.image_arch_cache.contains_key(&key)
+                });
+            if has_uncached {
+                self.image_arch_check_pending = true;
+                self.spawn_image_arch_check();
+            }
+        }
 
         self.pod_stats.set_pods(pod_stats);
 

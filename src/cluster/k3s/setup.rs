@@ -127,6 +127,45 @@ impl K3sManager {
         Ok(())
     }
 
+    /// Install k3dev-agent in the k3s container using embedded static binary.
+    /// The agent collects cgroup stats and queries Docker for pod mapping.
+    pub(super) async fn install_agent(&self) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        const AGENT_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-agent-x86_64");
+
+        #[cfg(target_arch = "aarch64")]
+        const AGENT_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-agent-aarch64");
+
+        // Check if agent is already installed
+        if self
+            .docker
+            .exec_in_container(
+                &self.config.container_name,
+                &["test", "-x", "/usr/local/bin/k3dev-agent"],
+            )
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let encoded = STANDARD.encode(AGENT_BINARY);
+
+        let install_cmd = format!(
+            "echo '{}' | base64 -d > /usr/local/bin/k3dev-agent && \
+             chmod +x /usr/local/bin/k3dev-agent",
+            encoded
+        );
+
+        self.docker
+            .exec_in_container(&self.config.container_name, &["sh", "-c", &install_cmd])
+            .await
+            .context("Failed to install k3dev-agent")?;
+
+        Ok(())
+    }
+
     /// Setup kubeconfig file
     pub(super) async fn setup_kubeconfig(&self) -> Result<()> {
         let kube_dir = dirs::home_dir()

@@ -117,6 +117,8 @@ pub struct PodStat {
     pub memory_limit_mb: f64,
     #[allow(dead_code)]
     pub status: String,
+    /// True if the pod's image architecture doesn't match the host
+    pub arch_mismatch: bool,
 }
 
 impl PodStat {
@@ -501,6 +503,13 @@ impl PodStats {
                         .bg(mem_base_style.fg.unwrap_or(ratatui::style::Color::Green));
                     let mem_empty_style = self.styles.muted_text;
 
+                    // Show arch mismatch warning icon before pod name
+                    let (arch_prefix, name_w) = if pod.arch_mismatch {
+                        ("\u{26a0} ", name_width.saturating_sub(2))
+                    } else {
+                        ("", name_width)
+                    };
+
                     let mut line_spans = vec![
                         Span::styled(
                             cursor,
@@ -510,16 +519,21 @@ impl PodStats {
                                 self.styles.muted_text
                             },
                         ),
-                        Span::styled(
-                            format!(
-                                "{:<width$}",
-                                truncate_string(&short_name, name_width),
-                                width = name_width
-                            ),
-                            name_style,
-                        ),
-                        Span::styled(" C", self.styles.muted_text),
                     ];
+
+                    if pod.arch_mismatch {
+                        line_spans.push(Span::styled(arch_prefix, self.styles.warning_text));
+                    }
+
+                    line_spans.push(Span::styled(
+                        format!(
+                            "{:<width$}",
+                            truncate_string(&short_name, name_w),
+                            width = name_w
+                        ),
+                        name_style,
+                    ));
+                    line_spans.push(Span::styled(" C", self.styles.muted_text));
 
                     line_spans.extend(progress_bar_with_label(
                         cpu_bar_percent,

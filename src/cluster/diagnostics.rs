@@ -4,7 +4,6 @@
 //! incrementally via AppMessage channel.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -100,6 +99,20 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             id: "kubectl_installed",
             category: CAT_PREREQUISITES,
             name: "kubectl installed".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "apparmor_check",
+            category: CAT_PREREQUISITES,
+            name: "AppArmor profile".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "br_netfilter_loaded",
+            category: CAT_PREREQUISITES,
+            name: "br_netfilter module".to_string(),
             status: DiagnosticStatus::Pending,
             duration: None,
         },
@@ -376,8 +389,70 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 Err("kubectl not found in PATH".to_string())
             }
         }
+        "apparmor_check" => {
+            // Only relevant on Linux
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Ok(Some("not applicable (non-Linux)".to_string()));
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // Check if AppArmor is active on the system
+                let apparmor_active =
+                    std::path::Path::new("/sys/kernel/security/apparmor").exists();
+                if !apparmor_active {
+                    return Ok(Some("not active".to_string()));
+                }
+
+                // AppArmor is active — check if Docker's default profile could interfere
+                // The k3s container now uses security_opt=apparmor:unconfined, so warn
+                // only if AppArmor is in enforcing mode
+                let profiles = std::fs::read_to_string(
+                    "/sys/kernel/security/apparmor/profiles",
+                )
+                .unwrap_or_default();
+
+                let docker_profile_enforcing = profiles
+                    .lines()
+                    .any(|l| l.contains("docker-default") && l.contains("(enforce)"));
+
+                if docker_profile_enforcing {
+                    Ok(Some("active, docker-default enforcing (k3s uses unconfined)".to_string()))
+                } else {
+                    Ok(Some("active".to_string()))
+                }
+            }
+        }
+        "br_netfilter_loaded" => {
+            // Only relevant on Linux
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Ok(Some("not applicable (non-Linux)".to_string()));
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // Check if br_netfilter module is loaded
+                let modules = std::fs::read_to_string("/proc/modules").unwrap_or_default();
+                let br_loaded = modules.lines().any(|l| l.starts_with("br_netfilter "));
+
+                if br_loaded {
+                    // Also check sysctl value
+                    let sysctl_val = std::fs::read_to_string(
+                        "/proc/sys/net/bridge/bridge-nf-call-iptables",
+                    )
+                    .unwrap_or_default();
+                    if sysctl_val.trim() == "1" {
+                        Ok(Some("loaded, bridge-nf-call-iptables=1".to_string()))
+                    } else {
+                        Err("br_netfilter loaded but bridge-nf-call-iptables != 1".to_string())
+                    }
+                } else {
+                    Err("br_netfilter not loaded (run: sudo modprobe br_netfilter)".to_string())
+                }
+            }
+        }
         "container_running" => {
-            let socket_path = PathBuf::from("/var/run/docker.sock");
+            let socket_path = PlatformInfo::find_docker_socket_sync();
             let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
             if docker.container_running(&config.container_name).await {
                 Ok(None)
@@ -985,7 +1060,7 @@ mod tests {
     #[test]
     fn test_build_test_list() {
         let tests = build_test_list();
-        assert_eq!(tests.len(), 18);
+        assert_eq!(tests.len(), 20);
         assert!(tests.iter().all(|t| t.status == DiagnosticStatus::Pending));
     }
 

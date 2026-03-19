@@ -3,12 +3,31 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use super::kube_ops::KubeOps;
 use crate::ui::components::OutputLine;
+
+/// Get the platform-appropriate hosts file path
+fn hosts_file_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        // Windows: C:\Windows\System32\drivers\etc\hosts
+        if let Ok(windir) = std::env::var("SystemRoot") {
+            PathBuf::from(windir)
+                .join("System32")
+                .join("drivers")
+                .join("etc")
+                .join("hosts")
+        } else {
+            PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts")
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/etc/hosts")
+    }
+}
 
 /// Health status for an ingress endpoint
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -113,10 +132,22 @@ impl IngressHealthChecker {
     }
 }
 
+/// Result of an /etc/hosts update attempt
+#[allow(dead_code)]
+pub enum HostsUpdateResult {
+    /// No update was needed (all hosts already present)
+    NoUpdateNeeded,
+    /// Successfully written directly (had write permission)
+    WrittenDirectly { count: usize },
+    /// Needs elevated privileges — contains the full file content to write
+    NeedsSudo { content: String, count: usize },
+    /// Hosts file is read-only (NixOS, MicroOS, etc.) — contains manual entries
+    ReadOnly { entries: Vec<String> },
+}
+
 /// Ingress manager for /etc/hosts updates
 pub struct IngressManager {
     hosts_marker: String,
-    sudo_password: Option<String>,
     domain: Option<String>,
     kube_ops: KubeOps,
 }
@@ -125,7 +156,6 @@ impl IngressManager {
     pub fn new() -> Self {
         Self {
             hosts_marker: "# k3dev-ingress".to_string(),
-            sudo_password: None,
             domain: None,
             kube_ops: KubeOps::new(),
         }
@@ -134,16 +164,6 @@ impl IngressManager {
     pub fn with_domain(domain: String) -> Self {
         Self {
             hosts_marker: "# k3dev-ingress".to_string(),
-            sudo_password: None,
-            domain: Some(domain),
-            kube_ops: KubeOps::new(),
-        }
-    }
-
-    pub fn with_domain_and_sudo(domain: String, sudo_password: Option<String>) -> Self {
-        Self {
-            hosts_marker: "# k3dev-ingress".to_string(),
-            sudo_password,
             domain: Some(domain),
             kube_ops: KubeOps::new(),
         }
@@ -152,51 +172,6 @@ impl IngressManager {
     /// Get the Traefik dashboard domain based on configured domain
     pub fn traefik_dashboard_domain(&self) -> Option<String> {
         self.domain.as_ref().map(|d| format!("traefik.{}", d))
-    }
-
-    /// Run a command with sudo, using password if available
-    async fn run_sudo_command(&self, args: &[&str]) -> Result<std::process::Output> {
-        use std::process::Stdio;
-
-        if let Some(password) = &self.sudo_password {
-            // Use sudo -S to read password from stdin
-            let mut child = Command::new("sudo")
-                .arg("-S")
-                .args(args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-
-            // Write password to stdin
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(format!("{}\n", password).as_bytes())
-                    .await?;
-            }
-
-            Ok(child.wait_with_output().await?)
-        } else {
-            // Try non-interactive sudo
-            Ok(Command::new("sudo").arg("-n").args(args).output().await?)
-        }
-    }
-
-    /// Write content to /etc/hosts using sudo
-    async fn write_hosts_with_sudo(&self, content: &str) -> Result<bool> {
-        // Write to temp file first
-        let temp_path = "/tmp/k3dev-hosts";
-        fs::write(temp_path, content).await?;
-
-        // Copy with sudo
-        let output = self
-            .run_sudo_command(&["cp", temp_path, "/etc/hosts"])
-            .await?;
-
-        // Cleanup temp file
-        let _ = fs::remove_file(temp_path).await;
-
-        Ok(output.status.success())
     }
 
     /// Get all ingress hosts from the cluster
@@ -286,7 +261,7 @@ impl IngressManager {
 
     /// Read ALL hosts from /etc/hosts that point to 127.0.0.1 (for checking if domain is resolvable)
     pub async fn get_all_hosts_from_etc_hosts(&self) -> HashSet<String> {
-        let hosts_path = PathBuf::from("/etc/hosts");
+        let hosts_path = hosts_file_path();
         let content = fs::read_to_string(&hosts_path).await.unwrap_or_default();
 
         let mut hosts = HashSet::new();
@@ -315,7 +290,7 @@ impl IngressManager {
     /// Read hosts from /etc/hosts that belong to k3dev (for cleanup)
     #[allow(dead_code)]
     pub async fn get_k3dev_hosts_from_etc_hosts(&self) -> HashSet<String> {
-        let hosts_path = PathBuf::from("/etc/hosts");
+        let hosts_path = hosts_file_path();
         let content = fs::read_to_string(&hosts_path).await.unwrap_or_default();
 
         let mut hosts = HashSet::new();
@@ -362,18 +337,19 @@ impl IngressManager {
         Ok(ingress_hosts.difference(&etc_hosts).cloned().collect())
     }
 
-    /// Update /etc/hosts with ingress entries
+    /// Update /etc/hosts with ingress entries.
+    /// Returns a result indicating what happened or what action is needed.
     pub async fn update_hosts(
         &mut self,
         output_tx: Option<mpsc::Sender<OutputLine>>,
-    ) -> Result<()> {
+    ) -> Result<HostsUpdateResult> {
         let hosts = self.get_ingress_hosts().await?;
 
         if hosts.is_empty() {
             if let Some(tx) = &output_tx {
                 let _ = tx.send(OutputLine::info("No ingress hosts found")).await;
             }
-            return Ok(());
+            return Ok(HostsUpdateResult::NoUpdateNeeded);
         }
 
         // Check if update is needed - check ALL hosts in /etc/hosts
@@ -387,11 +363,11 @@ impl IngressManager {
                     ))
                     .await;
             }
-            return Ok(());
+            return Ok(HostsUpdateResult::NoUpdateNeeded);
         }
 
         // Read current /etc/hosts
-        let hosts_path = PathBuf::from("/etc/hosts");
+        let hosts_path = hosts_file_path();
         let current_content = fs::read_to_string(&hosts_path).await.unwrap_or_default();
 
         // Remove existing k3dev entries
@@ -415,6 +391,37 @@ impl IngressManager {
         final_content.push_str(&new_entries.join("\n"));
         final_content.push('\n');
 
+        // Check if hosts file is on a read-only filesystem (NixOS, MicroOS, etc.)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(meta) = std::fs::metadata(&hosts_path) {
+                let mode = meta.mode();
+                let uid = meta.uid();
+                let is_root = std::fs::metadata("/proc/self")
+                    .map(|m| m.uid() == 0)
+                    .unwrap_or(false);
+                if !is_root && uid == 0 && (mode & 0o200) == 0 {
+                    if let Some(tx) = &output_tx {
+                        let _ = tx
+                            .send(OutputLine::warning(
+                                "Hosts file appears read-only (NixOS/MicroOS/immutable distro)",
+                            ))
+                            .await;
+                        let _ = tx
+                            .send(OutputLine::info("Add these entries to your system config:"))
+                            .await;
+                        for entry in &new_entries {
+                            let _ = tx.send(OutputLine::info(entry)).await;
+                        }
+                    }
+                    return Ok(HostsUpdateResult::ReadOnly {
+                        entries: new_entries,
+                    });
+                }
+            }
+        }
+
         // Try to write directly first (works if run as root or have write permissions)
         if fs::write(&hosts_path, &final_content).await.is_ok() {
             if let Some(tx) = &output_tx {
@@ -425,46 +432,33 @@ impl IngressManager {
                     )))
                     .await;
             }
-            return Ok(());
+            return Ok(HostsUpdateResult::WrittenDirectly {
+                count: hosts.len(),
+            });
         }
 
-        // Try with sudo
-        if let Ok(success) = self.write_hosts_with_sudo(&final_content).await {
-            if success {
-                if let Some(tx) = &output_tx {
-                    let _ = tx
-                        .send(OutputLine::success(format!(
-                            "Updated /etc/hosts with {} entries",
-                            hosts.len()
-                        )))
-                        .await;
-                }
-                return Ok(());
-            }
-        }
-
-        // Failed - show manual instructions
+        // Needs elevated privileges — caller must handle this
         if let Some(tx) = &output_tx {
             let _ = tx
-                .send(OutputLine::warning(
-                    "Cannot write to /etc/hosts (no permission)",
+                .send(OutputLine::info(
+                    "Requesting elevated privileges to update /etc/hosts...",
                 ))
                 .await;
-            let _ = tx
-                .send(OutputLine::info("Add these entries manually:"))
-                .await;
-            for entry in &new_entries {
-                let _ = tx.send(OutputLine::info(entry)).await;
-            }
         }
 
-        Ok(())
+        Ok(HostsUpdateResult::NeedsSudo {
+            content: final_content,
+            count: hosts.len(),
+        })
     }
 
     /// Clean all k3dev entries from /etc/hosts
     #[allow(dead_code)]
-    pub async fn clean_hosts(&self, output_tx: Option<mpsc::Sender<OutputLine>>) -> Result<()> {
-        let hosts_path = PathBuf::from("/etc/hosts");
+    pub async fn clean_hosts(
+        &self,
+        output_tx: Option<mpsc::Sender<OutputLine>>,
+    ) -> Result<HostsUpdateResult> {
+        let hosts_path = hosts_file_path();
         let current_content = fs::read_to_string(&hosts_path).await.unwrap_or_default();
 
         // Remove k3dev entries
@@ -482,31 +476,22 @@ impl IngressManager {
                     .send(OutputLine::success("Cleaned /etc/hosts entries"))
                     .await;
             }
-            return Ok(());
+            return Ok(HostsUpdateResult::WrittenDirectly { count: 0 });
         }
 
-        // Try with sudo
-        if let Ok(success) = self.write_hosts_with_sudo(&final_content).await {
-            if success {
-                if let Some(tx) = &output_tx {
-                    let _ = tx
-                        .send(OutputLine::success("Cleaned /etc/hosts entries"))
-                        .await;
-                }
-                return Ok(());
-            }
-        }
-
-        // Failed
+        // Needs elevated privileges
         if let Some(tx) = &output_tx {
             let _ = tx
-                .send(OutputLine::warning(
-                    "Cannot clean /etc/hosts (no permission)",
+                .send(OutputLine::info(
+                    "Requesting elevated privileges to clean /etc/hosts...",
                 ))
                 .await;
         }
 
-        Ok(())
+        Ok(HostsUpdateResult::NeedsSudo {
+            content: final_content,
+            count: 0,
+        })
     }
 
     /// Show current ingress hosts

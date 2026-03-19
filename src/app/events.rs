@@ -61,12 +61,6 @@ impl App {
             return;
         }
 
-        // Handle sudo password input mode (modal)
-        if self.mode == AppMode::SudoPassword {
-            self.handle_sudo_password_key(code);
-            return;
-        }
-
         // Handle help mode (modal)
         if self.mode == AppMode::Help {
             let visible_height = self
@@ -520,34 +514,6 @@ impl App {
                 }
             }
             KeyCode::Char(c) => self.input_form.handle_char(c),
-            _ => {}
-        }
-    }
-
-    fn handle_sudo_password_key(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Esc => {
-                self.mode = AppMode::Normal;
-                self.password_input.clear();
-                self.pending_hosts_update = false;
-                self.output.add_warning("Operation cancelled");
-            }
-            KeyCode::Enter => {
-                self.sudo_password = self.password_input.clone();
-                self.password_input.clear();
-                self.mode = AppMode::Normal;
-
-                if self.pending_hosts_update {
-                    self.pending_hosts_update = false;
-                    self.do_manual_hosts_update();
-                }
-            }
-            KeyCode::Backspace => {
-                self.password_input.pop();
-            }
-            KeyCode::Char(c) => {
-                self.password_input.push(c);
-            }
             _ => {}
         }
     }

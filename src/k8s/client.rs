@@ -1,5 +1,5 @@
-use anyhow::Result;
-use k8s_openapi::api::core::v1::{Namespace, Node, Pod};
+use anyhow::{Context, Result};
+use k8s_openapi::api::core::v1::{Namespace, Node, PersistentVolumeClaim, Pod};
 use kube::{
     api::{Api, DeleteParams, ListParams, LogParams},
     config::{KubeConfigOptions, Kubeconfig},
@@ -64,6 +64,30 @@ pub struct PendingPodInfo {
     pub namespace: String,
     pub containers: Vec<ContainerWaitingInfo>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// PVC information with usage data
+#[derive(Debug, Clone)]
+pub struct PvcInfo {
+    pub name: String,
+    pub namespace: String,
+    pub capacity_bytes: u64,
+    pub used_bytes: Option<u64>,
+    #[allow(dead_code)]
+    pub phase: String,
+    #[allow(dead_code)]
+    pub storage_class: String,
+    pub pods: Vec<String>,
+}
+
+/// PVC metadata from K8s API (capacity, phase, storage class)
+#[derive(Debug, Clone)]
+pub struct PvcMetadata {
+    pub name: String,
+    pub namespace: String,
+    pub capacity_bytes: u64,
+    pub phase: String,
+    pub storage_class: String,
 }
 
 /// Kubernetes client wrapper
@@ -450,6 +474,56 @@ impl K8sClient {
         Ok(())
     }
 
+    /// List PVC metadata (capacity, phase, storage_class) — single K8s API call.
+    /// Returns a HashMap keyed by "namespace/name" for easy merging with filesystem data.
+    pub async fn list_pvc_metadata(&self) -> Result<HashMap<String, PvcMetadata>> {
+        let pvcs: Api<PersistentVolumeClaim> = Api::all(self.client.clone());
+        let pvc_list = pvcs
+            .list(&ListParams::default())
+            .await
+            .context("Failed to list PVCs")?;
+
+        let mut map = HashMap::new();
+        for pvc in pvc_list.items {
+            let name = pvc.metadata.name.clone().unwrap_or_default();
+            let namespace = pvc.metadata.namespace.clone().unwrap_or_default();
+
+            let phase = pvc
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            let storage_class = pvc
+                .spec
+                .as_ref()
+                .and_then(|s| s.storage_class_name.clone())
+                .unwrap_or_default();
+
+            let capacity_bytes = pvc
+                .status
+                .as_ref()
+                .and_then(|s| s.capacity.as_ref())
+                .and_then(|c| c.get("storage"))
+                .map(|q| parse_k8s_quantity(&q.0))
+                .unwrap_or(0);
+
+            let key = format!("{}/{}", namespace, name);
+            map.insert(
+                key,
+                PvcMetadata {
+                    name,
+                    namespace,
+                    capacity_bytes,
+                    phase,
+                    storage_class,
+                },
+            );
+        }
+
+        Ok(map)
+    }
+
     /// List pending pods with container waiting info
     /// Returns pods that are in Pending phase or have containers in waiting state
     pub async fn list_pending_pods(&self) -> Result<Vec<PendingPodInfo>> {
@@ -572,4 +646,41 @@ impl K8sClient {
 
         Ok(pending_pods)
     }
+}
+
+/// Parse K8s resource quantity strings (e.g., "10Gi", "500Mi", "1Ti") to bytes
+fn parse_k8s_quantity(quantity: &str) -> u64 {
+    let quantity = quantity.trim();
+    if quantity.is_empty() {
+        return 0;
+    }
+
+    // Try binary suffixes (Ki, Mi, Gi, Ti)
+    if let Some(num) = quantity.strip_suffix("Ki") {
+        return num.parse::<u64>().unwrap_or(0) * 1024;
+    }
+    if let Some(num) = quantity.strip_suffix("Mi") {
+        return num.parse::<u64>().unwrap_or(0) * 1024 * 1024;
+    }
+    if let Some(num) = quantity.strip_suffix("Gi") {
+        return num.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024;
+    }
+    if let Some(num) = quantity.strip_suffix("Ti") {
+        return num.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024 * 1024;
+    }
+    // Try decimal suffixes (k, M, G, T)
+    if let Some(num) = quantity.strip_suffix('k') {
+        return num.parse::<u64>().unwrap_or(0) * 1000;
+    }
+    if let Some(num) = quantity.strip_suffix('M') {
+        return num.parse::<u64>().unwrap_or(0) * 1_000_000;
+    }
+    if let Some(num) = quantity.strip_suffix('G') {
+        return num.parse::<u64>().unwrap_or(0) * 1_000_000_000;
+    }
+    if let Some(num) = quantity.strip_suffix('T') {
+        return num.parse::<u64>().unwrap_or(0) * 1_000_000_000_000;
+    }
+    // Plain number (bytes)
+    quantity.parse::<u64>().unwrap_or(0)
 }

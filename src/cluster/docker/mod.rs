@@ -10,6 +10,7 @@
 
 pub(crate) mod pull_progress;
 mod stats;
+mod volumes;
 
 pub use pull_progress::{ContainerPullProgress, PullPhase};
 pub use stats::{ContainerStats, ResourceStats};
@@ -29,7 +30,7 @@ use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use bollard::volume::{CreateVolumeOptions, RemoveVolumeOptions};
 use bollard::Docker;
 use futures_util::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -44,12 +45,8 @@ pub struct DockerManager {
 
 impl DockerManager {
     pub fn new(socket_path: PathBuf) -> Result<Self> {
-        let client = Docker::connect_with_unix(
-            &socket_path.to_string_lossy(),
-            120,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .with_context(|| format!("Failed to connect to Docker at {:?}", socket_path))?;
+        let client = Docker::connect_with_defaults()
+            .context("Failed to connect to Docker. Check DOCKER_HOST or that Docker is running.")?;
 
         Ok(Self {
             socket_path,
@@ -57,9 +54,62 @@ impl DockerManager {
         })
     }
 
-    /// Check if Docker is accessible
+    /// Negotiate Docker API version with the server.
+    /// This ensures compatibility with older Docker versions that reject newer API requests.
+    /// Should be called once after construction when async context is available.
+    pub async fn negotiate_api_version(&mut self) -> Result<()> {
+        let old_client = std::mem::replace(
+            &mut self.client,
+            Docker::connect_with_defaults()
+                .context("Failed to reconnect to Docker for version negotiation")?,
+        );
+        self.client = old_client
+            .negotiate_version()
+            .await
+            .context("Failed to negotiate Docker API version")?;
+        Ok(())
+    }
+
+    /// Get Docker's root directory (data-root)
+    /// Returns the actual Docker data directory (e.g., "/var/lib/docker", "~/.local/share/docker/")
+    /// Falls back to "/var/lib/docker" if detection fails
+    pub async fn get_docker_root_dir(&self) -> String {
+        match self.client.info().await {
+            Ok(info) => info
+                .docker_root_dir
+                .unwrap_or_else(|| "/var/lib/docker".to_string()),
+            Err(_) => "/var/lib/docker".to_string(),
+        }
+    }
+
+    /// Check if Docker is accessible.
+    /// Retries briefly to handle systemd socket activation delays.
     pub async fn is_accessible(&self) -> bool {
-        self.client.ping().await.is_ok()
+        if self.client.ping().await.is_ok() {
+            return true;
+        }
+
+        // Socket activation: daemon may be starting. Retry with short delays.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if self.client.ping().await.is_ok() {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Get Docker's cgroup driver ("cgroupfs" or "systemd")
+    /// Falls back to "cgroupfs" if detection fails
+    pub async fn get_cgroup_driver(&self) -> String {
+        match self.client.info().await {
+            Ok(info) => info
+                .cgroup_driver
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "cgroupfs".to_string()),
+            Err(_) => "cgroupfs".to_string(),
+        }
     }
 
     /// Wait for Docker to become accessible
@@ -227,6 +277,66 @@ impl DockerManager {
         Ok(names)
     }
 
+    /// List k8s containers with their volume mount sources.
+    /// Parses pod name + namespace from container name format `k8s_{container}_{pod}_{namespace}_{uid}_{attempt}`.
+    pub async fn list_containers_with_mounts(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<ContainerMountInfo>> {
+        let mut filters = HashMap::new();
+        filters.insert("name", vec![prefix]);
+
+        let containers = self
+            .client
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters,
+                ..Default::default()
+            }))
+            .await
+            .context("Failed to list containers with mounts")?;
+
+        let mut result = Vec::new();
+        for c in containers {
+            let container_name = c
+                .names
+                .as_ref()
+                .and_then(|n| n.first())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_default();
+
+            // Parse pod name + namespace from k8s container name
+            let parts: Vec<&str> = container_name.split('_').collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let pod_name = parts[2].to_string();
+            let namespace = parts[3].to_string();
+
+            // Extract mount sources
+            let mounts = c
+                .mounts
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|m| {
+                    Some(MountSource {
+                        source: m.source?,
+                        destination: m.destination.unwrap_or_default(),
+                    })
+                })
+                .collect();
+
+            result.push(ContainerMountInfo {
+                container_name,
+                pod_name,
+                namespace,
+                mounts,
+            });
+        }
+
+        Ok(result)
+    }
+
     /// Force-remove all containers with a name prefix (parallel)
     pub async fn cleanup_containers_by_prefix(&self, prefix: &str) -> Result<()> {
         let containers = self.list_containers_by_prefix(prefix).await?;
@@ -332,6 +442,80 @@ impl DockerManager {
     /// Check if an image exists locally
     pub async fn image_exists(&self, image: &str) -> bool {
         self.client.inspect_image(image).await.is_ok()
+    }
+
+    /// Get the architecture of a Docker image (e.g., "amd64", "arm64")
+    pub async fn get_image_architecture(&self, image: &str) -> Option<String> {
+        self.client
+            .inspect_image(image)
+            .await
+            .ok()
+            .and_then(|info| info.architecture)
+    }
+
+    /// Get image architectures for all running k8s pod containers.
+    /// Returns a map of "namespace/pod_name" → image architecture string.
+    pub async fn get_pod_image_architectures(&self) -> HashMap<String, String> {
+        let containers = match self
+            .client
+            .list_containers(Some(ListContainersOptions::<String> {
+                all: false,
+                ..Default::default()
+            }))
+            .await
+        {
+            Ok(c) => c,
+            Err(_) => return HashMap::new(),
+        };
+
+        // Collect unique images and map pod keys to image names
+        let mut pod_to_image: HashMap<String, String> = HashMap::new();
+        let mut unique_images: HashSet<String> = HashSet::new();
+
+        for container in &containers {
+            let name = container
+                .names
+                .as_ref()
+                .and_then(|n| n.first())
+                .map(|n| n.trim_start_matches('/').to_string())
+                .unwrap_or_default();
+
+            // Only k8s workload containers (skip pause containers)
+            if !name.starts_with("k8s_") || name.starts_with("k8s_POD_") {
+                continue;
+            }
+
+            let image = container.image.clone().unwrap_or_default();
+            if image.is_empty() {
+                continue;
+            }
+
+            // Parse pod name and namespace from k8s_{container}_{pod}_{namespace}_{uid}_{attempt}
+            let parts: Vec<&str> = name.split('_').collect();
+            if parts.len() >= 4 {
+                let pod_key = format!("{}/{}", parts[3], parts[2]);
+                unique_images.insert(image.clone());
+                pod_to_image.insert(pod_key, image);
+            }
+        }
+
+        // Inspect each unique image for architecture
+        let mut image_arch: HashMap<String, String> = HashMap::new();
+        for image in &unique_images {
+            if let Some(arch) = self.get_image_architecture(image).await {
+                image_arch.insert(image.clone(), arch);
+            }
+        }
+
+        // Map pod keys to their image's architecture
+        let mut result = HashMap::new();
+        for (pod_key, image) in &pod_to_image {
+            if let Some(arch) = image_arch.get(image) {
+                result.insert(pod_key.clone(), arch.clone());
+            }
+        }
+
+        result
     }
 
     /// Get labels from a Docker image
@@ -597,6 +781,11 @@ impl DockerManager {
             } else {
                 None
             },
+            security_opt: if config.security_opt.is_empty() {
+                None
+            } else {
+                Some(config.security_opt.clone())
+            },
             ..Default::default()
         };
 
@@ -643,6 +832,23 @@ impl DockerManager {
     }
 }
 
+/// Container with parsed pod info and volume mounts
+pub struct ContainerMountInfo {
+    #[allow(dead_code)]
+    pub container_name: String,
+    pub pod_name: String,
+    #[allow(dead_code)]
+    pub namespace: String,
+    pub mounts: Vec<MountSource>,
+}
+
+/// A single mount source/destination pair from a container
+pub struct MountSource {
+    pub source: String,
+    #[allow(dead_code)]
+    pub destination: String,
+}
+
 /// Configuration for running a Docker container
 #[derive(Debug, Clone, Default)]
 pub struct ContainerRunConfig {
@@ -659,4 +865,6 @@ pub struct ContainerRunConfig {
     pub pid_host: bool,
     pub entrypoint: Option<String>,
     pub command: Option<Vec<String>>,
+    /// Security options (e.g., "apparmor=unconfined", "seccomp=unconfined")
+    pub security_opt: Vec<String>,
 }

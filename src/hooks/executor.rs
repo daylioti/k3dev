@@ -108,9 +108,16 @@ impl HookExecutor {
             *value = expand_home(value);
         }
 
-        // Build the command
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&hook.command);
+        // Build the command (platform-aware shell)
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(&hook.command);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&hook.command);
+            c
+        };
 
         if let Some(ref wd) = workdir {
             cmd.current_dir(wd);

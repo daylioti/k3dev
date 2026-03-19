@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::cluster::diagnostics::run_all_diagnostics;
-use crate::cluster::{ClusterManager, IngressManager};
+use crate::cluster::{ClusterManager, HostsUpdateResult, IngressManager};
 use crate::commands::{CommandContext, PaletteCommandId};
 use crate::config::{get_exec_placeholders, CommandEntry, RefreshTask};
 use crate::k8s::PodExecutor;
@@ -140,17 +140,6 @@ impl App {
         }
 
         None
-    }
-
-    /// Check if sudo requires a password (non-interactive check)
-    fn sudo_needs_password() -> bool {
-        std::process::Command::new("sudo")
-            .args(["-n", "true"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| !s.success())
-            .unwrap_or(true)
     }
 
     pub(super) fn execute_cluster_action(&mut self, action: ClusterAction) {
@@ -355,19 +344,6 @@ impl App {
     }
 
     pub(super) fn trigger_manual_hosts_update(&mut self) {
-        if Self::sudo_needs_password() && self.sudo_password.is_empty() {
-            self.pending_hosts_update = true;
-            self.password_input.clear();
-            self.password_popup
-                .set_message("Updating /etc/hosts requires sudo privileges.");
-            self.mode = AppMode::SudoPassword;
-            return;
-        }
-
-        self.do_manual_hosts_update();
-    }
-
-    pub(super) fn do_manual_hosts_update(&mut self) {
         self.output.clear();
         self.output.set_title("Updating /etc/hosts".to_string());
         self.output_popup.clear();
@@ -375,27 +351,29 @@ impl App {
             .set_title("Updating /etc/hosts".to_string());
         self.is_executing = true;
         self.status_bar.set_executing(true);
-        // Show output popup immediately when command starts
         self.mode = super::AppMode::OutputPopup;
 
         let timeout = self.refresh_config.manual_hosts_timeout;
         let (ctx, tx) = CommandContext::new(self.message_tx.clone(), timeout);
-
+        let message_tx = self.message_tx.clone();
         let domain = self.cluster_config.domain.clone();
-        let sudo_password = if self.sudo_password.is_empty() {
-            None
-        } else {
-            Some(self.sudo_password.clone())
-        };
 
         tokio::spawn(async move {
             ctx.execute(move |_output_tx| async move {
-                let mut ingress_manager =
-                    IngressManager::with_domain_and_sudo(domain, sudo_password);
-                ingress_manager
+                let mut ingress_manager = IngressManager::with_domain(domain);
+                let result = ingress_manager
                     .update_hosts(Some(tx))
                     .await
-                    .map_err(|e| format!("Failed to update /etc/hosts: {}", e))
+                    .map_err(|e| format!("Failed to update /etc/hosts: {}", e))?;
+
+                // If sudo is needed, send message back to main thread for interactive handling
+                if let HostsUpdateResult::NeedsSudo { content, count } = result {
+                    let _ = message_tx
+                        .send(AppMessage::NeedsSudoHostsWrite { content, count })
+                        .await;
+                }
+
+                Ok(())
             })
             .await;
         });

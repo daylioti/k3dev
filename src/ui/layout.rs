@@ -47,10 +47,10 @@ impl AppLayout {
             .menu_width
             .calculate(total_width, longest_menu_item);
 
-        // Apply menu width offset from user adjustments
+        // Apply menu width offset from user adjustments (cap at 35% of total width)
         let menu_width = (base_menu_width as i32 + menu_width_offset as i32)
             .max(20)
-            .min((total_width * 60 / 100) as i32) as u16;
+            .min((total_width * 35 / 100) as i32) as u16;
 
         // Horizontal split for content: menu | pod_stats (full right panel)
         let horizontal = Layout::default()

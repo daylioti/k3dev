@@ -40,20 +40,15 @@ pub struct Config {
 }
 
 /// Menu width configuration
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum MenuWidth {
     /// Auto-calculate based on longest visible item
+    #[default]
     Auto,
     /// Percentage of terminal width (e.g., 30)
     Percent(u16),
     /// Fixed number of characters
     Fixed(u16),
-}
-
-impl Default for MenuWidth {
-    fn default() -> Self {
-        MenuWidth::Percent(30)
-    }
 }
 
 impl<'de> serde::Deserialize<'de> for MenuWidth {
@@ -117,8 +112,8 @@ impl MenuWidth {
     pub fn calculate(&self, total_width: u16, longest_item: u16) -> u16 {
         match self {
             MenuWidth::Auto => {
-                // Auto-expand based on longest item, with some padding
-                (longest_item + 4).max(25).min(total_width / 2)
+                // Auto-expand based on longest item, with padding for border + scrollbar
+                (longest_item + 4).max(25).min(total_width * 35 / 100)
             }
             MenuWidth::Percent(percent) => {
                 (total_width * percent / 100).max(25).min(total_width / 2)
@@ -468,7 +463,8 @@ fn default_logging_enabled() -> bool {
 }
 
 fn default_log_file() -> String {
-    "/tmp/k3dev-{cluster_name}.log".to_string()
+    let tmp = std::env::temp_dir();
+    format!("{}/k3dev-{{cluster_name}}.log", tmp.display())
 }
 
 fn default_log_level() -> String {

@@ -332,12 +332,19 @@ async fn fetch_manifest_cached(image_ref: &ImageRef) -> Option<ManifestInfo> {
 async fn fetch_manifest_total(image_ref: &ImageRef) -> Option<ManifestInfo> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(false)
         .build()
         .ok()?;
 
+    // Read Docker credentials for this registry (if available)
+    let creds = read_docker_credentials(&image_ref.registry);
+    let creds_ref = creds.as_deref();
+
+    // Determine scheme (HTTPS or HTTP for insecure registries)
+    let base_url = registry_base_url(&client, &image_ref.registry).await;
     let manifest_url = format!(
-        "https://{}/v2/{}/manifests/{}",
-        image_ref.registry, image_ref.repository, image_ref.tag
+        "{}/v2/{}/manifests/{}",
+        base_url, image_ref.repository, image_ref.tag
     );
 
     let accept_headers = [
@@ -355,7 +362,7 @@ async fn fetch_manifest_total(image_ref: &ImageRef) -> Option<ManifestInfo> {
         .await
         .ok()?;
 
-    // Handle 401 with bearer token auth (Docker Hub)
+    // Handle 401 — supports both Bearer and Basic auth schemes
     let body = if resp.status().as_u16() == 401 {
         let www_auth = resp
             .headers()
@@ -363,15 +370,27 @@ async fn fetch_manifest_total(image_ref: &ImageRef) -> Option<ManifestInfo> {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        let token = fetch_bearer_token(&client, www_auth).await?;
-
-        let resp2 = client
-            .get(&manifest_url)
-            .header(ACCEPT, &accept_headers)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .ok()?;
+        let resp2 = if www_auth.starts_with("Basic") || www_auth.starts_with("basic") {
+            // Basic auth: send credentials directly
+            let creds = creds_ref?;
+            client
+                .get(&manifest_url)
+                .header(ACCEPT, &accept_headers)
+                .header("Authorization", format!("Basic {}", creds))
+                .send()
+                .await
+                .ok()?
+        } else {
+            // Bearer auth: fetch token from auth endpoint
+            let token = fetch_bearer_token(&client, www_auth, creds_ref).await?;
+            client
+                .get(&manifest_url)
+                .header(ACCEPT, &accept_headers)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await
+                .ok()?
+        };
 
         if !resp2.status().is_success() {
             return None;
@@ -412,9 +431,10 @@ async fn fetch_manifest_by_digest(
     image_ref: &ImageRef,
     digest: &str,
 ) -> Option<ManifestInfo> {
+    let base_url = registry_base_url(client, &image_ref.registry).await;
     let url = format!(
-        "https://{}/v2/{}/manifests/{}",
-        image_ref.registry, image_ref.repository, digest
+        "{}/v2/{}/manifests/{}",
+        base_url, image_ref.repository, digest
     );
     let accept = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json";
 
@@ -426,14 +446,28 @@ async fn fetch_manifest_by_digest(
             .get(WWW_AUTHENTICATE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let token = fetch_bearer_token(client, www_auth).await?;
-        let resp2 = client
-            .get(&url)
-            .header(ACCEPT, accept)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .ok()?;
+        let creds = read_docker_credentials(&image_ref.registry);
+
+        let resp2 = if www_auth.starts_with("Basic") || www_auth.starts_with("basic") {
+            let creds = creds.as_deref()?;
+            client
+                .get(&url)
+                .header(ACCEPT, accept)
+                .header("Authorization", format!("Basic {}", creds))
+                .send()
+                .await
+                .ok()?
+        } else {
+            let token = fetch_bearer_token(client, www_auth, creds.as_deref()).await?;
+            client
+                .get(&url)
+                .header(ACCEPT, accept)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await
+                .ok()?
+        };
+
         if !resp2.status().is_success() {
             return None;
         }
@@ -480,8 +514,141 @@ fn digest_prefix(digest: &str) -> String {
     hash.chars().take(12).collect()
 }
 
+/// Read Docker credentials for a registry from ~/.docker/config.json
+/// Returns base64-encoded "user:password" string if found.
+/// Checks inline `auths` first, then falls back to credential helpers
+/// (`credHelpers` per-registry or `credsStore` global).
+fn read_docker_credentials(registry: &str) -> Option<String> {
+    let config_path = dirs::home_dir()?.join(".docker").join("config.json");
+    let content = std::fs::read_to_string(&config_path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // 1. Try inline auths first
+    if let Some(auths) = config.get("auths").and_then(|a| a.as_object()) {
+        let registry_variants = [
+            registry.to_string(),
+            format!("https://{}", registry),
+            format!("https://{}/v2/", registry),
+            format!("https://{}/v1/", registry),
+        ];
+
+        for variant in &registry_variants {
+            if let Some(entry) = auths.get(variant.as_str()) {
+                if let Some(auth) = entry.get("auth").and_then(|a| a.as_str()) {
+                    if !auth.is_empty() {
+                        return Some(auth.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Try per-registry credential helper (credHelpers)
+    if let Some(cred_helpers) = config.get("credHelpers").and_then(|c| c.as_object()) {
+        if let Some(helper_name) = cred_helpers.get(registry).and_then(|h| h.as_str()) {
+            if let Some(creds) = run_credential_helper(helper_name, registry) {
+                return Some(creds);
+            }
+        }
+    }
+
+    // 3. Try global credential store (credsStore)
+    if let Some(store) = config.get("credsStore").and_then(|s| s.as_str()) {
+        if !store.is_empty() {
+            if let Some(creds) = run_credential_helper(store, registry) {
+                return Some(creds);
+            }
+        }
+    }
+
+    None
+}
+
+/// Run a Docker credential helper to get credentials for a registry.
+/// Executes `docker-credential-<helper> get` with the registry URL on stdin.
+/// Returns base64-encoded "user:password" on success.
+fn run_credential_helper(helper: &str, registry: &str) -> Option<String> {
+    use base64::Engine;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let binary = format!("docker-credential-{}", helper);
+    let mut child = Command::new(&binary)
+        .arg("get")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    // Write registry URL to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        // Credential helpers expect the full URL for Docker Hub
+        let server_url = if registry == "registry-1.docker.io" {
+            "https://index.docker.io/v1/"
+        } else {
+            registry
+        };
+        stdin.write_all(server_url.as_bytes()).ok()?;
+    }
+
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    // Parse JSON response: {"Username": "...", "Secret": "..."}
+    let resp: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let username = resp.get("Username").and_then(|u| u.as_str())?;
+    let secret = resp.get("Secret").and_then(|s| s.as_str())?;
+
+    if username.is_empty() || username == "<token>" {
+        // Some helpers return "<token>" as username for token-based auth
+        // In that case, the secret IS the token — encode it as-is
+        return None;
+    }
+
+    // Encode as base64 "user:password"
+    let auth = format!("{}:{}", username, secret);
+    Some(base64::engine::general_purpose::STANDARD.encode(auth))
+}
+
+/// Determine the registry URL scheme (https or http).
+/// Tries HTTPS first; falls back to HTTP for private/insecure registries.
+async fn registry_base_url(client: &reqwest::Client, registry: &str) -> String {
+    // Localhost and common local registries are typically HTTP
+    if registry.starts_with("localhost") || registry.starts_with("127.0.0.1") {
+        // Try HTTP first for localhost
+        let http_url = format!("http://{}/v2/", registry);
+        if client.get(&http_url).send().await.is_ok() {
+            return format!("http://{}", registry);
+        }
+    }
+
+    // Try HTTPS (default)
+    let https_url = format!("https://{}/v2/", registry);
+    if client.get(&https_url).send().await.is_ok() {
+        return format!("https://{}", registry);
+    }
+
+    // Fall back to HTTP for insecure registries
+    let http_url = format!("http://{}/v2/", registry);
+    if client.get(&http_url).send().await.is_ok() {
+        return format!("http://{}", registry);
+    }
+
+    // Default to HTTPS
+    format!("https://{}", registry)
+}
+
 /// Parse WWW-Authenticate header and fetch bearer token
-async fn fetch_bearer_token(client: &reqwest::Client, www_auth: &str) -> Option<String> {
+/// If Docker credentials are available for the registry, they are sent to the token endpoint
+/// for authenticated pulls (higher rate limits, private registry access)
+async fn fetch_bearer_token(
+    client: &reqwest::Client,
+    www_auth: &str,
+    registry_creds: Option<&str>,
+) -> Option<String> {
     let auth_str = www_auth
         .strip_prefix("Bearer ")
         .or_else(|| www_auth.strip_prefix("bearer "))?;
@@ -508,7 +675,13 @@ async fn fetch_bearer_token(client: &reqwest::Client, www_auth: &str) -> Option<
         token_url.push_str(&format!("&scope={}", scope));
     }
 
-    let resp = client.get(&token_url).send().await.ok()?;
+    let mut req = client.get(&token_url);
+    // If we have Docker credentials, send them as Basic auth to the token endpoint
+    if let Some(creds) = registry_creds {
+        req = req.header("Authorization", format!("Basic {}", creds));
+    }
+
+    let resp = req.send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }

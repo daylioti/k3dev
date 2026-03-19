@@ -61,15 +61,30 @@ impl K3sManager {
     /// Docker volume name for local PV storage (no sudo required)
     pub(crate) const LOCAL_PV_VOLUME_NAME: &'static str = "k3s-local-pv-data";
 
-    /// PV storage path - points to Docker volume's internal path
-    /// This path is accessible to pod containers since they run on the same Docker daemon
+    /// Default PV storage path (used when Docker root is not yet detected)
     pub(crate) const LOCAL_PV_STORAGE_PATH: &'static str =
         "/var/lib/docker/volumes/k3s-local-pv-data/_data";
+
+    /// Get PV storage path based on Docker's actual data root directory
+    pub(crate) fn local_pv_storage_path(docker_root: &str) -> String {
+        format!("{}/volumes/k3s-local-pv-data/_data", docker_root)
+    }
+
+    /// Get kubelet root dir based on Docker's actual data root directory
+    pub(crate) fn kubelet_root_dir(docker_root: &str) -> String {
+        format!("{}/kubelet", docker_root)
+    }
 
     pub async fn new(config: Arc<ClusterConfig>) -> Result<Self> {
         let platform = PlatformInfo::detect()?;
         let socket_path = platform.docker_socket_path().await?;
-        let docker = DockerManager::new(socket_path)?;
+        let mut docker = DockerManager::new(socket_path)?;
+
+        // Negotiate API version for compatibility with older Docker versions
+        if let Err(e) = docker.negotiate_api_version().await {
+            tracing::warn!("Docker API version negotiation failed (using default): {:#}", e);
+        }
+
         let kube_ops = KubeOps::new();
 
         Ok(Self {
@@ -253,8 +268,13 @@ impl K3sManager {
             pull_future,
         )?;
 
-        // Get docker socket path
+        // Get docker socket path, cgroup driver, docker root, and iptables mode
         let socket_path = self.platform.docker_socket_path().await?;
+        let cgroup_driver = self.docker.get_cgroup_driver().await;
+        let docker_root = self.docker.get_docker_root_dir().await;
+        let pv_storage_path = Self::local_pv_storage_path(&docker_root);
+        let kubelet_root = Self::kubelet_root_dir(&docker_root);
+        let iptables_mode = PlatformInfo::detect_iptables_mode();
 
         // Build port mappings
         let ports: Vec<(u16, u16)> = self
@@ -289,14 +309,17 @@ impl K3sManager {
                  --disable=servicelb \
                  --disable-cloud-controller \
                  --disable-network-policy \
+                 --flannel-backend=host-gw \
                  --default-local-storage-path {} \
                  --service-node-port-range 80-32767 \
-                 --kubelet-arg=root-dir=/var/lib/docker/kubelet \
-                 --kubelet-arg=cgroup-driver=cgroupfs \
+                 --kubelet-arg=root-dir={} \
+                 --kubelet-arg=cgroup-driver={} \
                  --kube-apiserver-arg=profiling=false \
                  --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
                  --kube-controller-manager-arg=concurrent-deployment-syncs=1",
-                Self::LOCAL_PV_STORAGE_PATH
+                pv_storage_path,
+                kubelet_root,
+                cgroup_driver
             ),
         ];
 
@@ -319,10 +342,10 @@ impl K3sManager {
                     "/var/run/docker.sock".to_string(),
                     String::new(),
                 ),
-                // Mount real /var/lib/docker - required for k3s --docker mode to access host Docker data
+                // Mount Docker data directory - required for k3s --docker mode to access host Docker data
                 (
-                    "/var/lib/docker".to_string(),
-                    "/var/lib/docker".to_string(),
+                    docker_root.clone(),
+                    docker_root.clone(),
                     "bind-propagation=rshared".to_string(),
                 ),
                 // Docker volume for rancher data (server config, agent data) - no sudo required
@@ -334,16 +357,20 @@ impl K3sManager {
                 // Docker volume for local PV storage - accessible to pod containers via Docker's volume path
                 (
                     Self::LOCAL_PV_VOLUME_NAME.to_string(),
-                    Self::LOCAL_PV_STORAGE_PATH.to_string(),
+                    pv_storage_path.clone(),
                     "volume".to_string(),
                 ),
             ],
-            env: vec![],
+            env: vec![
+                // Tell K3s to use the same iptables backend as the host
+                ("IPTABLES_MODE".to_string(), iptables_mode.to_string()),
+            ],
             network: Some(self.config.network_name.clone()),
             cgroupns_host: true,
             pid_host: true,
             entrypoint: Some(String::new()),
             command: Some(k3s_command),
+            security_opt: vec!["apparmor=unconfined".to_string()],
         };
 
         self.docker.run_container(&run_config).await?;
@@ -355,7 +382,7 @@ impl K3sManager {
         let _ = output_tx
             .send(OutputLine::info("Configuring cluster access..."))
             .await;
-        let (socat_result, kubeconfig_result) = tokio::join!(
+        let (socat_result, kubeconfig_result, agent_result) = tokio::join!(
             async {
                 let _ = output_tx
                     .send(OutputLine::info("Installing socat in container..."))
@@ -367,6 +394,12 @@ impl K3sManager {
                     .send(OutputLine::info("Setting up kubeconfig..."))
                     .await;
                 self.setup_kubeconfig().await
+            },
+            async {
+                let _ = output_tx
+                    .send(OutputLine::info("Installing stats agent..."))
+                    .await;
+                self.install_agent().await
             },
         );
 
@@ -384,8 +417,17 @@ impl K3sManager {
                 )))
                 .await;
         }
+        if let Err(e) = &agent_result {
+            let _ = output_tx
+                .send(OutputLine::warning(format!(
+                    "Agent install failed (stats will use fallback): {:#}",
+                    e
+                )))
+                .await;
+        }
         socat_result?;
         kubeconfig_result?;
+        // Agent failure is non-fatal — stats fall back to direct Docker API
 
         // Wait for cluster to be fully ready
         self.wait_for_cluster_ready(output_tx).await?;

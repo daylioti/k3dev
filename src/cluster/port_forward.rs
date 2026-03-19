@@ -41,20 +41,82 @@ impl PortForwardDetector {
         forwards
     }
 
-    /// Detect port forwards on the host by scanning /proc
+    /// Detect port forwards on the host using platform-appropriate method
     async fn detect_host_port_forwards(&self) -> Vec<ActivePortForward> {
+        #[cfg(target_os = "linux")]
+        {
+            self.detect_host_port_forwards_linux().await
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.detect_host_port_forwards_macos().await
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Linux: scan /proc/net/tcp and /proc/<pid>/fd for k8s port forwards
+    #[cfg(target_os = "linux")]
+    async fn detect_host_port_forwards_linux(&self) -> Vec<ActivePortForward> {
         let mut forwards = Vec::new();
 
-        // Get all listening sockets from /proc/net/tcp and /proc/net/tcp6
-        let listening_sockets = get_listening_sockets().await;
-
-        // Build inode -> (port, pid, cmdline) mapping
+        let listening_sockets = get_listening_sockets_linux().await;
         let socket_info = map_sockets_to_processes(&listening_sockets).await;
 
-        // Parse cmdlines to find port forwards
         for (port, _pid, cmdline) in socket_info {
             if let Some(pf) = parse_k8s_port_forward(&cmdline, port) {
                 forwards.push(pf);
+            }
+        }
+
+        forwards
+    }
+
+    /// macOS: use lsof to find k8s-related listening processes
+    #[cfg(target_os = "macos")]
+    async fn detect_host_port_forwards_macos(&self) -> Vec<ActivePortForward> {
+        let mut forwards = Vec::new();
+
+        // lsof -iTCP -sTCP:LISTEN -P -n -F pcn
+        // Output format: p<pid>\nc<command>\nn<name>
+        let output = match tokio::process::Command::new("lsof")
+            .args(["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pcn"])
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+            _ => return forwards,
+        };
+
+        let mut current_pid: u32 = 0;
+        let mut current_cmd = String::new();
+
+        for line in output.lines() {
+            if let Some(pid_str) = line.strip_prefix('p') {
+                current_pid = pid_str.parse().unwrap_or(0);
+            } else if let Some(cmd) = line.strip_prefix('c') {
+                current_cmd = cmd.to_string();
+            } else if let Some(name) = line.strip_prefix('n') {
+                // name format: "host:port" e.g. "*:8080" or "127.0.0.1:8080"
+                if !is_k8s_related_process(&current_cmd) {
+                    continue;
+                }
+                if let Some(port_str) = name.rsplit(':').next() {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        // Read full cmdline from /proc equivalent on macOS (ps)
+                        let cmdline = get_process_cmdline_macos(current_pid).await;
+                        let cmd_to_parse = if cmdline.is_empty() {
+                            current_cmd.clone()
+                        } else {
+                            cmdline
+                        };
+                        if let Some(pf) = parse_k8s_port_forward(&cmd_to_parse, port) {
+                            forwards.push(pf);
+                        }
+                    }
+                }
             }
         }
 
@@ -121,14 +183,31 @@ fn extract_deployment_name(pod_name: &str) -> String {
     }
 }
 
-/// Listening socket info: (port, inode)
+/// Listening socket info: (port, inode) — used by Linux /proc scanner
+#[cfg(target_os = "linux")]
 struct ListeningSocket {
     port: u16,
     inode: u64,
 }
 
-/// Read /proc/net/tcp and /proc/net/tcp6 for listening sockets
-async fn get_listening_sockets() -> Vec<ListeningSocket> {
+/// Get full command line for a process on macOS via `ps`
+#[cfg(target_os = "macos")]
+async fn get_process_cmdline_macos(pid: u32) -> String {
+    match tokio::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Read /proc/net/tcp and /proc/net/tcp6 for listening sockets (Linux only)
+#[cfg(target_os = "linux")]
+async fn get_listening_sockets_linux() -> Vec<ListeningSocket> {
     let mut sockets = Vec::new();
 
     for path in &["/proc/net/tcp", "/proc/net/tcp6"] {
@@ -162,7 +241,8 @@ async fn get_listening_sockets() -> Vec<ListeningSocket> {
     sockets
 }
 
-/// Map socket inodes to processes by scanning /proc/<pid>/fd
+/// Map socket inodes to processes by scanning /proc/<pid>/fd (Linux only)
+#[cfg(target_os = "linux")]
 async fn map_sockets_to_processes(sockets: &[ListeningSocket]) -> Vec<(u16, u32, String)> {
     let mut results = Vec::new();
 

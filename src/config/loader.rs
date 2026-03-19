@@ -63,9 +63,11 @@ impl ConfigLoader {
             search_paths.push(config_dir.join("k3dev").join("config.yaml"));
         }
 
-        // Add system config
-        search_paths.push(PathBuf::from("/etc/k3dev/config.yml"));
-        search_paths.push(PathBuf::from("/etc/k3dev/config.yaml"));
+        // Add system config (Linux only)
+        if cfg!(target_os = "linux") {
+            search_paths.push(PathBuf::from("/etc/k3dev/config.yml"));
+            search_paths.push(PathBuf::from("/etc/k3dev/config.yaml"));
+        }
 
         for path in search_paths {
             if path.exists() {
@@ -196,7 +198,11 @@ pub fn expand_home(path: &Path) -> Result<PathBuf> {
     let path_str = path.to_string_lossy();
     if let Some(stripped) = path_str.strip_prefix('~') {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("Cannot determine home directory"))?;
-        let rest = stripped.strip_prefix('/').unwrap_or(stripped);
+        // Strip leading path separator (both / and \ for Windows compatibility)
+        let rest = stripped
+            .strip_prefix('/')
+            .or_else(|| stripped.strip_prefix('\\'))
+            .unwrap_or(stripped);
         Ok(home.join(rest))
     } else {
         Ok(path.to_path_buf())

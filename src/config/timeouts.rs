@@ -41,6 +41,12 @@ pub struct RefreshConfig {
 
     /// Timeout for manual hosts update operations
     pub manual_hosts_timeout: Duration,
+
+    /// Interval for refreshing volume/PVC stats
+    pub volume_refresh: Duration,
+
+    /// Timeout for volume stats operations
+    pub volume_timeout: Duration,
 }
 
 impl Default for RefreshConfig {
@@ -60,6 +66,8 @@ impl Default for RefreshConfig {
             docker_stats_timeout: Duration::from_secs(5),
             port_forward_timeout: Duration::from_secs(10),
             manual_hosts_timeout: Duration::from_secs(60),
+            volume_refresh: Duration::from_secs(10),
+            volume_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -87,6 +95,8 @@ impl RefreshConfig {
             docker_stats_timeout: Duration::from_secs(1),
             port_forward_timeout: Duration::from_secs(1),
             manual_hosts_timeout: Duration::from_secs(5),
+            volume_refresh: Duration::from_millis(100),
+            volume_timeout: Duration::from_secs(1),
         }
     }
 }
@@ -102,6 +112,8 @@ pub enum RefreshTask {
     BlinkToggle,
     /// Refresh resource and pod stats
     StatsRefresh,
+    /// Refresh volume/PVC stats
+    VolumeRefresh,
 }
 
 /// Internal state for a scheduled task
@@ -152,6 +164,14 @@ impl RefreshScheduler {
             RefreshTask::StatsRefresh,
             TaskState {
                 interval: config.stats_refresh,
+                last_run: now,
+            },
+        );
+
+        tasks.insert(
+            RefreshTask::VolumeRefresh,
+            TaskState {
+                interval: config.volume_refresh,
                 last_run: now,
             },
         );

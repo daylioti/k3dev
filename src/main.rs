@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use std::panic;
 
 mod app;
+mod cli;
 mod cluster;
 mod commands;
 mod config;
@@ -22,6 +23,7 @@ mod shell;
 mod ui;
 
 use app::App;
+use ui::components::ClusterAction;
 
 #[derive(Parser)]
 #[command(name = "k3dev")]
@@ -29,8 +31,37 @@ use app::App;
 #[command(about = "TUI for local k3s cluster development")]
 struct Cli {
     /// Path to configuration file
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     config: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Start the cluster
+    Start,
+    /// Stop the cluster
+    Stop,
+    /// Restart the cluster
+    Restart,
+    /// Destroy the cluster
+    Destroy,
+    /// Show cluster info
+    Info,
+}
+
+impl CliCommand {
+    fn as_cluster_action(&self) -> ClusterAction {
+        match self {
+            CliCommand::Start => ClusterAction::Start,
+            CliCommand::Stop => ClusterAction::Stop,
+            CliCommand::Restart => ClusterAction::Restart,
+            CliCommand::Destroy => ClusterAction::Destroy,
+            CliCommand::Info => ClusterAction::Info,
+        }
+    }
 }
 
 /// Restore terminal to normal state
@@ -45,6 +76,13 @@ fn restore_terminal() {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // If a subcommand was given, run headlessly (no TUI)
+    if let Some(cmd) = &cli.command {
+        let exit_code = cli::run_cli_action(cmd.as_cluster_action(), cli.config.as_deref()).await?;
+        std::process::exit(exit_code);
+    }
+
+    // Otherwise, launch the TUI
     // Set up panic hook to restore terminal on panic
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {

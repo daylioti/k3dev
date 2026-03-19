@@ -167,9 +167,24 @@ impl TraefikManager {
             return;
         }
 
-        // Find Firefox profiles
-        let home = std::env::var("HOME").unwrap_or_default();
-        let firefox_dir = format!("{}/.mozilla/firefox", home);
+        // Find Firefox profiles (platform-dependent location)
+        let firefox_dir = match dirs::home_dir() {
+            Some(home) => {
+                // macOS: ~/Library/Application Support/Firefox/Profiles
+                #[cfg(target_os = "macos")]
+                let dir = home
+                    .join("Library")
+                    .join("Application Support")
+                    .join("Firefox")
+                    .join("Profiles");
+                // Linux and others: ~/.mozilla/firefox
+                #[cfg(not(target_os = "macos"))]
+                let dir = home.join(".mozilla").join("firefox");
+                dir
+            }
+            None => return,
+        };
+        let firefox_dir = firefox_dir.to_string_lossy().to_string();
 
         if let Ok(entries) = std::fs::read_dir(&firefox_dir) {
             for entry in entries.flatten() {

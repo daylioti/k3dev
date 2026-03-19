@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 use super::K3sManager;
 use crate::cluster::config::ClusterConfig;
+use crate::cluster::platform::PlatformInfo;
 use crate::cluster::docker::{ContainerRunConfig, DockerManager};
 use crate::config::HookEvent;
 use crate::hooks::HookExecutor;
@@ -249,8 +250,13 @@ impl K3sManager {
                 .await;
         }
 
-        // Get docker socket path
+        // Get docker socket path, cgroup driver, docker root, and iptables mode
         let socket_path = self.platform.docker_socket_path().await?;
+        let cgroup_driver = self.docker.get_cgroup_driver().await;
+        let docker_root = self.docker.get_docker_root_dir().await;
+        let pv_storage_path = Self::local_pv_storage_path(&docker_root);
+        let kubelet_root = Self::kubelet_root_dir(&docker_root);
+        let iptables_mode = PlatformInfo::detect_iptables_mode();
 
         // Build port mappings
         let ports: Vec<(u16, u16)> = self
@@ -289,18 +295,21 @@ impl K3sManager {
                  --disable=servicelb \
                  --disable-cloud-controller \
                  --disable-network-policy \
+                 --flannel-backend=host-gw \
                  --default-local-storage-path {} \
                  --service-node-port-range 80-32767 \
-                 --kubelet-arg=root-dir=/var/lib/docker/kubelet \
-                 --kubelet-arg=cgroup-driver=cgroupfs \
+                 --kubelet-arg=root-dir={} \
+                 --kubelet-arg=cgroup-driver={} \
                  --kube-apiserver-arg=profiling=false \
                  --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
                  --kube-controller-manager-arg=concurrent-deployment-syncs=1",
                 Self::RANCHER_DATA_PATH,
-                Self::LOCAL_PV_STORAGE_PATH,
+                pv_storage_path,
                 Self::RANCHER_DATA_PATH,
-                Self::LOCAL_PV_STORAGE_PATH,
-                Self::LOCAL_PV_STORAGE_PATH
+                pv_storage_path,
+                pv_storage_path,
+                kubelet_root,
+                cgroup_driver
             ),
         ];
 
@@ -319,10 +328,10 @@ impl K3sManager {
                     "/var/run/docker.sock".to_string(),
                     String::new(),
                 ),
-                // Mount real /var/lib/docker
+                // Mount Docker data directory
                 (
-                    "/var/lib/docker".to_string(),
-                    "/var/lib/docker".to_string(),
+                    docker_root.clone(),
+                    docker_root.clone(),
                     "bind-propagation=rshared".to_string(),
                 ),
                 // Docker volume for rancher data
@@ -334,16 +343,19 @@ impl K3sManager {
                 // Docker volume for local PV storage
                 (
                     Self::LOCAL_PV_VOLUME_NAME.to_string(),
-                    Self::LOCAL_PV_STORAGE_PATH.to_string(),
+                    pv_storage_path.clone(),
                     "volume".to_string(),
                 ),
             ],
-            env: vec![],
+            env: vec![
+                ("IPTABLES_MODE".to_string(), iptables_mode.to_string()),
+            ],
             network: Some(self.config.network_name.clone()),
             cgroupns_host: true,
             pid_host: true,
             entrypoint: Some(String::new()),
             command: Some(k3s_command),
+            security_opt: vec!["apparmor=unconfined".to_string()],
         };
 
         // Ensure prerequisites exist (volumes, network)
@@ -365,11 +377,23 @@ impl K3sManager {
         // Wait for API (should be fast since cluster is pre-initialized)
         self.wait_for_api(output_tx).await?;
 
-        // Setup kubeconfig on host (even though snapshot has it in container, we need it on host)
+        // Setup kubeconfig and install agent in parallel
         let _ = output_tx
             .send(OutputLine::info("Setting up kubeconfig..."))
             .await;
-        self.setup_kubeconfig().await?;
+        let (kubeconfig_result, agent_result) = tokio::join!(
+            self.setup_kubeconfig(),
+            self.install_agent(),
+        );
+        kubeconfig_result?;
+        if let Err(e) = &agent_result {
+            let _ = output_tx
+                .send(OutputLine::warning(format!(
+                    "Agent install failed (stats will use fallback): {:#}",
+                    e
+                )))
+                .await;
+        }
 
         if !is_deep {
             // Legacy snapshot: wait for cluster to be fully ready (deployments, etc.)

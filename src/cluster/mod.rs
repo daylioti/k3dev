@@ -12,7 +12,9 @@ pub use config::ClusterConfig;
 #[allow(unused_imports)]
 pub use docker::ContainerRunConfig;
 pub use docker::{ContainerPullProgress, ContainerStats, DockerManager, PullPhase, ResourceStats};
-pub use ingress::{IngressEntry, IngressHealthChecker, IngressHealthStatus, IngressManager};
+pub use ingress::{
+    HostsUpdateResult, IngressEntry, IngressHealthChecker, IngressHealthStatus, IngressManager,
+};
 pub use k3s::{ClusterStatus, K3sManager};
 pub use platform::PlatformInfo;
 pub use port_forward::PortForwardDetector;
@@ -253,7 +255,10 @@ impl ClusterManager {
 
     /// Update /etc/hosts with current ingress entries
     #[allow(dead_code)]
-    pub async fn update_hosts(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
+    pub async fn update_hosts(
+        &mut self,
+        output_tx: mpsc::Sender<OutputLine>,
+    ) -> Result<HostsUpdateResult> {
         self.ingress.update_hosts(Some(output_tx)).await
     }
 }

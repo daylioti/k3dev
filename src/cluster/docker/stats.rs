@@ -265,7 +265,29 @@ impl DockerManager {
     }
 }
 
+/// Detected cgroup version for the system
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CgroupVersion {
+    V1,
+    V2,
+}
+
+/// Detect whether the system uses cgroup v1 or v2
+fn detect_cgroup_version() -> CgroupVersion {
+    use std::path::Path;
+    // cgroup v2 unified hierarchy has cgroup.controllers at the root
+    if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+        CgroupVersion::V2
+    } else {
+        CgroupVersion::V1
+    }
+}
+
+/// Cached cgroup version detection (called frequently during stats reads)
+static CGROUP_VERSION: Lazy<CgroupVersion> = Lazy::new(detect_cgroup_version);
+
 /// Read stats from cgroup files (very fast)
+/// Supports both cgroup v1 and v2
 /// Returns (cpu_percent, cpu_limit_millicores, memory_used_mb, memory_limit_mb)
 fn read_cgroup_stats(
     cgroup_path: &std::path::Path,
@@ -273,9 +295,22 @@ fn read_cgroup_stats(
     now_usec: u64,
     num_cpus: f64,
 ) -> (f64, f64, f64, f64) {
+    match *CGROUP_VERSION {
+        CgroupVersion::V2 => read_cgroup_v2_stats(cgroup_path, container_id, now_usec, num_cpus),
+        CgroupVersion::V1 => read_cgroup_v1_stats(cgroup_path, container_id, now_usec, num_cpus),
+    }
+}
+
+/// Read stats from cgroup v2 files
+fn read_cgroup_v2_stats(
+    cgroup_path: &std::path::Path,
+    container_id: &str,
+    now_usec: u64,
+    num_cpus: f64,
+) -> (f64, f64, f64, f64) {
     use std::fs;
 
-    // Read CPU usage from cpu.stat
+    // Read CPU usage from cpu.stat (usage_usec field)
     let cpu_stat_path = cgroup_path.join("cpu.stat");
     let usage_usec = fs::read_to_string(&cpu_stat_path)
         .ok()
@@ -303,89 +338,35 @@ fn read_cgroup_stats(
                     None // No limit
                 } else {
                     let quota_val = quota.parse::<f64>().ok()?;
-                    // millicores = (quota / period) * 1000
                     Some((quota_val / period) * MILLICORES_PER_CORE)
                 }
             } else {
                 None
             }
         })
-        .unwrap_or(0.0); // 0 means no limit
+        .unwrap_or(0.0);
 
-    // Calculate CPU percentage using global cached delta
-    let cpu_percent = {
-        let prev = CPU_CACHE
-            .read()
-            .ok()
-            .and_then(|cache| cache.get(container_id).cloned());
-
-        let (percent, prev_percent) = if let Some(prev) = prev {
-            let usage_delta = usage_usec.saturating_sub(prev.usage_usec) as f64;
-            let time_delta = now_usec.saturating_sub(prev.timestamp_usec) as f64;
-
-            let raw_percent = if time_delta >= MIN_CPU_SAMPLE_DELTA_USEC {
-                // usage_usec is per-CPU, time_delta is wall clock
-                // CPU% = (usage_delta / time_delta) * 100
-                let calc = (usage_delta / time_delta) * 100.0;
-                calc.min(MAX_CPU_PERCENT)
-            } else {
-                // Time delta too small for reliable measurement, use previous value
-                prev.prev_cpu_percent
-            };
-
-            // Spike detection: reject suspiciously large jumps
-            let final_percent = if prev.prev_cpu_percent > 0.0
-                && raw_percent > prev.prev_cpu_percent + CPU_SPIKE_THRESHOLD_PERCENT
-                && raw_percent > CPU_SPIKE_MIN_VALUE_PERCENT
-            {
-                // Likely a measurement artifact, keep previous value
-                prev.prev_cpu_percent
-            } else {
-                raw_percent
-            };
-
-            (final_percent, prev.prev_cpu_percent)
-        } else {
-            (0.0, 0.0)
-        };
-
-        // Update global cache with both usage and calculated percent
-        if let Ok(mut cache) = CPU_CACHE.write() {
-            cache.insert(
-                container_id.to_string(),
-                CachedCpuStats {
-                    usage_usec,
-                    timestamp_usec: now_usec,
-                    prev_cpu_percent: if percent > 0.0 { percent } else { prev_percent },
-                },
-            );
-        }
-
-        percent.min(100.0 * num_cpus) // Cap at max possible
-    };
+    let cpu_percent = calculate_cpu_percent(container_id, usage_usec, now_usec, num_cpus);
 
     // Read memory stats
-    let mem_current = cgroup_path.join("memory.current");
-    let mem_max = cgroup_path.join("memory.max");
-
-    let memory_used_mb = fs::read_to_string(&mem_current)
+    let memory_used_mb = fs::read_to_string(cgroup_path.join("memory.current"))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|b| b as f64 / (1024.0 * 1024.0))
         .unwrap_or(0.0);
 
-    let memory_limit_mb = fs::read_to_string(&mem_max)
+    let memory_limit_mb = fs::read_to_string(cgroup_path.join("memory.max"))
         .ok()
         .and_then(|s| {
             let trimmed = s.trim();
             if trimmed == "max" {
-                None // No limit set
+                None
             } else {
                 trimmed.parse::<u64>().ok()
             }
         })
         .map(|b| b as f64 / (1024.0 * 1024.0))
-        .unwrap_or(0.0); // 0 means no limit (will be detected as unlimited)
+        .unwrap_or(0.0);
 
     (
         cpu_percent,
@@ -395,44 +376,463 @@ fn read_cgroup_stats(
     )
 }
 
-/// Find cgroup path for a container ID under /sys/fs/cgroup/kubepods
-/// Searches recursively through kubepods hierarchy (including QoS classes)
+/// Read stats from cgroup v1 files
+/// v1 splits controllers: cpu/cpuacct and memory are in separate hierarchies
+/// The `cgroup_path` here is the cpu controller path; memory path is derived
+fn read_cgroup_v1_stats(
+    cgroup_path: &std::path::Path,
+    container_id: &str,
+    now_usec: u64,
+    num_cpus: f64,
+) -> (f64, f64, f64, f64) {
+    use std::fs;
+
+    // CPU usage: cpuacct.usage is in nanoseconds (convert to microseconds)
+    let usage_usec = fs::read_to_string(cgroup_path.join("cpuacct.usage"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|ns| ns / 1000) // nanoseconds → microseconds
+        .unwrap_or(0);
+
+    // CPU limit: cpu.cfs_quota_us / cpu.cfs_period_us
+    // quota of -1 means no limit
+    let cpu_quota = fs::read_to_string(cgroup_path.join("cpu.cfs_quota_us"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(-1);
+    let cpu_period = fs::read_to_string(cgroup_path.join("cpu.cfs_period_us"))
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(100_000.0);
+
+    let cpu_limit_millicores = if cpu_quota > 0 && cpu_period > 0.0 {
+        (cpu_quota as f64 / cpu_period) * MILLICORES_PER_CORE
+    } else {
+        0.0
+    };
+
+    let cpu_percent = calculate_cpu_percent(container_id, usage_usec, now_usec, num_cpus);
+
+    // Memory: derive memory cgroup path from cpu path
+    // /sys/fs/cgroup/cpu,cpuacct/kubepods/... → /sys/fs/cgroup/memory/kubepods/...
+    let memory_path = derive_v1_memory_path(cgroup_path);
+
+    let memory_used_mb = memory_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p.join("memory.usage_in_bytes")).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|b| b as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0);
+
+    let memory_limit_mb = memory_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p.join("memory.limit_in_bytes")).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .and_then(|b| {
+            // v1 uses a very large number instead of "max" for no-limit
+            // Typically PAGE_COUNTER_MAX * PAGE_SIZE, ~= 2^63 on 64-bit
+            if b > (1u64 << 60) {
+                None // Effectively unlimited
+            } else {
+                Some(b as f64 / (1024.0 * 1024.0))
+            }
+        })
+        .unwrap_or(0.0);
+
+    (
+        cpu_percent,
+        cpu_limit_millicores,
+        memory_used_mb,
+        memory_limit_mb,
+    )
+}
+
+/// Derive the memory cgroup path from a cpu cgroup path for cgroup v1
+/// e.g., /sys/fs/cgroup/cpu,cpuacct/kubepods/.../container_id
+///     → /sys/fs/cgroup/memory/kubepods/.../container_id
+fn derive_v1_memory_path(cpu_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let path_str = cpu_path.to_str()?;
+    // Find the controller part and replace it with "memory"
+    // Handles both /sys/fs/cgroup/cpu/... and /sys/fs/cgroup/cpu,cpuacct/...
+    let memory_path = if path_str.contains("/cpu,cpuacct/") {
+        path_str.replacen("/cpu,cpuacct/", "/memory/", 1)
+    } else if path_str.contains("/cpu/") {
+        path_str.replacen("/cpu/", "/memory/", 1)
+    } else {
+        return None;
+    };
+    let p = std::path::PathBuf::from(memory_path);
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Calculate CPU percentage using global cached delta (shared between v1 and v2)
+fn calculate_cpu_percent(
+    container_id: &str,
+    usage_usec: u64,
+    now_usec: u64,
+    num_cpus: f64,
+) -> f64 {
+    let prev = CPU_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.get(container_id).cloned());
+
+    let (percent, prev_percent) = if let Some(prev) = prev {
+        let usage_delta = usage_usec.saturating_sub(prev.usage_usec) as f64;
+        let time_delta = now_usec.saturating_sub(prev.timestamp_usec) as f64;
+
+        let raw_percent = if time_delta >= MIN_CPU_SAMPLE_DELTA_USEC {
+            let calc = (usage_delta / time_delta) * 100.0;
+            calc.min(MAX_CPU_PERCENT)
+        } else {
+            prev.prev_cpu_percent
+        };
+
+        // Spike detection: reject suspiciously large jumps
+        let final_percent = if prev.prev_cpu_percent > 0.0
+            && raw_percent > prev.prev_cpu_percent + CPU_SPIKE_THRESHOLD_PERCENT
+            && raw_percent > CPU_SPIKE_MIN_VALUE_PERCENT
+        {
+            prev.prev_cpu_percent
+        } else {
+            raw_percent
+        };
+
+        (final_percent, prev.prev_cpu_percent)
+    } else {
+        (0.0, 0.0)
+    };
+
+    // Update global cache
+    if let Ok(mut cache) = CPU_CACHE.write() {
+        cache.insert(
+            container_id.to_string(),
+            CachedCpuStats {
+                usage_usec,
+                timestamp_usec: now_usec,
+                prev_cpu_percent: if percent > 0.0 { percent } else { prev_percent },
+            },
+        );
+    }
+
+    percent.min(100.0 * num_cpus)
+}
+
+/// Find cgroup path for a container ID
+/// Supports both cgroup v2 (unified /sys/fs/cgroup/kubepods) and
+/// cgroup v1 (split controllers like /sys/fs/cgroup/cpu,cpuacct/kubepods)
 fn find_container_cgroup(container_id: &str) -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
 
-    let kubepods_base = PathBuf::from("/sys/fs/cgroup/kubepods");
-    if !kubepods_base.exists() {
-        return None;
-    }
-
-    // Search function to find container cgroup recursively
-    fn search_dir(dir: &std::path::Path, container_id: &str) -> Option<PathBuf> {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.is_dir() {
-                    let name = path.file_name()?.to_str()?;
-
-                    // Check if this directory name matches the container ID
-                    if name == container_id {
-                        return Some(path);
+    match *CGROUP_VERSION {
+        CgroupVersion::V2 => {
+            let kubepods_base = PathBuf::from("/sys/fs/cgroup/kubepods");
+            if !kubepods_base.exists() {
+                return None;
+            }
+            search_cgroup_dir(&kubepods_base, container_id)
+        }
+        CgroupVersion::V1 => {
+            // v1: try cpu,cpuacct first (common combined mount), then cpu alone
+            for controller in &["cpu,cpuacct", "cpu"] {
+                let base = PathBuf::from(format!("/sys/fs/cgroup/{}/kubepods", controller));
+                if base.exists() {
+                    if let Some(found) = search_cgroup_dir(&base, container_id) {
+                        return Some(found);
                     }
+                }
+            }
+            None
+        }
+    }
+}
 
-                    // Recurse into pod directories and QoS class directories
-                    if name.starts_with("pod")
-                        || name == "burstable"
-                        || name == "besteffort"
-                        || name == "guaranteed"
-                    {
-                        if let Some(found) = search_dir(&path, container_id) {
-                            return Some(found);
-                        }
+/// Recursively search for a container cgroup directory by container ID
+fn search_cgroup_dir(
+    dir: &std::path::Path,
+    container_id: &str,
+) -> Option<std::path::PathBuf> {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name()?.to_str()?;
+
+                if name == container_id {
+                    return Some(path);
+                }
+
+                // Recurse into pod directories and QoS class directories
+                if name.starts_with("pod")
+                    || name == "burstable"
+                    || name == "besteffort"
+                    || name == "guaranteed"
+                    // v1 with systemd driver uses docker-<id>.scope inside slices
+                    || name.starts_with("kubepods")
+                {
+                    if let Some(found) = search_cgroup_dir(&path, container_id) {
+                        return Some(found);
                     }
                 }
             }
         }
-        None
+    }
+    None
+}
+
+// === Agent-based stats collection ===
+// Runs k3dev-agent inside the k3s container via exec.
+// One exec call replaces N Docker API calls + N cgroup reads.
+
+/// Raw container stats from the agent JSON output
+struct AgentContainer {
+    id: String,
+    pod: String,
+    ns: String,
+    cpu_usec: u64,
+    cpu_quota: i64,
+    cpu_period: u64,
+    mem_current: u64,
+    mem_max: i64,
+}
+
+struct AgentOutput {
+    ts: u64,
+    containers: Vec<AgentContainer>,
+}
+
+impl DockerManager {
+    /// Get per-pod stats via the injected k3dev-agent binary.
+    /// Falls back to the direct cgroup method if agent is unavailable.
+    pub async fn get_pod_stats_via_agent(
+        &self,
+        k3s_container: &str,
+    ) -> Result<Vec<ContainerStats>> {
+        let json = self
+            .exec_in_container(k3s_container, &["/usr/local/bin/k3dev-agent"])
+            .await?;
+
+        let agent = parse_agent_output(&json)?;
+        let num_cpus = num_cpus::get() as f64;
+
+        let mut pod_stats: HashMap<String, ContainerStats> = HashMap::new();
+
+        for c in &agent.containers {
+            // Skip unknown containers (no Docker name mapping)
+            if c.pod == "_unknown" {
+                continue;
+            }
+
+            // CPU limit in millicores
+            let cpu_limit_millicores = if c.cpu_quota > 0 && c.cpu_period > 0 {
+                (c.cpu_quota as f64 / c.cpu_period as f64) * MILLICORES_PER_CORE
+            } else {
+                0.0
+            };
+
+            // Memory
+            let memory_used_mb = c.mem_current as f64 / (1024.0 * 1024.0);
+            let memory_limit_mb = if c.mem_max > 0 {
+                c.mem_max as f64 / (1024.0 * 1024.0)
+            } else {
+                0.0
+            };
+
+            // CPU delta using same global cache
+            let cpu_percent = {
+                let prev = CPU_CACHE
+                    .read()
+                    .ok()
+                    .and_then(|cache| cache.get(&c.id).cloned());
+
+                let (percent, prev_percent) = if let Some(prev) = prev {
+                    let usage_delta = c.cpu_usec.saturating_sub(prev.usage_usec) as f64;
+                    let time_delta = agent.ts.saturating_sub(prev.timestamp_usec) as f64;
+
+                    let raw_percent = if time_delta >= MIN_CPU_SAMPLE_DELTA_USEC {
+                        (usage_delta / time_delta) * 100.0
+                    } else {
+                        prev.prev_cpu_percent
+                    };
+
+                    // Spike detection
+                    let final_percent = if prev.prev_cpu_percent > 0.0
+                        && raw_percent > prev.prev_cpu_percent + CPU_SPIKE_THRESHOLD_PERCENT
+                        && raw_percent > CPU_SPIKE_MIN_VALUE_PERCENT
+                    {
+                        prev.prev_cpu_percent
+                    } else {
+                        raw_percent.min(MAX_CPU_PERCENT)
+                    };
+
+                    (final_percent, prev.prev_cpu_percent)
+                } else {
+                    (0.0, 0.0)
+                };
+
+                if let Ok(mut cache) = CPU_CACHE.write() {
+                    cache.insert(
+                        c.id.clone(),
+                        CachedCpuStats {
+                            usage_usec: c.cpu_usec,
+                            timestamp_usec: agent.ts,
+                            prev_cpu_percent: if percent > 0.0 { percent } else { prev_percent },
+                        },
+                    );
+                }
+
+                percent.min(100.0 * num_cpus)
+            };
+
+            // Aggregate per pod (same logic as existing method)
+            let key = format!("{}/{}", c.ns, c.pod);
+            pod_stats
+                .entry(key)
+                .and_modify(|stats| {
+                    stats.cpu_percent += cpu_percent;
+                    if stats.cpu_limit_millicores > 0.0 && cpu_limit_millicores > 0.0 {
+                        stats.cpu_limit_millicores += cpu_limit_millicores;
+                    } else {
+                        stats.cpu_limit_millicores = 0.0;
+                    }
+                    stats.memory_used_mb += memory_used_mb;
+                    if stats.memory_limit_mb > 0.0 && memory_limit_mb > 0.0 {
+                        stats.memory_limit_mb += memory_limit_mb;
+                    } else {
+                        stats.memory_limit_mb = 0.0;
+                    }
+                })
+                .or_insert(ContainerStats {
+                    name: c.pod.clone(),
+                    namespace: c.ns.clone(),
+                    cpu_percent,
+                    cpu_limit_millicores,
+                    memory_used_mb,
+                    memory_limit_mb,
+                    status: "running".to_string(),
+                });
+        }
+
+        let max_cpu_percent = num_cpus * 100.0;
+        let mut stats_list: Vec<ContainerStats> = pod_stats
+            .into_values()
+            .map(|mut s| {
+                s.cpu_percent = s.cpu_percent.min(max_cpu_percent);
+                s
+            })
+            .collect();
+        stats_list.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(stats_list)
     }
 
-    search_dir(&kubepods_base, container_id)
+    /// Get aggregated resource stats via the agent.
+    pub async fn get_container_stats_via_agent(
+        &self,
+        k3s_container: &str,
+    ) -> Result<ResourceStats> {
+        let pod_stats = self.get_pod_stats_via_agent(k3s_container).await?;
+
+        let mut stats = ResourceStats::default();
+        for pod in &pod_stats {
+            stats.cpu_percent += pod.cpu_percent;
+            stats.memory_used_mb += pod.memory_used_mb;
+        }
+        // Use first non-zero memory limit as total (same heuristic as original)
+        for pod in &pod_stats {
+            if pod.memory_limit_mb > 0.0 {
+                stats.memory_total_mb = pod.memory_limit_mb;
+                break;
+            }
+        }
+
+        Ok(stats)
+    }
+}
+
+/// Parse the JSON output from k3dev-agent.
+/// Minimal parser — no serde, handles the specific agent output format.
+fn parse_agent_output(json: &str) -> Result<AgentOutput> {
+    let json = json.trim();
+    if json.is_empty() || json.starts_with("{\"error\"") {
+        return Err(anyhow::anyhow!(
+            "Agent returned error: {}",
+            json.chars().take(200).collect::<String>()
+        ));
+    }
+
+    // Extract timestamp: {"ts":12345,...}
+    let ts = extract_u64_field(json, "\"ts\":")
+        .ok_or_else(|| anyhow::anyhow!("Missing ts field in agent output"))?;
+
+    // Find containers array
+    let arr_start = json
+        .find("\"containers\":[")
+        .ok_or_else(|| anyhow::anyhow!("Missing containers array"))?
+        + 14;
+
+    let mut containers = Vec::new();
+    let mut pos = arr_start;
+
+    // Parse each container object
+    while pos < json.len() {
+        let obj_start = match json[pos..].find('{') {
+            Some(p) => pos + p,
+            None => break,
+        };
+        let obj_end = match json[obj_start..].find('}') {
+            Some(p) => obj_start + p + 1,
+            None => break,
+        };
+        let obj = &json[obj_start..obj_end];
+
+        if let Some(c) = parse_agent_container(obj) {
+            containers.push(c);
+        }
+
+        pos = obj_end;
+    }
+
+    Ok(AgentOutput { ts, containers })
+}
+
+fn parse_agent_container(obj: &str) -> Option<AgentContainer> {
+    Some(AgentContainer {
+        id: extract_str_field(obj, "\"id\":\"")?,
+        pod: extract_str_field(obj, "\"pod\":\"")?,
+        ns: extract_str_field(obj, "\"ns\":\"")?,
+        cpu_usec: extract_u64_field(obj, "\"cpu\":")?,
+        cpu_quota: extract_i64_field(obj, "\"cq\":")?,
+        cpu_period: extract_u64_field(obj, "\"cp\":")?,
+        mem_current: extract_u64_field(obj, "\"mem\":")?,
+        mem_max: extract_i64_field(obj, "\"ml\":")?,
+    })
+}
+
+fn extract_str_field(s: &str, marker: &str) -> Option<String> {
+    let start = s.find(marker)? + marker.len();
+    let end = start + s[start..].find('"')?;
+    Some(s[start..end].to_string())
+}
+
+fn extract_u64_field(s: &str, marker: &str) -> Option<u64> {
+    let start = s.find(marker)? + marker.len();
+    let end = start
+        + s[start..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(s.len() - start);
+    s[start..end].parse().ok()
+}
+
+fn extract_i64_field(s: &str, marker: &str) -> Option<i64> {
+    let start = s.find(marker)? + marker.len();
+    let end = start
+        + s[start..]
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(s.len() - start);
+    s[start..end].parse().ok()
 }
