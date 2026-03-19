@@ -1,0 +1,15 @@
+[package]
+name = "k3dev-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight stats collector for k3s containers - runs inside container"
+
+# Zero external dependencies - std only for minimal binary size
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "s"  # Optimize for size

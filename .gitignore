@@ -5,6 +5,7 @@
 
 # Build artifacts
 target/
+assets/
 
 # Environment and secrets
 .env

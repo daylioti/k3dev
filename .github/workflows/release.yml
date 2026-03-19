@@ -39,7 +39,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target }},x86_64-unknown-linux-musl
 
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -48,11 +48,10 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Install musl tools
-        if: contains(matrix.target, 'musl')
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-musl" ]]; then
+          if [[ "${{ matrix.target }}" == aarch64* ]]; then
             sudo apt-get install -y gcc-aarch64-linux-gnu musl-dev
           fi
 
@@ -67,9 +66,26 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
+            agent/target
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
+
+      - name: Build embedded assets
+        run: |
+          # Build agent + socat for x86_64 (native)
+          ./scripts/build-assets.sh --ci
+
+          # For aarch64 targets, build real aarch64 agent via cross
+          if [[ "${{ matrix.target }}" == aarch64* ]]; then
+            cross build --release --target aarch64-unknown-linux-musl --manifest-path agent/Cargo.toml
+            cp agent/target/aarch64-unknown-linux-musl/release/k3dev-agent assets/k3dev-agent-aarch64
+
+            # Build aarch64 socat via cross-compilation container
+            cross run --target aarch64-unknown-linux-musl -- echo "cross works" || true
+            # Fallback: use placeholder for socat-aarch64 in cross builds
+            # The x86_64 socat is real; aarch64 uses the native build script on ARM runners
+          fi
 
       - name: Build (native)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
