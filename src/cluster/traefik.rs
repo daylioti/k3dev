@@ -10,6 +10,7 @@ use x509_parser::prelude::*;
 
 use super::config::ClusterConfig;
 use super::kube_ops::KubeOps;
+use super::platform::PlatformInfo;
 use crate::ui::components::OutputLine;
 
 /// Traefik ingress controller manager
@@ -79,7 +80,7 @@ impl TraefikManager {
         }
 
         // Check if mkcert is installed
-        if which::which("mkcert").is_err() {
+        if PlatformInfo::find_binary("mkcert").is_none() {
             let _ = output_tx
                 .send(OutputLine::warning(
                     "mkcert not installed, skipping certificate generation",
@@ -148,7 +149,7 @@ impl TraefikManager {
     /// Install mkcert CA in Firefox NSS database (Firefox uses its own trust store)
     async fn install_ca_in_firefox(&self, output_tx: &mpsc::Sender<OutputLine>) {
         // Check if certutil is available
-        if which::which("certutil").is_err() {
+        if PlatformInfo::find_binary("certutil").is_none() {
             return;
         }
 

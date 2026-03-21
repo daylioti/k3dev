@@ -41,8 +41,17 @@ impl PortForwardDetector {
         forwards
     }
 
-    /// Detect port forwards on the host using platform-appropriate method
+    /// Detect port forwards on the host using platform-appropriate method.
+    /// Returns empty when Docker is remote — local /proc and process scanning
+    /// cannot see port forwards on the remote host.
     async fn detect_host_port_forwards(&self) -> Vec<ActivePortForward> {
+        use crate::cluster::platform::PlatformInfo;
+
+        // Remote Docker: local process/socket scanning is irrelevant
+        if PlatformInfo::is_docker_remote() {
+            return Vec::new();
+        }
+
         #[cfg(target_os = "linux")]
         {
             self.detect_host_port_forwards_linux().await

@@ -149,7 +149,7 @@ impl ShellRunner {
             self.run_streaming("cmd", &["/C", script_path], output_tx, cancel_token)
                 .await
         } else {
-            self.run_streaming("bash", &all_args, output_tx, cancel_token)
+            self.run_streaming("sh", &all_args, output_tx, cancel_token)
                 .await
         }
     }

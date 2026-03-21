@@ -28,6 +28,7 @@ use bollard::models::{
 };
 use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use bollard::volume::{CreateVolumeOptions, RemoveVolumeOptions};
+use bollard::ClientVersion;
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
@@ -70,6 +71,47 @@ impl DockerManager {
         Ok(())
     }
 
+    /// Check if the Docker daemon's architecture matches the k3dev binary's compile-time target_arch.
+    /// Logs a warning if there's a mismatch (e.g., k3dev compiled for aarch64 but Docker reports x86_64
+    /// under Rosetta, or vice versa). Does not block startup.
+    pub async fn check_architecture_mismatch(&self) {
+        let docker_arch = match self.client.info().await {
+            Ok(info) => match info.architecture {
+                Some(arch) => arch,
+                None => return, // Can't detect, skip
+            },
+            Err(_) => return, // Can't query, skip
+        };
+
+        let binary_arch = if cfg!(target_arch = "x86_64") {
+            "x86_64"
+        } else if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            return; // Unknown arch, skip
+        };
+
+        // Normalize Docker's reported architecture for comparison
+        let docker_arch_normalized = match docker_arch.as_str() {
+            "x86_64" | "amd64" => "x86_64",
+            "aarch64" | "arm64" => "aarch64",
+            _ => docker_arch.as_str(),
+        };
+
+        if binary_arch != docker_arch_normalized {
+            tracing::warn!(
+                binary_arch = binary_arch,
+                docker_arch = docker_arch.as_str(),
+                "Architecture mismatch: k3dev binary is compiled for {} but Docker daemon reports {}. \
+                 Embedded binaries (socat, agent) may not work in the container. \
+                 Consider using a native {} build of k3dev.",
+                binary_arch,
+                docker_arch,
+                docker_arch_normalized,
+            );
+        }
+    }
+
     /// Get Docker's root directory (data-root)
     /// Returns the actual Docker data directory (e.g., "/var/lib/docker", "~/.local/share/docker/")
     /// Falls back to "/var/lib/docker" if detection fails
@@ -100,16 +142,36 @@ impl DockerManager {
         false
     }
 
-    /// Get Docker's cgroup driver ("cgroupfs" or "systemd")
-    /// Falls back to "cgroupfs" if detection fails
-    pub async fn get_cgroup_driver(&self) -> String {
-        match self.client.info().await {
+
+
+    /// Check that Docker's cgroup driver is cgroupfs (required for k3s-in-docker).
+    /// k3s runs inside a container without systemd, so kubelet cannot use the
+    /// systemd cgroup manager. Docker and kubelet must use the same driver.
+    pub async fn check_cgroup_driver(&self) -> Result<()> {
+        let driver = match self.client.info().await {
             Ok(info) => info
                 .cgroup_driver
                 .map(|d| d.to_string())
                 .unwrap_or_else(|| "cgroupfs".to_string()),
-            Err(_) => "cgroupfs".to_string(),
+            Err(_) => return Ok(()), // Can't detect, don't block
+        };
+
+        if driver == "systemd" {
+            anyhow::bail!(
+                "Docker is using the 'systemd' cgroup driver, which is incompatible with k3dev.\n\n\
+                 k3s runs inside a Docker container without systemd as init, so kubelet\n\
+                 cannot use the systemd cgroup manager. Both Docker and kubelet must use\n\
+                 the 'cgroupfs' driver.\n\n\
+                 To fix, create or edit /etc/docker/daemon.json:\n\n\
+                   {{\n\
+                     \"exec-opts\": [\"native.cgroupdriver=cgroupfs\"]\n\
+                   }}\n\n\
+                 Then restart Docker:\n\n\
+                   sudo systemctl restart docker\n\n\
+                 Note: This only affects cgroup accounting, not Docker functionality."
+            );
         }
+        Ok(())
     }
 
     /// Wait for Docker to become accessible
@@ -772,7 +834,21 @@ impl DockerManager {
             privileged: Some(config.privileged),
             network_mode: config.network.clone(),
             cgroupns_mode: if config.cgroupns_host {
-                Some(HostConfigCgroupnsModeEnum::HOST)
+                // HostConfigCgroupnsModeEnum was added in Docker API v1.41 (Docker 20.10+).
+                // Older Docker versions reject container creation when this option is set.
+                let api_v141 = ClientVersion {
+                    major_version: 1,
+                    minor_version: 41,
+                };
+                if self.client.client_version() >= api_v141 {
+                    Some(HostConfigCgroupnsModeEnum::HOST)
+                } else {
+                    tracing::warn!(
+                        "Docker API version {} < 1.41: skipping cgroupns_mode (not supported)",
+                        self.client.client_version()
+                    );
+                    None
+                }
             } else {
                 None
             },
@@ -825,7 +901,64 @@ impl DockerManager {
             self.client
                 .start_container(&config.name, None::<StartContainerOptions<String>>)
                 .await
-                .with_context(|| format!("Failed to start container {}", config.name))?;
+                .map_err(|e| {
+                    let err_msg = e.to_string().to_lowercase();
+                    let is_port_error = err_msg.contains("bind")
+                        || err_msg.contains("address already in use")
+                        || err_msg.contains("permission denied")
+                        || err_msg.contains("port is already allocated");
+
+                    if is_port_error {
+                        let privileged_ports: Vec<String> = config
+                            .ports
+                            .iter()
+                            .filter(|(host, _)| *host < 1024)
+                            .map(|(host, container)| format!("{}:{}", host, container))
+                            .collect();
+
+                        let mut context_msg = format!(
+                            "Failed to start container '{}': port binding error.\n\n\
+                             Error: {}\n\n",
+                            config.name, e
+                        );
+
+                        if !privileged_ports.is_empty() {
+                            context_msg.push_str(&format!(
+                                "Privileged ports configured: {}\n\n",
+                                privileged_ports.join(", ")
+                            ));
+                        }
+
+                        if cfg!(target_os = "macos") {
+                            context_msg.push_str(
+                                "On macOS, binding to ports below 1024 (like 80/443) requires \
+                                 Docker Desktop's privileged port mapping.\n\n\
+                                 To fix:\n\
+                                 - Open Docker Desktop → Settings → Advanced → \
+                                   Enable privileged port mapping\n\
+                                 - Or configure alternative ports in k3dev.yml:\n\
+                                   http_port: 8080\n\
+                                   https_port: 8443\n"
+                            );
+                        } else {
+                            context_msg.push_str(
+                                "Possible causes:\n\
+                                 - Another process is already using the port(s)\n\
+                                 - Insufficient permissions to bind to ports below 1024\n\n\
+                                 To fix, configure alternative ports in k3dev.yml:\n\
+                                   http_port: 8080\n\
+                                   https_port: 8443\n"
+                            );
+                        }
+
+                        anyhow!(context_msg)
+                    } else {
+                        anyhow!(e).context(format!(
+                            "Failed to start container {}",
+                            config.name
+                        ))
+                    }
+                })?;
         }
 
         Ok(())

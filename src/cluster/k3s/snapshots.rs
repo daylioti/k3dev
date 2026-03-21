@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use super::K3sManager;
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::docker::{ContainerRunConfig, DockerManager};
-use crate::cluster::platform::PlatformInfo;
+use crate::cluster::platform::{docker_host_tcp_url, PlatformInfo};
 use crate::config::HookEvent;
 use crate::hooks::HookExecutor;
 use crate::ui::components::OutputLine;
@@ -250,9 +250,9 @@ impl K3sManager {
                 .await;
         }
 
-        // Get docker socket path, cgroup driver, docker root, and iptables mode
+        // Get docker socket path, docker root, and iptables mode
         let socket_path = self.platform.docker_socket_path().await?;
-        let cgroup_driver = self.docker.get_cgroup_driver().await;
+        let cgroup_driver = "cgroupfs";
         let docker_root = self.docker.get_docker_root_dir().await;
         let pv_storage_path = Self::local_pv_storage_path(&docker_root);
         let kubelet_root = Self::kubelet_root_dir(&docker_root);
@@ -313,6 +313,47 @@ impl K3sManager {
             ),
         ];
 
+        // Build volumes and env - handle TCP Docker (no socket file to mount)
+        let tcp_url = docker_host_tcp_url();
+        let mut volumes = vec![
+            // Mount Docker data directory
+            (
+                docker_root.clone(),
+                docker_root.clone(),
+                "bind-propagation=rshared".to_string(),
+            ),
+            // Docker volume for rancher data
+            (
+                Self::RANCHER_VOLUME_NAME.to_string(),
+                Self::RANCHER_DATA_PATH.to_string(),
+                "volume".to_string(),
+            ),
+            // Docker volume for local PV storage
+            (
+                Self::LOCAL_PV_VOLUME_NAME.to_string(),
+                pv_storage_path.clone(),
+                "volume".to_string(),
+            ),
+        ];
+        let mut env = vec![("IPTABLES_MODE".to_string(), iptables_mode.to_string())];
+
+        if let Some(ref url) = tcp_url {
+            // TCP Docker (e.g., Colima/OrbStack with tcp://127.0.0.1:2375):
+            // No local socket file to mount — pass DOCKER_HOST to the container instead
+            tracing::info!(docker_host = %url, "TCP Docker detected, passing DOCKER_HOST to k3s container");
+            env.push(("DOCKER_HOST".to_string(), url.clone()));
+        } else {
+            // Unix socket Docker: mount the socket file
+            volumes.insert(
+                0,
+                (
+                    socket_path.to_string_lossy().to_string(),
+                    "/var/run/docker.sock".to_string(),
+                    String::new(),
+                ),
+            );
+        }
+
         // Run container from snapshot image
         let run_config = ContainerRunConfig {
             name: self.config.container_name.clone(),
@@ -321,33 +362,8 @@ impl K3sManager {
             detach: true,
             privileged: true,
             ports,
-            volumes: vec![
-                // Docker socket for k3s --docker mode
-                (
-                    socket_path.to_string_lossy().to_string(),
-                    "/var/run/docker.sock".to_string(),
-                    String::new(),
-                ),
-                // Mount Docker data directory
-                (
-                    docker_root.clone(),
-                    docker_root.clone(),
-                    "bind-propagation=rshared".to_string(),
-                ),
-                // Docker volume for rancher data
-                (
-                    Self::RANCHER_VOLUME_NAME.to_string(),
-                    Self::RANCHER_DATA_PATH.to_string(),
-                    "volume".to_string(),
-                ),
-                // Docker volume for local PV storage
-                (
-                    Self::LOCAL_PV_VOLUME_NAME.to_string(),
-                    pv_storage_path.clone(),
-                    "volume".to_string(),
-                ),
-            ],
-            env: vec![("IPTABLES_MODE".to_string(), iptables_mode.to_string())],
+            volumes,
+            env,
             network: Some(self.config.network_name.clone()),
             cgroupns_host: true,
             pid_host: true,

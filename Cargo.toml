@@ -28,6 +28,12 @@ pkg-url = "{ repo }/releases/download/v{ version }/k3dev-linux-aarch64"
 [package.metadata.binstall.overrides.aarch64-unknown-linux-musl]
 pkg-url = "{ repo }/releases/download/v{ version }/k3dev-linux-aarch64-musl"
 
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/k3dev-macos-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/k3dev-macos-aarch64"
+
 [dependencies]
 # TUI
 ratatui = "0.29"

@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use bollard::Docker;
+use once_cell::sync::Lazy;
 use std::path::PathBuf;
 
 /// Detected CPU architecture
@@ -7,6 +8,137 @@ use std::path::PathBuf;
 pub enum Architecture {
     Amd64,
     Arm64,
+}
+
+/// Whether Docker is local (unix socket) or remote (TCP/SSH)
+#[derive(Debug, Clone, PartialEq)]
+pub enum DockerLocation {
+    /// Docker daemon is on the local machine (unix socket or default)
+    Local,
+    /// Docker daemon is on a remote machine at the given hostname/IP
+    Remote(String),
+}
+
+/// Cached Docker location detection (checked once at startup)
+static DOCKER_LOCATION: Lazy<DockerLocation> = Lazy::new(detect_docker_location);
+
+/// Check if a hostname is a loopback address (localhost, 127.x.x.x, ::1)
+fn is_loopback(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    if host == "::1" || host == "[::1]" {
+        return true;
+    }
+    // Check 127.0.0.0/8 range
+    if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+        return addr.is_loopback();
+    }
+    false
+}
+
+/// Parse hostname from a remote Docker URL (tcp://, ssh://, http://, https://).
+/// Returns None for loopback addresses (localhost, 127.x.x.x, ::1) since those
+/// are local-via-TCP (e.g., Colima, OrbStack) rather than truly remote.
+fn parse_remote_host(url: &str) -> Option<String> {
+    for prefix in &["tcp://", "ssh://", "http://", "https://"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            // Strip user@ for ssh://user@host
+            let after_user = rest.split('@').next_back().unwrap_or(rest);
+            // Strip :port and /path
+            let host = after_user.split(':').next().unwrap_or(after_user);
+            let host = host.split('/').next().unwrap_or(host);
+            if !host.is_empty() {
+                // Loopback addresses are local-via-TCP, not truly remote
+                if is_loopback(host) {
+                    return None;
+                }
+                return Some(host.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Check if DOCKER_HOST (or Docker context endpoint) is a TCP/HTTP URL.
+/// Returns the full URL if so, None if it's a unix socket or unset.
+pub fn docker_host_tcp_url() -> Option<String> {
+    // Check DOCKER_HOST env var
+    if let Ok(host) = std::env::var("DOCKER_HOST") {
+        for prefix in &["tcp://", "http://", "https://"] {
+            if host.starts_with(prefix) {
+                return Some(host);
+            }
+        }
+        return None;
+    }
+
+    // Check Docker context endpoint
+    if let Some(endpoint) = docker_endpoint_from_context() {
+        for prefix in &["tcp://", "http://", "https://"] {
+            if endpoint.starts_with(prefix) {
+                return Some(endpoint);
+            }
+        }
+    }
+
+    None
+}
+
+/// Detect whether Docker is local or remote based on DOCKER_HOST and Docker context
+fn detect_docker_location() -> DockerLocation {
+    // 1. Check DOCKER_HOST env var
+    if let Ok(host) = std::env::var("DOCKER_HOST") {
+        if let Some(remote_host) = parse_remote_host(&host) {
+            return DockerLocation::Remote(remote_host);
+        }
+        // unix:// or bare path = local
+        return DockerLocation::Local;
+    }
+
+    // 2. Check Docker context for non-unix endpoints
+    if let Some(endpoint) = docker_endpoint_from_context() {
+        if let Some(remote_host) = parse_remote_host(&endpoint) {
+            return DockerLocation::Remote(remote_host);
+        }
+    }
+
+    DockerLocation::Local
+}
+
+/// Read Docker endpoint URL from Docker context configuration.
+/// Returns the raw Host string (e.g., "unix:///var/run/docker.sock" or "tcp://remote:2375")
+fn docker_endpoint_from_context() -> Option<String> {
+    let docker_dir = dirs::home_dir()?.join(".docker");
+    let config_path = docker_dir.join("config.json");
+    let config_content = std::fs::read_to_string(config_path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&config_content).ok()?;
+    let context_name = config.get("currentContext")?.as_str()?;
+
+    if context_name == "default" || context_name.is_empty() {
+        return None;
+    }
+
+    let contexts_dir = docker_dir.join("contexts").join("meta");
+    let entries = std::fs::read_dir(contexts_dir).ok()?;
+    for entry in entries.flatten() {
+        let meta_path = entry.path().join("meta.json");
+        if let Ok(meta_content) = std::fs::read_to_string(&meta_path) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_content) {
+                let name = meta.get("Name").and_then(|n| n.as_str()).unwrap_or("");
+                if name == context_name {
+                    return meta
+                        .get("Endpoints")
+                        .and_then(|e| e.get("docker"))
+                        .and_then(|d| d.get("Host"))
+                        .and_then(|h| h.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Platform detection and runtime management
@@ -58,11 +190,50 @@ impl PlatformInfo {
         !std::path::Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
     }
 
-    /// Get the Docker socket path
+    /// Detect whether Docker is local or remote.
+    /// Result is cached — safe to call frequently.
+    pub fn docker_location() -> &'static DockerLocation {
+        &DOCKER_LOCATION
+    }
+
+    /// Returns true if Docker is running on a remote host (TCP/SSH)
+    pub fn is_docker_remote() -> bool {
+        matches!(*Self::docker_location(), DockerLocation::Remote(_))
+    }
+
+    /// Get the remote Docker host address, if Docker is remote
+    pub fn docker_remote_host() -> Option<&'static str> {
+        match Self::docker_location() {
+            DockerLocation::Remote(host) => Some(host.as_str()),
+            DockerLocation::Local => None,
+        }
+    }
+
+    /// Get the Docker socket path for mounting into the k3s container.
     ///
-    /// Checks `DOCKER_HOST` env var first (stripping `unix://` prefix if present),
-    /// then tries common socket locations in order.
+    /// For local Docker: finds the actual socket file on the filesystem.
+    /// For remote Docker: returns `/var/run/docker.sock` (the path on the remote host
+    /// where Docker's socket exists — Docker resolves bind mounts on its own host).
+    /// For TCP Docker (local-via-TCP): returns `/var/run/docker.sock` as a fallback
+    /// path — callers should check `docker_host_tcp_url()` to decide whether to
+    /// mount the socket or pass DOCKER_HOST as an env var instead.
     pub async fn docker_socket_path(&self) -> Result<PathBuf> {
+        // Remote Docker: the k3s container needs the socket from the remote host.
+        // Volume mounts are resolved on the Docker host, so /var/run/docker.sock
+        // refers to the remote host's socket, which is correct.
+        if Self::is_docker_remote() {
+            return Ok(PathBuf::from("/var/run/docker.sock"));
+        }
+
+        // TCP Docker (local-via-TCP, e.g., Colima/OrbStack with tcp://127.0.0.1:2375):
+        // There's no local socket file to mount. Return the default path; the caller
+        // (create_cluster/start_from_snapshot) will skip the socket mount and pass
+        // DOCKER_HOST as an env var instead.
+        if docker_host_tcp_url().is_some() {
+            return Ok(PathBuf::from("/var/run/docker.sock"));
+        }
+
+        // Local Docker: find the actual socket file
         // 1. Check DOCKER_HOST env var
         if let Ok(host) = std::env::var("DOCKER_HOST") {
             let path = host.strip_prefix("unix://").unwrap_or(&host);
@@ -88,7 +259,7 @@ impl PlatformInfo {
             }
         }
 
-        // 3. Provide helpful error with permission diagnostics
+        // 4. Provide helpful error with permission diagnostics
         let mut error_msg =
             "Docker socket not found. Set DOCKER_HOST or ensure Docker is running.".to_string();
 
@@ -224,8 +395,12 @@ impl PlatformInfo {
 
     /// Detect the host's iptables backend mode ("nft" or "legacy").
     /// K3s should use the same mode to avoid invisible rules.
-    /// Returns "nft" if iptables is backed by nftables, "legacy" otherwise.
+    /// For remote Docker, returns "legacy" (safe default — local iptables is irrelevant).
     pub fn detect_iptables_mode() -> &'static str {
+        // Remote Docker: local iptables mode is irrelevant to the remote host
+        if Self::is_docker_remote() {
+            return "legacy";
+        }
         #[cfg(target_os = "linux")]
         {
             // Check what /usr/sbin/iptables or /sbin/iptables resolves to
@@ -285,25 +460,59 @@ impl PlatformInfo {
         false
     }
 
+    /// Find a binary by name, checking PATH first, then Homebrew fallback on macOS.
+    /// On ARM64 macOS, Homebrew installs to `/opt/homebrew/bin` which may not be
+    /// in PATH for non-interactive shells.
+    pub fn find_binary(name: &str) -> Option<PathBuf> {
+        if let Ok(path) = which::which(name) {
+            return Some(path);
+        }
+
+        // On macOS, check Homebrew paths as fallback
+        #[cfg(target_os = "macos")]
+        {
+            let homebrew_paths = ["/opt/homebrew/bin", "/usr/local/bin"];
+            for dir in &homebrew_paths {
+                let candidate = std::path::Path::new(dir).join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Check if kubectl is installed
     pub fn is_kubectl_installed(&self) -> bool {
-        which::which("kubectl").is_ok()
+        Self::find_binary("kubectl").is_some()
     }
 
     /// Check if helm is installed
     pub fn is_helm_installed(&self) -> bool {
-        which::which("helm").is_ok()
+        Self::find_binary("helm").is_some()
     }
 
     /// Check if mkcert is installed
     #[allow(dead_code)]
     pub fn is_mkcert_installed(&self) -> bool {
-        which::which("mkcert").is_ok()
+        Self::find_binary("mkcert").is_some()
     }
 
-    /// Find Docker socket path synchronously (for use in spawned tasks)
-    /// Checks DOCKER_HOST, then common socket locations
+    /// Find Docker socket path synchronously (for use in spawned tasks).
+    /// For remote Docker, returns `/var/run/docker.sock` (the remote host's socket path).
+    /// For TCP Docker (local-via-TCP), returns `/var/run/docker.sock` as fallback.
     pub fn find_docker_socket_sync() -> PathBuf {
+        // Remote Docker: return the standard remote socket path
+        if Self::is_docker_remote() {
+            return PathBuf::from("/var/run/docker.sock");
+        }
+
+        // TCP Docker (local-via-TCP): no local socket file exists
+        if docker_host_tcp_url().is_some() {
+            return PathBuf::from("/var/run/docker.sock");
+        }
+
         // Check DOCKER_HOST first
         if let Ok(host) = std::env::var("DOCKER_HOST") {
             let path = host.strip_prefix("unix://").unwrap_or(&host);

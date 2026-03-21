@@ -14,6 +14,7 @@ use tokio::time::sleep;
 
 use super::K3sManager;
 use crate::cluster::kube_ops::KubeOps;
+use crate::cluster::platform::PlatformInfo;
 use crate::ui::components::OutputLine;
 
 impl K3sManager {
@@ -37,8 +38,17 @@ impl K3sManager {
         let max_attempts = 40; // More attempts with faster initial intervals
         let mut last_progress_report = std::time::Instant::now();
 
+        // Use remote host address when Docker is remote, otherwise localhost
+        let api_host = PlatformInfo::docker_remote_host()
+            .unwrap_or("127.0.0.1")
+            .to_string();
+
         for attempt in 0..max_attempts {
-            match client.get("https://127.0.0.1:6443/healthz").send().await {
+            match client
+                .get(format!("https://{}:6443/healthz", api_host))
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     // 200 OK or 401 Unauthorized both mean API is up
                     // 401 means auth is required but server is responding
@@ -191,8 +201,12 @@ impl K3sManager {
 
             if let Ok(content) = result {
                 if !content.is_empty() && content.contains("clusters:") {
-                    // Replace 127.0.0.1 with localhost for better compatibility
-                    let fixed_content = content.replace("127.0.0.1", "localhost");
+                    // Replace 127.0.0.1 with the appropriate host:
+                    // - Remote Docker: use the remote host's address
+                    // - Local Docker: use "localhost" for better compatibility
+                    let api_host = PlatformInfo::docker_remote_host()
+                        .unwrap_or("localhost");
+                    let fixed_content = content.replace("127.0.0.1", api_host);
 
                     fs::write(&temp_config, &fixed_content).await?;
                     fs::copy(&temp_config, &kubeconfig_path).await?;

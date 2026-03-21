@@ -26,7 +26,7 @@ error() { echo -e "${RED}Error:${NC} $1" >&2; exit 1; }
 detect_os() {
     case "$(uname -s)" in
         Linux*) echo "linux" ;;
-        Darwin*) error "macOS is not supported" ;;
+        Darwin*) echo "macos" ;;
         *) error "Unsupported OS: $(uname -s)" ;;
     esac
 }
@@ -40,7 +40,7 @@ detect_arch() {
     esac
 }
 
-# Check if musl libc
+# Check if musl libc (Linux only)
 is_musl() {
     if command -v ldd >/dev/null 2>&1; then
         ldd --version 2>&1 | grep -qi musl && return 0
@@ -67,12 +67,11 @@ install() {
     os=$(detect_os)
     arch=$(detect_arch)
 
-    # Determine variant (musl or gnu)
-    if is_musl; then
+    # Determine variant (musl or gnu, Linux only)
+    variant=""
+    if [[ "$os" == "linux" ]] && is_musl; then
         variant="-musl"
         info "Detected musl libc"
-    else
-        variant=""
     fi
 
     artifact="${BINARY_NAME}-${os}-${arch}${variant}"
@@ -96,16 +95,24 @@ install() {
     if curl -fsSL "$checksum_url" -o "${tmp_dir}/checksum.sha256" 2>/dev/null; then
         info "Verifying checksum..."
         cd "$tmp_dir"
-        if ! sha256sum -c checksum.sha256 >/dev/null 2>&1; then
-            # The checksum file format might be different, try manual verification
-            expected=$(cat checksum.sha256 | awk '{print $1}')
-            actual=$(sha256sum "${BINARY_NAME}" | awk '{print $1}')
+        # Use shasum on macOS, sha256sum on Linux
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha_cmd="sha256sum"
+        elif command -v shasum >/dev/null 2>&1; then
+            sha_cmd="shasum -a 256"
+        else
+            warn "No checksum tool found, skipping verification"
+            sha_cmd=""
+        fi
+        if [ -n "$sha_cmd" ]; then
+            expected=$(awk '{print $1}' checksum.sha256)
+            actual=$($sha_cmd "${BINARY_NAME}" | awk '{print $1}')
             if [ "$expected" != "$actual" ]; then
                 error "Checksum verification failed"
             fi
+            success "Checksum verified"
         fi
         cd - >/dev/null
-        success "Checksum verified"
     fi
 
     # Create install directory
@@ -146,19 +153,18 @@ main() {
     install
 
     # Post-install checks
+    local os
+    os=$(detect_os)
     echo ""
     if ! command -v docker >/dev/null 2>&1; then
         warn "Docker is not installed. k3dev requires Docker to run."
+        if [[ "$os" == "macos" ]]; then
+            echo "  Install Docker Desktop: https://www.docker.com/products/docker-desktop/"
+        fi
     elif ! docker info >/dev/null 2>&1; then
         warn "Docker is not running or not accessible."
-    else
-        cgroup_driver=$(docker info 2>/dev/null | grep -i "Cgroup Driver:" | awk '{print $3}')
-        if [ "$cgroup_driver" != "cgroupfs" ]; then
-            warn "Docker cgroup driver is '$cgroup_driver', but 'cgroupfs' is required."
-            echo ""
-            echo "  Configure Docker with:"
-            echo "    sudo tee /etc/docker/daemon.json <<< '{\"exec-opts\": [\"native.cgroupdriver=cgroupfs\"]}'"
-            echo "    sudo systemctl restart docker"
+        if [[ "$os" == "macos" ]]; then
+            echo "  Start Docker Desktop from Applications."
         fi
     fi
 }

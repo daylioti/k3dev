@@ -5,12 +5,13 @@
 #   ./scripts/build-assets.sh              # Build for current arch only
 #   ./scripts/build-assets.sh --all        # Build for both x86_64 and aarch64
 #   ./scripts/build-assets.sh --ci         # CI mode: real x86_64, placeholders for aarch64
+#   ./scripts/build-assets.sh --macos      # macOS mode: placeholders for all (agent/socat run inside Linux containers)
 #
 # Prerequisites:
-#   - Rust toolchain with musl target
-#   - musl-tools (apt: musl-tools)
+#   - Rust toolchain with musl target (Linux only)
+#   - musl-tools (apt: musl-tools) (Linux only)
 #   - For --all: cross (cargo install cross) or aarch64 cross-compiler
-#   - For socat: gcc, musl-gcc, autoconf (build deps)
+#   - For socat: gcc, musl-gcc, autoconf (build deps) (Linux only)
 
 set -euo pipefail
 
@@ -94,12 +95,30 @@ create_placeholders() {
     fi
 }
 
+create_all_placeholders() {
+    # Create placeholders for all architectures.
+    # Used on macOS where we can't build Linux musl binaries natively.
+    # The agent and socat run inside the k3s Linux container, so they need
+    # to be Linux binaries — on macOS they'll be fetched or built via cross.
+    [[ -f "$ASSETS_DIR/k3dev-agent-x86_64" ]] || echo -n "placeholder" > "$ASSETS_DIR/k3dev-agent-x86_64"
+    [[ -f "$ASSETS_DIR/socat-x86_64" ]] || echo -n "placeholder" > "$ASSETS_DIR/socat-x86_64"
+    [[ -f "$ASSETS_DIR/k3dev-agent-aarch64" ]] || echo -n "placeholder" > "$ASSETS_DIR/k3dev-agent-aarch64"
+    [[ -f "$ASSETS_DIR/socat-aarch64" ]] || echo -n "placeholder" > "$ASSETS_DIR/socat-aarch64"
+}
+
 case "${1:-}" in
     --ci)
         # CI mode: build real binaries for host arch, placeholders for the other
         build_agent_native
         build_socat_native
         create_placeholders
+        ;;
+    --macos)
+        # macOS mode: placeholders for all (agent/socat are Linux binaries that
+        # run inside the k3s container, not on the macOS host).
+        # Real Linux binaries will be built via cross or downloaded at runtime.
+        create_all_placeholders
+        echo "Created placeholder assets for macOS build"
         ;;
     --all)
         # Build everything for both architectures
@@ -120,9 +139,16 @@ case "${1:-}" in
         ;;
     *)
         # Default: build for current arch, placeholders for other
-        build_agent_native
-        build_socat_native
-        create_placeholders
+        if [[ "$(uname -s)" == "Darwin" ]]; then
+            # macOS: can't build Linux musl binaries natively
+            create_all_placeholders
+            echo "macOS detected — created placeholder assets"
+            echo "Use --all with cross installed to build real Linux binaries"
+        else
+            build_agent_native
+            build_socat_native
+            create_placeholders
+        fi
         ;;
 esac
 

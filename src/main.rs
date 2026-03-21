@@ -74,6 +74,26 @@ fn restore_terminal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // On macOS, ensure Homebrew binary paths are in PATH.
+    // ARM64 macOS installs Homebrew to /opt/homebrew/bin, which may not be
+    // in PATH for non-interactive shells (e.g., launched from GUI apps).
+    #[cfg(target_os = "macos")]
+    {
+        let homebrew_dirs = ["/opt/homebrew/bin", "/usr/local/bin"];
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let mut needs_update = false;
+        let mut new_path = current_path.clone();
+        for dir in &homebrew_dirs {
+            if std::path::Path::new(dir).is_dir() && !current_path.split(':').any(|p| p == *dir) {
+                new_path = format!("{}:{}", dir, new_path);
+                needs_update = true;
+            }
+        }
+        if needs_update {
+            std::env::set_var("PATH", &new_path);
+        }
+    }
+
     let cli = Cli::parse();
 
     // If a subcommand was given, run headlessly (no TUI)

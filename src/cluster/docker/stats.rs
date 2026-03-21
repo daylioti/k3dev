@@ -83,7 +83,13 @@ impl DockerManager {
     /// Get aggregated resource stats from all cluster containers (main k3s container + k8s workloads)
     /// Uses cgroups v2 for fast stats reading
     pub async fn get_container_stats(&self, prefix: &str) -> Result<ResourceStats> {
+        use crate::cluster::platform::PlatformInfo;
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Remote Docker: local cgroups don't reflect remote containers — use agent instead
+        if PlatformInfo::is_docker_remote() {
+            anyhow::bail!("Host-side cgroup stats unavailable with remote Docker");
+        }
 
         // Get the main k3s container
         let mut containers = self.list_containers_by_prefix(prefix).await?;
@@ -144,7 +150,13 @@ impl DockerManager {
     /// Get per-pod stats using cgroups v2 (much faster than Docker API)
     /// Reads directly from /sys/fs/cgroup/kubepods for resource stats
     pub async fn get_pod_stats(&self, prefix: &str) -> Result<Vec<ContainerStats>> {
+        use crate::cluster::platform::PlatformInfo;
         use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Remote Docker: local cgroups don't reflect remote containers — use agent instead
+        if PlatformInfo::is_docker_remote() {
+            anyhow::bail!("Host-side cgroup stats unavailable with remote Docker");
+        }
 
         // Get container list from Docker (fast - just listing, no stats)
         let mut containers = self.list_containers_by_prefix(prefix).await?;
@@ -520,16 +532,30 @@ fn calculate_cpu_percent(container_id: &str, usage_usec: u64, now_usec: u64, num
 /// Find cgroup path for a container ID
 /// Supports both cgroup v2 (unified /sys/fs/cgroup/kubepods) and
 /// cgroup v1 (split controllers like /sys/fs/cgroup/cpu,cpuacct/kubepods)
+///
+/// For rootless Docker, cgroups are nested under user slices instead of kubepods:
+///   /sys/fs/cgroup/user.slice/user-<UID>.slice/user@<UID>.service/docker.service/...
+/// When the standard kubepods path isn't found, this falls back to searching
+/// rootless Docker cgroup paths using the current UID.
 fn find_container_cgroup(container_id: &str) -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
 
     match *CGROUP_VERSION {
         CgroupVersion::V2 => {
+            // Standard path: kubepods (rootful Docker with k3s)
             let kubepods_base = PathBuf::from("/sys/fs/cgroup/kubepods");
-            if !kubepods_base.exists() {
-                return None;
+            if kubepods_base.exists() {
+                if let Some(found) = search_cgroup_dir(&kubepods_base, container_id) {
+                    return Some(found);
+                }
             }
-            search_cgroup_dir(&kubepods_base, container_id)
+
+            // Rootless Docker fallback: search under user slice cgroup paths
+            if let Some(found) = find_rootless_cgroup_v2(container_id) {
+                return Some(found);
+            }
+
+            None
         }
         CgroupVersion::V1 => {
             // v1: try cpu,cpuacct first (common combined mount), then cpu alone
@@ -541,9 +567,142 @@ fn find_container_cgroup(container_id: &str) -> Option<std::path::PathBuf> {
                     }
                 }
             }
+
+            // Rootless Docker fallback for v1: search under user slice
+            if let Some(found) = find_rootless_cgroup_v1(container_id) {
+                return Some(found);
+            }
+
             None
         }
     }
+}
+
+/// Get current UID for rootless cgroup path construction
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self")
+        .ok()
+        .map(|m| m.uid())
+        .or_else(|| std::fs::metadata(".").ok().map(|m| m.uid()))
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> Option<u32> {
+    None
+}
+
+/// Find a container's cgroup under rootless Docker paths (cgroup v2)
+/// Rootless Docker with systemd driver places containers under:
+///   /sys/fs/cgroup/user.slice/user-<UID>.slice/user@<UID>.service/docker.service/<container_id>
+/// or with cgroupfs driver:
+///   /sys/fs/cgroup/user.slice/user-<UID>.slice/user@<UID>.service/docker/<container_id>
+/// K3s inside rootless Docker may also create kubepods under the user slice.
+fn find_rootless_cgroup_v2(container_id: &str) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let uid = current_uid()?;
+    let user_service = PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{}.slice/user@{}.service",
+        uid, uid
+    ));
+
+    if !user_service.exists() {
+        return None;
+    }
+
+    // Check docker.service/ (systemd cgroup driver)
+    let docker_service = user_service.join("docker.service");
+    if docker_service.exists() {
+        // Direct container ID match
+        let direct = docker_service.join(container_id);
+        if direct.exists() {
+            return Some(direct);
+        }
+        // Search recursively (kubepods may exist under docker.service)
+        if let Some(found) = search_cgroup_dir_broad(&docker_service, container_id) {
+            return Some(found);
+        }
+    }
+
+    // Check docker/ (cgroupfs driver)
+    let docker_dir = user_service.join("docker");
+    if docker_dir.exists() {
+        let direct = docker_dir.join(container_id);
+        if direct.exists() {
+            return Some(direct);
+        }
+        if let Some(found) = search_cgroup_dir_broad(&docker_dir, container_id) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+/// Find a container's cgroup under rootless Docker paths (cgroup v1)
+/// Rootless Docker v1 places containers under:
+///   /sys/fs/cgroup/cpu,cpuacct/user.slice/user-<UID>.slice/docker/<container_id>
+fn find_rootless_cgroup_v1(container_id: &str) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let uid = current_uid()?;
+
+    for controller in &["cpu,cpuacct", "cpu"] {
+        // Rootless v1 with cgroupfs driver
+        let base = PathBuf::from(format!(
+            "/sys/fs/cgroup/{}/user.slice/user-{}.slice",
+            controller, uid
+        ));
+        if base.exists() {
+            // Search for container ID under docker/ or other subdirectories
+            if let Some(found) = search_cgroup_dir_broad(&base, container_id) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+/// Broadly search for a container cgroup directory by container ID
+/// Unlike `search_cgroup_dir`, this recurses into any subdirectory (not just kubepods-related ones)
+/// to handle arbitrary rootless Docker cgroup hierarchies. Limited to 3 levels deep.
+fn search_cgroup_dir_broad(dir: &std::path::Path, container_id: &str) -> Option<std::path::PathBuf> {
+    search_cgroup_dir_broad_depth(dir, container_id, 0)
+}
+
+fn search_cgroup_dir_broad_depth(
+    dir: &std::path::Path,
+    container_id: &str,
+    depth: u32,
+) -> Option<std::path::PathBuf> {
+    const MAX_DEPTH: u32 = 5;
+    if depth >= MAX_DEPTH {
+        return None;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = path.file_name()?.to_str()?;
+
+                if name == container_id {
+                    return Some(path);
+                }
+
+                // Recurse into subdirectories
+                if let Some(found) =
+                    search_cgroup_dir_broad_depth(&path, container_id, depth + 1)
+                {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Recursively search for a container cgroup directory by container ID

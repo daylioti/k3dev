@@ -149,22 +149,34 @@ pub enum HostsUpdateResult {
 pub struct IngressManager {
     hosts_marker: String,
     domain: Option<String>,
+    /// IP address to use in /etc/hosts entries (127.0.0.1 for local, remote host IP for remote Docker)
+    target_ip: String,
     kube_ops: KubeOps,
 }
 
 impl IngressManager {
     pub fn new() -> Self {
+        use crate::cluster::platform::PlatformInfo;
+        let target_ip = PlatformInfo::docker_remote_host()
+            .unwrap_or("127.0.0.1")
+            .to_string();
         Self {
             hosts_marker: "# k3dev-ingress".to_string(),
             domain: None,
+            target_ip,
             kube_ops: KubeOps::new(),
         }
     }
 
     pub fn with_domain(domain: String) -> Self {
+        use crate::cluster::platform::PlatformInfo;
+        let target_ip = PlatformInfo::docker_remote_host()
+            .unwrap_or("127.0.0.1")
+            .to_string();
         Self {
             hosts_marker: "# k3dev-ingress".to_string(),
             domain: Some(domain),
+            target_ip,
             kube_ops: KubeOps::new(),
         }
     }
@@ -259,7 +271,7 @@ impl IngressManager {
         Ok(entries)
     }
 
-    /// Read ALL hosts from /etc/hosts that point to 127.0.0.1 (for checking if domain is resolvable)
+    /// Read ALL hosts from /etc/hosts that point to our target IP (for checking if domain is resolvable)
     pub async fn get_all_hosts_from_etc_hosts(&self) -> HashSet<String> {
         let hosts_path = hosts_file_path();
         let content = fs::read_to_string(&hosts_path).await.unwrap_or_default();
@@ -271,9 +283,10 @@ impl IngressManager {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            // Line format: "127.0.0.1 hostname [hostname2 ...]"
+            // Line format: "<ip> hostname [hostname2 ...]"
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[0] == "127.0.0.1" {
+            // Match 127.0.0.1 (always) and the configured target IP (may be remote host)
+            if parts.len() >= 2 && (parts[0] == "127.0.0.1" || parts[0] == self.target_ip) {
                 // Add all hostnames on this line (there can be multiple)
                 for hostname in &parts[1..] {
                     // Stop at comment
@@ -379,7 +392,7 @@ impl IngressManager {
         // Add new entries
         let mut new_entries: Vec<String> = hosts
             .iter()
-            .map(|host| format!("127.0.0.1 {} {}", host, self.hosts_marker))
+            .map(|host| format!("{} {} {}", self.target_ip, host, self.hosts_marker))
             .collect();
         new_entries.sort();
 
