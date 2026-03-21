@@ -26,7 +26,7 @@ infrastructure:
   domain: "myapp.local"
 
   # K3s version
-  k3s_version: "v1.33.4-k3s1"
+  k3s_version: "v1.35.2-k3s1"
 
   # Ports
   api_port: 6443

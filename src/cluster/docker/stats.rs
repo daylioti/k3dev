@@ -6,7 +6,7 @@
 //! - CPU delta calculation with spike detection
 
 use anyhow::Result;
-use bollard::container::InspectContainerOptions;
+use bollard::query_parameters::InspectContainerOptions;
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;

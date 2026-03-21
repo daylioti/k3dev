@@ -8,6 +8,8 @@ use kube::{
     Client,
 };
 
+use super::jiff_to_chrono;
+
 /// A single phase in the pod startup timeline
 #[derive(Debug, Clone)]
 pub struct TimelinePhase {
@@ -60,11 +62,17 @@ pub async fn get_pod_timeline(
         .context("Failed to fetch events")?;
 
     // Extract timestamps from pod metadata and status
-    let creation_ts = pod.metadata.creation_timestamp.as_ref().map(|t| t.0);
+    let creation_ts = pod
+        .metadata
+        .creation_timestamp
+        .as_ref()
+        .map(|t| jiff_to_chrono(t.0));
 
     let status = pod.status.as_ref();
 
-    let start_time = status.and_then(|s| s.start_time.as_ref()).map(|t| t.0);
+    let start_time = status
+        .and_then(|s| s.start_time.as_ref())
+        .map(|t| jiff_to_chrono(t.0));
 
     // Extract condition timestamps
     let conditions = status
@@ -95,7 +103,7 @@ pub async fn get_pod_timeline(
                             .as_ref()?
                             .started_at
                             .as_ref()
-                            .map(|t| t.0)
+                            .map(|t| jiff_to_chrono(t.0))
                     })
                     .min()
             });
@@ -113,7 +121,7 @@ pub async fn get_pod_timeline(
                         .as_ref()?
                         .finished_at
                         .as_ref()
-                        .map(|t| t.0)
+                        .map(|t| jiff_to_chrono(t.0))
                 })
                 .max()
         });
@@ -130,8 +138,8 @@ pub async fn get_pod_timeline(
         .filter_map(|e| {
             e.last_timestamp
                 .as_ref()
-                .map(|t| t.0)
-                .or_else(|| e.event_time.as_ref().map(|t| t.0))
+                .map(|t| jiff_to_chrono(t.0))
+                .or_else(|| e.event_time.as_ref().map(|t| jiff_to_chrono(t.0)))
         })
         .max();
 
@@ -242,8 +250,8 @@ pub async fn get_pod_timeline(
             let timestamp = e
                 .last_timestamp
                 .as_ref()
-                .map(|t| t.0)
-                .or_else(|| e.event_time.as_ref().map(|t| t.0))?;
+                .map(|t| jiff_to_chrono(t.0))
+                .or_else(|| e.event_time.as_ref().map(|t| jiff_to_chrono(t.0)))?;
             Some(TimelineEvent {
                 timestamp,
                 reason: e.reason.clone().unwrap_or_default(),
@@ -274,5 +282,5 @@ fn find_condition_time(
         .iter()
         .find(|c| c.type_ == condition_type && c.status == "True")
         .and_then(|c| c.last_transition_time.as_ref())
-        .map(|t| t.0)
+        .map(|t| jiff_to_chrono(t.0))
 }

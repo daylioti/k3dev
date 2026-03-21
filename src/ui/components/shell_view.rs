@@ -38,7 +38,7 @@ impl ShellView {
 
     /// Resize the VT100 parser screen
     pub fn set_size(&mut self, rows: u16, cols: u16) {
-        self.parser.set_size(rows.max(1), cols.max(1));
+        self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
     }
 
     pub fn set_connected(&mut self) {
@@ -131,7 +131,7 @@ impl ShellView {
                 if contents.is_empty() {
                     current_text.push(' ');
                 } else {
-                    current_text.push_str(&contents);
+                    current_text.push_str(contents);
                 }
             }
 

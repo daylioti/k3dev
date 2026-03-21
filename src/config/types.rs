@@ -343,7 +343,7 @@ fn default_domain() -> String {
 }
 
 fn default_k3s_version() -> String {
-    "v1.33.4-k3s1".to_string()
+    "v1.35.2-k3s1".to_string()
 }
 
 fn default_api_port() -> u16 {

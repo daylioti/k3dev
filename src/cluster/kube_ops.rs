@@ -544,7 +544,7 @@ impl KubeOps {
         let client = self.client().await?;
 
         // Parse the YAML to get resource info
-        let value: serde_yaml::Value = serde_yaml::from_str(yaml_content)?;
+        let value: serde_yml::Value = serde_yml::from_str(yaml_content)?;
         let api_version = value
             .get("apiVersion")
             .and_then(|v| v.as_str())
@@ -583,7 +583,7 @@ impl KubeOps {
         };
 
         // Convert to DynamicObject
-        let obj: DynamicObject = serde_yaml::from_str(yaml_content)?;
+        let obj: DynamicObject = serde_yml::from_str(yaml_content)?;
 
         // Create namespaced or cluster-scoped API
         let api: Api<DynamicObject> = if namespace == "default" && group.is_empty() {
@@ -677,7 +677,7 @@ impl KubeOps {
             kubeconfig.current_context = kubeconfig.contexts.first().map(|c| c.name.clone());
         }
 
-        let yaml_content = serde_yaml::to_string(&kubeconfig)?;
+        let yaml_content = serde_yml::to_string(&kubeconfig)?;
         tokio::fs::write(&kubeconfig_path, yaml_content).await?;
 
         #[cfg(unix)]

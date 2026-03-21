@@ -34,7 +34,7 @@ impl ConfigLoader {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
-        let mut config: Config = serde_yaml::from_str(&content)
+        let mut config: Config = serde_yml::from_str(&content)
             .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
 
         self.resolve_placeholders(&mut config);

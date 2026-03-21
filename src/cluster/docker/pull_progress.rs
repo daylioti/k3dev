@@ -10,7 +10,7 @@
 //! "growing denominator" problem where total bytes increase as layers
 //! are discovered.
 
-use bollard::image::CreateImageOptions;
+use bollard::query_parameters::CreateImageOptions;
 use bollard::Docker;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, WWW_AUTHENTICATE};
@@ -845,8 +845,8 @@ pub async fn monitor_image_pull(
     let tag = image_ref.tag.clone();
 
     let options = Some(CreateImageOptions {
-        from_image: from_image.as_str(),
-        tag: tag.as_str(),
+        from_image: Some(from_image.clone()),
+        tag: Some(tag.clone()),
         ..Default::default()
     });
 

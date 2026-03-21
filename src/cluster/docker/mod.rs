@@ -16,18 +16,18 @@ pub use pull_progress::{ContainerPullProgress, PullPhase};
 pub use stats::{ContainerStats, ResourceStats};
 
 use anyhow::{anyhow, Context, Result};
-use bollard::container::{
-    Config, CreateContainerOptions, DownloadFromContainerOptions, InspectContainerOptions,
-    ListContainersOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
-};
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use bollard::image::CreateImageOptions;
 use bollard::models::{
-    HostConfig, HostConfigCgroupnsModeEnum, Mount, MountBindOptions,
-    MountBindOptionsPropagationEnum, MountTypeEnum, PortBinding,
+    ContainerConfig, ContainerCreateBody, HostConfig, HostConfigCgroupnsModeEnum, Mount,
+    MountBindOptions, MountBindOptionsPropagationEnum, MountTypeEnum, NetworkCreateRequest,
+    PortBinding, VolumeCreateRequest,
 };
-use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
-use bollard::volume::{CreateVolumeOptions, RemoveVolumeOptions};
+use bollard::query_parameters::{
+    CommitContainerOptions, CreateContainerOptions, CreateImageOptions,
+    DownloadFromContainerOptions, InspectContainerOptions, InspectNetworkOptions,
+    ListContainersOptions, ListImagesOptions, RemoveContainerOptions, RemoveImageOptions,
+    RemoveVolumeOptions, StartContainerOptions, StopContainerOptions, WaitContainerOptions,
+};
 use bollard::ClientVersion;
 use bollard::Docker;
 use futures_util::StreamExt;
@@ -225,7 +225,7 @@ impl DockerManager {
     /// Start a stopped container
     pub async fn start_container(&self, name: &str) -> Result<()> {
         self.client
-            .start_container(name, None::<StartContainerOptions<String>>)
+            .start_container(name, None::<StartContainerOptions>)
             .await
             .with_context(|| format!("Failed to start container {}", name))
     }
@@ -233,7 +233,13 @@ impl DockerManager {
     /// Stop a running container
     pub async fn stop_container(&self, name: &str) -> Result<()> {
         self.client
-            .stop_container(name, Some(StopContainerOptions { t: 10 }))
+            .stop_container(
+                name,
+                Some(StopContainerOptions {
+                    t: Some(10),
+                    signal: None,
+                }),
+            )
             .await
             .with_context(|| format!("Failed to stop container {}", name))
     }
@@ -294,9 +300,12 @@ impl DockerManager {
         src: &str,
         dst: &PathBuf,
     ) -> Result<()> {
-        let mut stream = self
-            .client
-            .download_from_container(container, Some(DownloadFromContainerOptions { path: src }));
+        let mut stream = self.client.download_from_container(
+            container,
+            Some(DownloadFromContainerOptions {
+                path: src.to_string(),
+            }),
+        );
 
         let mut file = tokio::fs::File::create(dst)
             .await
@@ -315,13 +324,13 @@ impl DockerManager {
     /// List containers by name prefix
     pub async fn list_containers_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         let mut filters = HashMap::new();
-        filters.insert("name", vec![prefix]);
+        filters.insert("name".to_string(), vec![prefix.to_string()]);
 
         let containers = self
             .client
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters,
+                filters: Some(filters),
                 ..Default::default()
             }))
             .await
@@ -344,13 +353,13 @@ impl DockerManager {
         prefix: &str,
     ) -> Result<Vec<ContainerMountInfo>> {
         let mut filters = HashMap::new();
-        filters.insert("name", vec![prefix]);
+        filters.insert("name".to_string(), vec![prefix.to_string()]);
 
         let containers = self
             .client
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters,
+                filters: Some(filters),
                 ..Default::default()
             }))
             .await
@@ -425,7 +434,7 @@ impl DockerManager {
         // Check if network exists
         if self
             .client
-            .inspect_network(name, None::<InspectNetworkOptions<String>>)
+            .inspect_network(name, None::<InspectNetworkOptions>)
             .await
             .is_ok()
         {
@@ -433,7 +442,7 @@ impl DockerManager {
         }
 
         self.client
-            .create_network(CreateNetworkOptions {
+            .create_network(NetworkCreateRequest {
                 name: name.to_string(),
                 ..Default::default()
             })
@@ -455,8 +464,8 @@ impl DockerManager {
     /// Create a Docker volume
     pub async fn create_volume(&self, name: &str) -> Result<()> {
         self.client
-            .create_volume(CreateVolumeOptions {
-                name: name.to_string(),
+            .create_volume(VolumeCreateRequest {
+                name: Some(name.to_string()),
                 ..Default::default()
             })
             .await
@@ -486,7 +495,7 @@ impl DockerManager {
     /// Pull a Docker image
     pub async fn pull_image(&self, image: &str) -> Result<()> {
         let options = Some(CreateImageOptions {
-            from_image: image,
+            from_image: Some(image.to_string()),
             ..Default::default()
         });
 
@@ -518,7 +527,7 @@ impl DockerManager {
     pub async fn get_pod_image_architectures(&self) -> HashMap<String, String> {
         let containers = match self
             .client
-            .list_containers(Some(ListContainersOptions::<String> {
+            .list_containers(Some(ListContainersOptions {
                 all: false,
                 ..Default::default()
             }))
@@ -593,19 +602,17 @@ impl DockerManager {
         image: &str,
         labels: HashMap<String, String>,
     ) -> Result<()> {
-        use bollard::image::CommitContainerOptions;
-
         let options = CommitContainerOptions {
-            container,
-            repo: image,
-            tag: "",
-            comment: "k3dev snapshot",
-            author: "k3dev",
+            container: Some(container.to_string()),
+            repo: Some(image.to_string()),
+            tag: Some(String::new()),
+            comment: Some("k3dev snapshot".to_string()),
+            author: Some("k3dev".to_string()),
             pause: false, // Don't pause container during commit
             changes: None,
         };
 
-        let config = Config::<String> {
+        let config = ContainerConfig {
             labels: Some(labels),
             ..Default::default()
         };
@@ -626,9 +633,7 @@ impl DockerManager {
 
     /// List images matching a pattern (simple prefix match)
     pub async fn list_images_by_pattern(&self, pattern: &str) -> Result<Vec<String>> {
-        use bollard::image::ListImagesOptions;
-
-        let options = Some(ListImagesOptions::<String> {
+        let options = Some(ListImagesOptions {
             all: false,
             ..Default::default()
         });
@@ -653,11 +658,10 @@ impl DockerManager {
 
     /// Remove an image
     pub async fn remove_image(&self, image: &str) -> Result<()> {
-        use bollard::image::RemoveImageOptions;
-
         let options = Some(RemoveImageOptions {
             force: true,
             noprune: false,
+            platforms: None,
         });
 
         self.client
@@ -698,7 +702,7 @@ impl DockerManager {
             ..Default::default()
         };
 
-        let container_config = Config {
+        let container_config = ContainerCreateBody {
             image: Some(image.to_string()),
             cmd: Some(command.iter().map(|s| s.to_string()).collect()),
             host_config: Some(host_config),
@@ -708,8 +712,8 @@ impl DockerManager {
         self.client
             .create_container(
                 Some(CreateContainerOptions {
-                    name: container_name.clone(),
-                    platform: None,
+                    name: Some(container_name.clone()),
+                    ..Default::default()
                 }),
                 container_config,
             )
@@ -717,14 +721,13 @@ impl DockerManager {
             .with_context(|| "Failed to create ephemeral container")?;
 
         self.client
-            .start_container(&container_name, None::<StartContainerOptions<String>>)
+            .start_container(&container_name, None::<StartContainerOptions>)
             .await
             .with_context(|| "Failed to start ephemeral container")?;
 
-        let mut wait_stream = self.client.wait_container(
-            &container_name,
-            None::<bollard::container::WaitContainerOptions<String>>,
-        );
+        let mut wait_stream = self
+            .client
+            .wait_container(&container_name, None::<WaitContainerOptions>);
         while let Some(result) = wait_stream.next().await {
             match result {
                 Ok(response) => {
@@ -755,12 +758,12 @@ impl DockerManager {
 
     /// Run a new container
     pub async fn run_container(&self, config: &ContainerRunConfig) -> Result<()> {
-        let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
+        let mut exposed_ports: Vec<String> = Vec::new();
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
         for (host, container) in &config.ports {
             let container_port = format!("{}/tcp", container);
-            exposed_ports.insert(container_port.clone(), HashMap::new());
+            exposed_ports.push(container_port.clone());
             port_bindings.insert(
                 container_port,
                 Some(vec![PortBinding {
@@ -863,7 +866,7 @@ impl DockerManager {
             ..Default::default()
         };
 
-        let container_config = Config {
+        let container_config = ContainerCreateBody {
             image: Some(config.image.clone()),
             hostname: config.hostname.clone(),
             env: if env.is_empty() { None } else { Some(env) },
@@ -887,8 +890,8 @@ impl DockerManager {
         self.client
             .create_container(
                 Some(CreateContainerOptions {
-                    name: config.name.clone(),
-                    platform: None,
+                    name: Some(config.name.clone()),
+                    ..Default::default()
                 }),
                 container_config,
             )
@@ -897,7 +900,7 @@ impl DockerManager {
 
         if config.detach {
             self.client
-                .start_container(&config.name, None::<StartContainerOptions<String>>)
+                .start_container(&config.name, None::<StartContainerOptions>)
                 .await
                 .map_err(|e| {
                     let err_msg = e.to_string().to_lowercase();

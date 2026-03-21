@@ -8,6 +8,7 @@ use kube::{
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::jiff_to_chrono;
 use crate::config::expand_home;
 
 /// Node information
@@ -379,7 +380,7 @@ impl K8sClient {
                 status
                     .start_time
                     .as_ref()
-                    .map(|t| t.0.to_string())
+                    .map(|t| jiff_to_chrono(t.0).to_string())
                     .unwrap_or_else(|| "N/A".to_string())
             ));
 
@@ -411,7 +412,7 @@ impl K8sClient {
                                 running
                                     .started_at
                                     .as_ref()
-                                    .map(|t| t.0.to_string())
+                                    .map(|t| jiff_to_chrono(t.0).to_string())
                                     .unwrap_or_else(|| "N/A".to_string())
                             ));
                         } else if let Some(waiting) = &state.waiting {
@@ -556,7 +557,7 @@ impl K8sClient {
                     .status
                     .as_ref()
                     .and_then(|s| s.start_time.as_ref())
-                    .map(|t| t.0);
+                    .map(|t| jiff_to_chrono(t.0));
 
                 // Get container images from spec
                 let container_images: HashMap<String, String> = pod
