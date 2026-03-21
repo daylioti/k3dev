@@ -204,8 +204,7 @@ impl K3sManager {
                     // Replace 127.0.0.1 with the appropriate host:
                     // - Remote Docker: use the remote host's address
                     // - Local Docker: use "localhost" for better compatibility
-                    let api_host = PlatformInfo::docker_remote_host()
-                        .unwrap_or("localhost");
+                    let api_host = PlatformInfo::docker_remote_host().unwrap_or("localhost");
                     let fixed_content = content.replace("127.0.0.1", api_host);
 
                     fs::write(&temp_config, &fixed_content).await?;

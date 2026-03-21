@@ -142,8 +142,6 @@ impl DockerManager {
         false
     }
 
-
-
     /// Check that Docker's cgroup driver is cgroupfs (required for k3s-in-docker).
     /// k3s runs inside a container without systemd, so kubelet cannot use the
     /// systemd cgroup manager. Docker and kubelet must use the same driver.
@@ -938,7 +936,7 @@ impl DockerManager {
                                    Enable privileged port mapping\n\
                                  - Or configure alternative ports in k3dev.yml:\n\
                                    http_port: 8080\n\
-                                   https_port: 8443\n"
+                                   https_port: 8443\n",
                             );
                         } else {
                             context_msg.push_str(
@@ -947,16 +945,13 @@ impl DockerManager {
                                  - Insufficient permissions to bind to ports below 1024\n\n\
                                  To fix, configure alternative ports in k3dev.yml:\n\
                                    http_port: 8080\n\
-                                   https_port: 8443\n"
+                                   https_port: 8443\n",
                             );
                         }
 
                         anyhow!(context_msg)
                     } else {
-                        anyhow!(e).context(format!(
-                            "Failed to start container {}",
-                            config.name
-                        ))
+                        anyhow!(e).context(format!("Failed to start container {}", config.name))
                     }
                 })?;
         }

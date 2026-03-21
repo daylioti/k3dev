@@ -669,7 +669,10 @@ fn find_rootless_cgroup_v1(container_id: &str) -> Option<std::path::PathBuf> {
 /// Broadly search for a container cgroup directory by container ID
 /// Unlike `search_cgroup_dir`, this recurses into any subdirectory (not just kubepods-related ones)
 /// to handle arbitrary rootless Docker cgroup hierarchies. Limited to 3 levels deep.
-fn search_cgroup_dir_broad(dir: &std::path::Path, container_id: &str) -> Option<std::path::PathBuf> {
+fn search_cgroup_dir_broad(
+    dir: &std::path::Path,
+    container_id: &str,
+) -> Option<std::path::PathBuf> {
     search_cgroup_dir_broad_depth(dir, container_id, 0)
 }
 
@@ -694,9 +697,7 @@ fn search_cgroup_dir_broad_depth(
                 }
 
                 // Recurse into subdirectories
-                if let Some(found) =
-                    search_cgroup_dir_broad_depth(&path, container_id, depth + 1)
-                {
+                if let Some(found) = search_cgroup_dir_broad_depth(&path, container_id, depth + 1) {
                     return Some(found);
                 }
             }
