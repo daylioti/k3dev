@@ -393,7 +393,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             // Only relevant on Linux
             #[cfg(not(target_os = "linux"))]
             {
-                return Ok(Some("not applicable (non-Linux)".to_string()));
+                Ok(Some("not applicable (non-Linux)".to_string()))
             }
             #[cfg(target_os = "linux")]
             {
@@ -427,7 +427,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             // Only relevant on Linux
             #[cfg(not(target_os = "linux"))]
             {
-                return Ok(Some("not applicable (non-Linux)".to_string()));
+                Ok(Some("not applicable (non-Linux)".to_string()))
             }
             #[cfg(target_os = "linux")]
             {
