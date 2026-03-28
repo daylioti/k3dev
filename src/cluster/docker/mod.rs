@@ -46,13 +46,35 @@ pub struct DockerManager {
 
 impl DockerManager {
     pub fn new(socket_path: PathBuf) -> Result<Self> {
-        let client = Docker::connect_with_defaults()
-            .context("Failed to connect to Docker. Check DOCKER_HOST or that Docker is running.")?;
+        let client = Self::connect(&socket_path)?;
 
         Ok(Self {
             socket_path,
             client,
         })
+    }
+
+    /// Connect to Docker using the resolved socket path.
+    /// Falls back to DOCKER_HOST / default if the path doesn't exist (TCP/remote).
+    fn connect(socket_path: &PathBuf) -> Result<Docker> {
+        // If the socket file exists on disk, connect directly to it.
+        // This handles Docker Desktop on macOS (~/.docker/run/docker.sock)
+        // and other non-default socket locations.
+        if socket_path.exists() {
+            let uri = format!("unix://{}", socket_path.display());
+            return Docker::connect_with_socket(&uri, 120, bollard::API_DEFAULT_VERSION)
+                .with_context(|| {
+                    format!(
+                        "Failed to connect to Docker socket at {}",
+                        socket_path.display()
+                    )
+                });
+        }
+
+        // For TCP/remote Docker or when socket path is a placeholder,
+        // fall back to DOCKER_HOST env var or bollard defaults.
+        Docker::connect_with_defaults()
+            .context("Failed to connect to Docker. Check DOCKER_HOST or that Docker is running.")
     }
 
     /// Negotiate Docker API version with the server.
@@ -61,7 +83,7 @@ impl DockerManager {
     pub async fn negotiate_api_version(&mut self) -> Result<()> {
         let old_client = std::mem::replace(
             &mut self.client,
-            Docker::connect_with_defaults()
+            Self::connect(&self.socket_path)
                 .context("Failed to reconnect to Docker for version negotiation")?,
         );
         self.client = old_client
@@ -274,9 +296,11 @@ impl DockerManager {
             .await
             .context("Failed to create exec")?;
 
+        let exec_id = exec.id.clone();
+
         let output = self
             .client
-            .start_exec(&exec.id, Some(StartExecOptions::default()))
+            .start_exec(&exec_id, Some(StartExecOptions::default()))
             .await
             .context("Failed to start exec")?;
 
@@ -286,6 +310,19 @@ impl DockerManager {
                 if let Ok(msg) = msg {
                     result.push_str(&msg.to_string());
                 }
+            }
+        }
+
+        // Check exit code
+        let inspect = self.client.inspect_exec(&exec_id).await?;
+        if let Some(code) = inspect.exit_code {
+            if code != 0 {
+                anyhow::bail!(
+                    "Command {:?} exited with code {}: {}",
+                    command,
+                    code,
+                    result.trim()
+                );
             }
         }
 

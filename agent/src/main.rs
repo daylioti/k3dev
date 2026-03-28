@@ -246,17 +246,34 @@ fn read_cgroup_v1_files(path: &Path) -> Option<CgroupStats> {
 
 /// Query Docker daemon for running containers and extract container_id → (pod_name, namespace).
 /// Uses raw HTTP over Unix socket — no external dependencies.
+/// Tries the default socket first, falls back to the VM's raw socket on Docker Desktop
+/// where the proxy socket filters container visibility.
 fn query_docker_containers() -> HashMap<String, (String, String)> {
-    let mut stream = match UnixStream::connect("/var/run/docker.sock") {
+    // Try default socket first
+    let result = query_docker_socket("/var/run/docker.sock");
+    if !result.is_empty() {
+        return result;
+    }
+
+    // Fallback: Docker Desktop's raw VM socket (bypasses proxy filtering)
+    // Accessible because k3s container runs with --pid=host
+    let raw_socket = Path::new("/proc/1/root/run/docker.sock");
+    if raw_socket.exists() {
+        return query_docker_socket(raw_socket.to_str().unwrap_or_default());
+    }
+
+    HashMap::new()
+}
+
+fn query_docker_socket(socket_path: &str) -> HashMap<String, (String, String)> {
+    let mut stream = match UnixStream::connect(socket_path) {
         Ok(s) => s,
         Err(_) => return HashMap::new(),
     };
 
-    // Set read timeout to avoid hanging if Docker is unresponsive
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
 
-    // HTTP/1.0 avoids chunked transfer encoding — simpler parsing
     let request = b"GET /containers/json HTTP/1.0\r\nHost: localhost\r\n\r\n";
     if stream.write_all(request).is_err() {
         return HashMap::new();
@@ -269,7 +286,6 @@ fn query_docker_containers() -> HashMap<String, (String, String)> {
 
     let response_str = String::from_utf8_lossy(&response);
 
-    // Skip HTTP headers — find blank line
     let body = match response_str.find("\r\n\r\n") {
         Some(pos) => &response_str[pos + 4..],
         None => return HashMap::new(),

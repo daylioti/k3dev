@@ -16,7 +16,7 @@ pub use ingress::{
     HostsUpdateResult, IngressEntry, IngressHealthChecker, IngressHealthStatus, IngressManager,
 };
 pub use k3s::{ClusterStatus, K3sManager};
-pub use platform::PlatformInfo;
+pub use platform::{find_available_port, PlatformInfo};
 pub use port_forward::PortForwardDetector;
 pub use traefik::TraefikManager;
 
@@ -78,7 +78,15 @@ impl ClusterManager {
     pub async fn start(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
         // Ensure K3sManager is available
         if self.k3s.is_none() {
-            self.k3s = K3sManager::new(Arc::clone(&self.config)).await.ok();
+            match K3sManager::new(Arc::clone(&self.config)).await {
+                Ok(mgr) => self.k3s = Some(mgr),
+                Err(e) => {
+                    let _ = output_tx
+                        .send(OutputLine::error(&format!("Failed to initialize cluster manager: {:#}", e)))
+                        .await;
+                    return Ok(());
+                }
+            }
         }
 
         // Start k3s cluster (core components only)

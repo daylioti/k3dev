@@ -259,7 +259,7 @@ impl K3sManager {
         let iptables_mode = PlatformInfo::detect_iptables_mode();
 
         // Build port mappings
-        let ports: Vec<(u16, u16)> = self
+        let mut ports: Vec<(u16, u16)> = self
             .config
             .port_mappings()
             .iter()
@@ -273,6 +273,26 @@ impl K3sManager {
             })
             .collect();
 
+        #[cfg(target_os = "macos")]
+        {
+            let relay_port = crate::cluster::platform::find_available_port(2375).unwrap_or(2375);
+            ports.push((relay_port, relay_port));
+        }
+
+        // On macOS (Docker Desktop), bypass the proxy socket (see mod.rs for details)
+        let docker_endpoint = if cfg!(target_os = "macos") {
+            " --container-runtime-endpoint /proc/1/root/run/docker.sock"
+        } else {
+            ""
+        };
+
+        #[cfg(target_os = "macos")]
+        let ports = {
+            let mut p = ports;
+            p.push((2375, 2375));
+            p
+        };
+
         // K3s server command with snapshot data restoration
         let k3s_command = vec![
             "/bin/sh".to_string(),
@@ -281,42 +301,40 @@ impl K3sManager {
                 "set -e && \
                  if [ -d /snapshot-data ]; then \
                    echo 'Restoring cluster state from snapshot...' && \
-                   mkdir -p {} {} && \
-                   cp -a /snapshot-data/rancher/. {}/ 2>/dev/null || true && \
-                   cp -a /snapshot-data/pv/. {}/ 2>/dev/null || true && \
+                   mkdir -p {rancher} {pv} && \
+                   cp -a /snapshot-data/rancher/. {rancher}/ 2>/dev/null || true && \
+                   cp -a /snapshot-data/pv/. {pv}/ 2>/dev/null || true && \
                    echo 'Cluster state restored'; \
                  fi && \
                  nsenter --mount=/proc/1/ns/mnt modprobe br_netfilter 2>/dev/null || true && \
                  sysctl -w net.bridge.bridge-nf-call-iptables=1 2>/dev/null || true && \
                  mkdir -p /run/k3s /sys/fs/cgroup/kubepods && \
                  /bin/k3s server \
-                 --docker \
+                 --docker{docker_endpoint} \
                  --disable=metrics-server \
                  --disable=servicelb \
                  --disable-cloud-controller \
                  --disable-network-policy \
                  --flannel-backend=host-gw \
-                 --default-local-storage-path {} \
+                 --default-local-storage-path {pv} \
                  --service-node-port-range 80-32767 \
-                 --kubelet-arg=root-dir={} \
-                 --kubelet-arg=cgroup-driver={} \
+                 --kubelet-arg=root-dir={kubelet} \
+                 --kubelet-arg=cgroup-driver={cgroup} \
                  --kube-apiserver-arg=profiling=false \
                  --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
                  --kube-controller-manager-arg=concurrent-deployment-syncs=1",
-                Self::RANCHER_DATA_PATH,
-                pv_storage_path,
-                Self::RANCHER_DATA_PATH,
-                pv_storage_path,
-                pv_storage_path,
-                kubelet_root,
-                cgroup_driver
+                docker_endpoint = docker_endpoint,
+                rancher = Self::RANCHER_DATA_PATH,
+                pv = pv_storage_path,
+                kubelet = kubelet_root,
+                cgroup = cgroup_driver
             ),
         ];
 
         // Build volumes and env - handle TCP Docker (no socket file to mount)
         let tcp_url = docker_host_tcp_url();
         let mut volumes = vec![
-            // Mount Docker data directory
+            // Mount Docker data directory - required for k3s --docker mode
             (
                 docker_root.clone(),
                 docker_root.clone(),
@@ -338,20 +356,18 @@ impl K3sManager {
         let mut env = vec![("IPTABLES_MODE".to_string(), iptables_mode.to_string())];
 
         if let Some(ref url) = tcp_url {
-            // TCP Docker (e.g., Colima/OrbStack with tcp://127.0.0.1:2375):
-            // No local socket file to mount — pass DOCKER_HOST to the container instead
             tracing::info!(docker_host = %url, "TCP Docker detected, passing DOCKER_HOST to k3s container");
             env.push(("DOCKER_HOST".to_string(), url.clone()));
         } else {
-            // Unix socket Docker: mount the socket file
             volumes.insert(
                 0,
                 (
-                    socket_path.to_string_lossy().to_string(),
+                    self.platform.docker_socket_mount_source(&socket_path),
                     "/var/run/docker.sock".to_string(),
                     String::new(),
                 ),
             );
+
         }
 
         // Run container from snapshot image

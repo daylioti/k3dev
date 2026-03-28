@@ -288,6 +288,33 @@ impl PlatformInfo {
         Err(anyhow!("{}\nChecked: {}", error_msg, checked))
     }
 
+    /// Get the Docker socket path to use as a bind mount source when creating
+    /// the k3s container. On macOS with Docker Desktop, this must be
+    /// `/var/run/docker.sock` (the well-known path that Docker Desktop
+    /// intercepts and forwards into the VM), not the actual macOS proxy socket.
+    /// On Linux or when using DOCKER_HOST, returns the actual socket path.
+    pub fn docker_socket_mount_source(&self, socket_path: &std::path::Path) -> String {
+        #[cfg(target_os = "macos")]
+        {
+            // Docker Desktop on macOS requires `/var/run/docker.sock` as the
+            // bind mount source. It intercepts this specific path and creates
+            // a proper socket connection inside the container's VM. Mounting
+            // the macOS proxy socket (e.g., ~/.docker/run/docker.sock) via
+            // virtiofs results in a non-functional socket inside the container.
+            let default = "/var/run/docker.sock";
+            let default_path = std::path::Path::new(default);
+            if socket_path != default_path {
+                tracing::info!(
+                    resolved = %socket_path.display(),
+                    mount_source = default,
+                    "macOS detected: using standard Docker socket path for container mount"
+                );
+                return default.to_string();
+            }
+        }
+        socket_path.to_string_lossy().to_string()
+    }
+
     /// Common Docker socket paths to check, in priority order
     fn docker_socket_candidates() -> Vec<String> {
         let mut candidates = vec![
@@ -303,8 +330,15 @@ impl PlatformInfo {
             candidates.push(format!("/run/user/{}/podman/podman.sock", uid));
         }
 
-        // Docker Desktop on Linux: ~/.docker/desktop/docker.sock
+        // Docker Desktop: ~/.docker/run/docker.sock (macOS) or ~/.docker/desktop/docker.sock (Linux)
         if let Some(home) = dirs::home_dir() {
+            candidates.push(
+                home.join(".docker")
+                    .join("run")
+                    .join("docker.sock")
+                    .to_string_lossy()
+                    .to_string(),
+            );
             candidates.push(
                 home.join(".docker")
                     .join("desktop")
@@ -434,11 +468,24 @@ impl PlatformInfo {
         }
     }
 
+    /// Connect to Docker using the same socket detection logic as DockerManager.
+    /// Checks Docker context and common socket locations, falling back to defaults.
+    pub fn connect_docker() -> Result<Docker, bollard::errors::Error> {
+        // Try the detected socket path first (handles Docker contexts, Desktop, etc.)
+        let socket_path = Self::find_docker_socket_sync();
+        if socket_path.exists() {
+            let uri = format!("unix://{}", socket_path.display());
+            return Docker::connect_with_socket(&uri, 120, bollard::API_DEFAULT_VERSION);
+        }
+        // Fallback to DOCKER_HOST env var or bollard defaults
+        Docker::connect_with_defaults()
+    }
+
     /// Check if Docker is available and running.
     /// Retries briefly to handle systemd socket activation, where the socket file
     /// exists but the daemon takes a few seconds to start on first connection.
     pub async fn is_docker_available(&self) -> bool {
-        let client = match Docker::connect_with_defaults() {
+        let client = match Self::connect_docker() {
             Ok(c) => c,
             Err(_) => return false,
         };
@@ -559,4 +606,14 @@ impl PlatformInfo {
 
         missing
     }
+}
+
+/// Find an available TCP port starting from the given port.
+pub fn find_available_port(start: u16) -> anyhow::Result<u16> {
+    for port in start..start + 100 {
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("No available port found in range {}-{}", start, start + 100)
 }

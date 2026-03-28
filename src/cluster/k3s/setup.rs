@@ -88,18 +88,15 @@ impl K3sManager {
         Err(anyhow!("Timeout waiting for k3s API"))
     }
 
-    /// Install socat in the k3s container using embedded static binary
-    /// The binary is compiled into k3dev, no network required
-    /// Architecture-specific binary is selected at compile time
+    /// Install socat in the k3s container using embedded static binary.
+    /// Uses docker cp for reliable transfer of large binaries.
     pub(super) async fn install_socat(&self) -> Result<()> {
-        // Static socat binary embedded at compile time (architecture-specific)
         #[cfg(target_arch = "x86_64")]
         const SOCAT_BINARY: &[u8] = include_bytes!("../../../assets/socat-x86_64");
 
         #[cfg(target_arch = "aarch64")]
         const SOCAT_BINARY: &[u8] = include_bytes!("../../../assets/socat-aarch64");
 
-        // Check if socat is already installed
         if self
             .docker
             .exec_in_container(&self.config.container_name, &["which", "socat"])
@@ -109,26 +106,14 @@ impl K3sManager {
             return Ok(());
         }
 
-        // Base64 encode the binary for injection via exec
-        // This eliminates temp file I/O and docker cp overhead
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let encoded = STANDARD.encode(SOCAT_BINARY);
+        self.install_binary_via_docker_cp(
+            SOCAT_BINARY,
+            "socat",
+            "/usr/local/bin/socat",
+        )
+        .await
+        .context("Failed to install socat")?;
 
-        // Inject binary directly via exec (no temp file, no docker cp)
-        // Single atomic command: decode base64, write to file, and make executable
-        let install_cmd = format!(
-            "mkdir -p /usr/local/bin && \
-             echo '{}' | base64 -d > /usr/local/bin/socat && \
-             chmod +x /usr/local/bin/socat",
-            encoded
-        );
-
-        self.docker
-            .exec_in_container(&self.config.container_name, &["sh", "-c", &install_cmd])
-            .await
-            .context("Failed to install socat via binary injection")?;
-
-        // Verify installation
         self.docker
             .exec_in_container(&self.config.container_name, &["socat", "-V"])
             .await
@@ -138,7 +123,6 @@ impl K3sManager {
     }
 
     /// Install k3dev-agent in the k3s container using embedded static binary.
-    /// The agent collects cgroup stats and queries Docker for pod mapping.
     pub(super) async fn install_agent(&self) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         const AGENT_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-agent-x86_64");
@@ -146,7 +130,6 @@ impl K3sManager {
         #[cfg(target_arch = "aarch64")]
         const AGENT_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-agent-aarch64");
 
-        // Check if agent is already installed
         if self
             .docker
             .exec_in_container(
@@ -159,19 +142,58 @@ impl K3sManager {
             return Ok(());
         }
 
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let encoded = STANDARD.encode(AGENT_BINARY);
+        self.install_binary_via_docker_cp(
+            AGENT_BINARY,
+            "k3dev-agent",
+            "/usr/local/bin/k3dev-agent",
+        )
+        .await
+        .context("Failed to install k3dev-agent")?;
 
-        let install_cmd = format!(
-            "echo '{}' | base64 -d > /usr/local/bin/k3dev-agent && \
-             chmod +x /usr/local/bin/k3dev-agent",
-            encoded
-        );
+        Ok(())
+    }
 
-        self.docker
-            .exec_in_container(&self.config.container_name, &["sh", "-c", &install_cmd])
+    /// Install a binary into the container via docker cp (reliable for large files).
+    async fn install_binary_via_docker_cp(
+        &self,
+        binary: &[u8],
+        name: &str,
+        dest: &str,
+    ) -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!("k3dev-{}", name));
+        tokio::fs::write(&tmp, binary).await?;
+
+        // Ensure target directory exists
+        let _ = self
+            .docker
+            .exec_in_container(
+                &self.config.container_name,
+                &["mkdir", "-p", "/usr/local/bin"],
+            )
+            .await;
+
+        // Copy binary into container
+        let tmp_str = tmp.to_str().unwrap().to_string();
+        let dest_arg = format!("{}:{}", self.config.container_name, dest);
+        tracing::info!(src = %tmp_str, dest = %dest_arg, "docker cp binary");
+
+        let output = tokio::process::Command::new("docker")
+            .args(["cp", &tmp_str, &dest_arg])
+            .output()
             .await
-            .context("Failed to install k3dev-agent")?;
+            .context("docker cp failed")?;
+
+        let _ = tokio::fs::remove_file(&tmp).await;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("docker cp {} failed: {}", name, stderr);
+        }
+
+        // Make executable
+        self.docker
+            .exec_in_container(&self.config.container_name, &["chmod", "+x", dest])
+            .await?;
 
         Ok(())
     }

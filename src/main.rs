@@ -50,16 +50,92 @@ enum CliCommand {
     Destroy,
     /// Show cluster info
     Info,
+    /// Delete all snapshot images
+    DeleteSnapshots,
+    /// Run cluster diagnostics (health checks)
+    Diagnostics,
+    /// Update /etc/hosts with ingress entries
+    UpdateHosts,
+    /// List pods with status
+    Pods {
+        /// Namespace to list pods from (default: all namespaces)
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// View pod logs
+    Logs {
+        /// Pod name
+        pod: String,
+        /// Namespace (default: "default")
+        #[arg(short, long, default_value = "default")]
+        namespace: String,
+        /// Container name (for multi-container pods)
+        #[arg(long)]
+        container: Option<String>,
+        /// Number of tail lines
+        #[arg(short, long, default_value = "100")]
+        tail: i64,
+        /// Follow log output
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Describe a pod
+    Describe {
+        /// Pod name
+        pod: String,
+        /// Namespace (default: "default")
+        #[arg(short, long, default_value = "default")]
+        namespace: String,
+    },
+    /// Delete a pod
+    DeletePod {
+        /// Pod name
+        pod: String,
+        /// Namespace (default: "default")
+        #[arg(short, long, default_value = "default")]
+        namespace: String,
+    },
+    /// Restart a pod (delete and let deployment recreate)
+    RestartPod {
+        /// Pod name
+        pod: String,
+        /// Namespace (default: "default")
+        #[arg(short, long, default_value = "default")]
+        namespace: String,
+    },
+    /// Execute a shell in a pod
+    Exec {
+        /// Pod name
+        pod: String,
+        /// Namespace (default: "default")
+        #[arg(short, long, default_value = "default")]
+        namespace: String,
+        /// Container name (for multi-container pods)
+        #[arg(long)]
+        container: Option<String>,
+        /// Command to execute (default: /bin/sh)
+        #[arg(long, default_value = "/bin/sh")]
+        cmd: String,
+    },
+    /// Run docker CLI against the cluster's Docker daemon (bypasses Docker Desktop proxy)
+    #[command(trailing_var_arg = true)]
+    Docker {
+        /// Arguments passed to docker CLI
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 impl CliCommand {
-    fn as_cluster_action(&self) -> ClusterAction {
+    fn as_cluster_action(&self) -> Option<ClusterAction> {
         match self {
-            CliCommand::Start => ClusterAction::Start,
-            CliCommand::Stop => ClusterAction::Stop,
-            CliCommand::Restart => ClusterAction::Restart,
-            CliCommand::Destroy => ClusterAction::Destroy,
-            CliCommand::Info => ClusterAction::Info,
+            CliCommand::Start => Some(ClusterAction::Start),
+            CliCommand::Stop => Some(ClusterAction::Stop),
+            CliCommand::Restart => Some(ClusterAction::Restart),
+            CliCommand::Destroy => Some(ClusterAction::Destroy),
+            CliCommand::Info => Some(ClusterAction::Info),
+            CliCommand::DeleteSnapshots => Some(ClusterAction::DeleteSnapshots),
+            _ => None,
         }
     }
 }
@@ -98,7 +174,50 @@ async fn main() -> Result<()> {
 
     // If a subcommand was given, run headlessly (no TUI)
     if let Some(cmd) = &cli.command {
-        let exit_code = cli::run_cli_action(cmd.as_cluster_action(), cli.config.as_deref()).await?;
+        let config_path = cli.config.as_deref();
+        let exit_code = match cmd {
+            CliCommand::Docker { args } => run_docker_passthrough(args, config_path).await?,
+            CliCommand::Diagnostics => cli::run_cli_diagnostics(config_path).await?,
+            CliCommand::UpdateHosts => cli::run_cli_update_hosts(config_path).await?,
+            CliCommand::Pods { namespace } => {
+                cli::run_cli_pods(config_path, namespace.as_deref()).await?
+            }
+            CliCommand::Logs {
+                pod,
+                namespace,
+                container,
+                tail,
+                follow,
+            } => {
+                cli::run_cli_logs(config_path, pod, namespace, container.as_deref(), *tail, *follow)
+                    .await?
+            }
+            CliCommand::Describe { pod, namespace } => {
+                cli::run_cli_describe(config_path, pod, namespace).await?
+            }
+            CliCommand::DeletePod { pod, namespace } => {
+                cli::run_cli_delete_pod(config_path, pod, namespace).await?
+            }
+            CliCommand::RestartPod { pod, namespace } => {
+                cli::run_cli_restart_pod(config_path, pod, namespace).await?
+            }
+            CliCommand::Exec {
+                pod,
+                namespace,
+                container,
+                cmd: shell_cmd,
+            } => {
+                cli::run_cli_exec(config_path, pod, namespace, container.as_deref(), shell_cmd)
+                    .await?
+            }
+            _ => {
+                if let Some(action) = cmd.as_cluster_action() {
+                    cli::run_cli_action(action, config_path).await?
+                } else {
+                    0
+                }
+            }
+        };
         std::process::exit(exit_code);
     }
 
@@ -127,6 +246,154 @@ async fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// Run docker CLI with DOCKER_HOST pointing to the raw Docker daemon socket relay.
+/// On macOS, Docker Desktop's proxy filters container visibility. This command
+/// starts a socat relay (if not running) and passes all args to `docker`.
+async fn run_docker_passthrough(args: &[String], config_path: Option<&str>) -> Result<i32> {
+    let loader = config::ConfigLoader::new(config_path);
+    let config = loader.load().unwrap_or_default();
+    let cluster_config = cluster::ClusterConfig::from(config.infrastructure);
+
+    // Check container is running
+    let docker = cluster::DockerManager::new(
+        cluster::PlatformInfo::find_docker_socket_sync(),
+    )?;
+    let running = docker
+        .container_running(&cluster_config.container_name)
+        .await;
+    if !running {
+        eprintln!("Cluster is not running. Start it first with: k3dev start");
+        return Ok(1);
+    }
+
+    // Find the relay port — check if socat is already listening on a port
+    let relay_port = find_or_start_docker_relay(&docker, &cluster_config.container_name).await?;
+
+    // Pass through to docker CLI
+    let status = std::process::Command::new("docker")
+        .args(args)
+        .env("DOCKER_HOST", format!("tcp://localhost:{}", relay_port))
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to run docker: {}", e))?;
+
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Find an existing socat relay or start a new one. Returns the host port.
+async fn find_or_start_docker_relay(
+    docker: &cluster::DockerManager,
+    container_name: &str,
+) -> Result<u16> {
+    // Check if socat is already running on any port
+    let ps_output = docker
+        .exec_in_container(container_name, &["sh", "-c", "ps aux 2>/dev/null | grep 'socat TCP-LISTEN' | grep -v grep"])
+        .await
+        .unwrap_or_default();
+
+    if let Some(port) = parse_socat_port(&ps_output) {
+        return Ok(port);
+    }
+
+    // Discover which port was published for the relay by inspecting the container
+    let port = discover_published_relay_port(container_name)
+        .unwrap_or_else(|| cluster::find_available_port(2375).unwrap_or(2375));
+
+    // Ensure socat binary exists — install if missing via docker cp
+    let socat_check = docker
+        .exec_in_container(container_name, &["ls", "/usr/local/bin/socat"])
+        .await;
+    if socat_check.is_err() {
+        #[cfg(target_arch = "aarch64")]
+        const SOCAT_BINARY: &[u8] = include_bytes!("../assets/socat-aarch64");
+        #[cfg(target_arch = "x86_64")]
+        const SOCAT_BINARY: &[u8] = include_bytes!("../assets/socat-x86_64");
+
+        let tmp = std::env::temp_dir().join("k3dev-socat");
+        std::fs::write(&tmp, SOCAT_BINARY)?;
+        let _ = std::process::Command::new("docker")
+            .args(["exec", container_name, "mkdir", "-p", "/usr/local/bin"])
+            .output();
+        let cp_status = std::process::Command::new("docker")
+            .args(["cp", tmp.to_str().unwrap(), &format!("{}:/usr/local/bin/socat", container_name)])
+            .output();
+        let _ = std::fs::remove_file(&tmp);
+        if cp_status.is_err() || !cp_status.unwrap().status.success() {
+            anyhow::bail!("Failed to install socat in container");
+        }
+        let _ = std::process::Command::new("docker")
+            .args(["exec", container_name, "chmod", "+x", "/usr/local/bin/socat"])
+            .output();
+    }
+
+    // Start socat relay via docker exec -d
+    let output = std::process::Command::new("docker")
+        .args([
+            "exec", "-d", container_name,
+            "/usr/local/bin/socat",
+            &format!("TCP-LISTEN:{},fork,reuseaddr,bind=0.0.0.0", port),
+            "UNIX-CONNECT:/proc/1/root/run/docker.sock",
+        ])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to start docker relay: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to start docker relay: {}", stderr);
+    }
+
+    // Brief wait for socat to bind
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    Ok(port)
+}
+
+/// Discover the published relay port by inspecting container port bindings.
+/// Looks for a published port in the 2375-2474 range (Docker API relay).
+fn discover_published_relay_port(container_name: &str) -> Option<u16> {
+    let output = std::process::Command::new("docker")
+        .args(["inspect", "--format", "{{json .NetworkSettings.Ports}}", container_name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let ports_json = String::from_utf8_lossy(&output.stdout);
+    // Look for port mappings in the relay range 2375-2474
+    for port in 2375..2475u16 {
+        let key = format!("{}/tcp", port);
+        if ports_json.contains(&key) {
+            // Extract the HostPort value
+            let pattern = format!("\"{}\":[{{\"HostIp\":", key);
+            if let Some(idx) = ports_json.find(&pattern) {
+                let after = &ports_json[idx + pattern.len()..];
+                if let Some(hp_idx) = after.find("\"HostPort\":\"") {
+                    let hp_start = hp_idx + 12;
+                    let hp_end = after[hp_start..].find('"').unwrap_or(0) + hp_start;
+                    if let Ok(host_port) = after[hp_start..hp_end].parse::<u16>() {
+                        return Some(host_port);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse the listening port from socat process listing
+fn parse_socat_port(ps_output: &str) -> Option<u16> {
+    // Look for "TCP-LISTEN:NNNN" in process listing
+    for line in ps_output.lines() {
+        if let Some(idx) = line.find("TCP-LISTEN:") {
+            let after = &line[idx + 11..];
+            let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(port) = port_str.parse::<u16>() {
+                return Some(port);
+            }
+        }
+    }
+    None
 }
 
 async fn run_app(

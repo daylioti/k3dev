@@ -249,7 +249,7 @@ impl App {
             pending_pods_cache: Vec::new(),
             pull_progress_cache: HashMap::new(),
             active_pull_monitors: HashSet::new(),
-            docker_client: Docker::connect_with_defaults().ok(),
+            docker_client: crate::cluster::PlatformInfo::connect_docker().ok(),
             image_arch_cache: HashMap::new(),
             image_arch_check_pending: false,
             shell_session: None,

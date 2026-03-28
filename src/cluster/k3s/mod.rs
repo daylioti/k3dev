@@ -286,7 +286,7 @@ impl K3sManager {
         let iptables_mode = PlatformInfo::detect_iptables_mode();
 
         // Build port mappings
-        let ports: Vec<(u16, u16)> = self
+        let mut ports: Vec<(u16, u16)> = self
             .config
             .port_mappings()
             .iter()
@@ -300,11 +300,31 @@ impl K3sManager {
             })
             .collect();
 
+        // On macOS, publish a port for the Docker API relay (socat) so
+        // `k3dev docker` can access the raw Docker daemon from the host.
+        // Find an available host port starting from 2375.
+        #[cfg(target_os = "macos")]
+        {
+            let relay_port = crate::cluster::platform::find_available_port(2375).unwrap_or(2375);
+            ports.push((relay_port, relay_port));
+        }
+
         // K3s server command
         // Note: metrics-server is disabled because we use Docker API for metrics
         // servicelb is disabled as it's rarely needed for local development
         // Traefik is enabled (K3s built-in) and configured via HelmChartConfig CRD
         // Optimized flags to disable unnecessary components for faster startup
+        //
+        // On macOS (Docker Desktop), the mounted Docker socket is a proxy that filters
+        // container visibility, breaking cri-dockerd. The container runs with --pid=host,
+        // so we can access the VM's raw Docker socket at /proc/1/root/run/docker.sock.
+        // Use --container-runtime-endpoint to tell cri-dockerd to use the raw socket.
+        let docker_endpoint = if cfg!(target_os = "macos") {
+            " --container-runtime-endpoint /proc/1/root/run/docker.sock"
+        } else {
+            ""
+        };
+
         let k3s_command = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -313,20 +333,23 @@ impl K3sManager {
                  sysctl -w net.bridge.bridge-nf-call-iptables=1 2>/dev/null || true && \
                  mkdir -p /run/k3s /sys/fs/cgroup/kubepods && \
                  /bin/k3s server \
-                 --docker \
+                 --docker{docker_endpoint} \
                  --disable=metrics-server \
                  --disable=servicelb \
                  --disable-cloud-controller \
                  --disable-network-policy \
                  --flannel-backend=host-gw \
-                 --default-local-storage-path {} \
+                 --default-local-storage-path {pv} \
                  --service-node-port-range 80-32767 \
-                 --kubelet-arg=root-dir={} \
-                 --kubelet-arg=cgroup-driver={} \
+                 --kubelet-arg=root-dir={kubelet} \
+                 --kubelet-arg=cgroup-driver={cgroup} \
                  --kube-apiserver-arg=profiling=false \
                  --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
                  --kube-controller-manager-arg=concurrent-deployment-syncs=1",
-                pv_storage_path, kubelet_root, cgroup_driver
+                docker_endpoint = docker_endpoint,
+                pv = pv_storage_path,
+                kubelet = kubelet_root,
+                cgroup = cgroup_driver
             ),
         ];
 
@@ -368,15 +391,16 @@ impl K3sManager {
             tracing::info!(docker_host = %url, "TCP Docker detected, passing DOCKER_HOST to k3s container");
             env.push(("DOCKER_HOST".to_string(), url.clone()));
         } else {
-            // Unix socket Docker: mount the socket file
+            // Mount the Docker socket for the container
             volumes.insert(
                 0,
                 (
-                    socket_path.to_string_lossy().to_string(),
+                    self.platform.docker_socket_mount_source(&socket_path),
                     "/var/run/docker.sock".to_string(),
                     String::new(),
                 ),
             );
+
         }
 
         let run_config = ContainerRunConfig {
