@@ -63,25 +63,33 @@ jobs:
             ~/.cargo/git
             target
             agent/target
+            assets
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
-      - name: Build embedded assets
+      - name: Prepare embedded assets
         run: |
-          # Build agent + socat for x86_64 (native)
-          ./scripts/build-assets.sh --ci
+          mkdir -p assets
 
-          # For aarch64 targets, build real aarch64 agent via cross
+          # Build k3dev-agent for x86_64 natively (build.rs handles this too,
+          # but pre-building avoids redundant work during cross compilation)
+          ./scripts/build-agent.sh
+
+          # For aarch64 targets, also cross-build the aarch64 agent
           if [[ "${{ matrix.target }}" == aarch64* ]]; then
             cross build --release --target aarch64-unknown-linux-musl --manifest-path agent/Cargo.toml
             cp agent/target/aarch64-unknown-linux-musl/release/k3dev-agent assets/k3dev-agent-aarch64
-
-            # Build aarch64 socat via cross-compilation container
-            cross run --target aarch64-unknown-linux-musl -- echo "cross works" || true
-            # Fallback: use placeholder for socat-aarch64 in cross builds
-            # The x86_64 socat is real; aarch64 uses the native build script on ARM runners
           fi
+
+          # Socat is downloaded automatically by build.rs from GitHub releases.
+          # Placeholders are created for any arch that can't be resolved.
+          # Create non-host arch placeholders so include_bytes! compiles.
+          for arch in x86_64 aarch64; do
+            for bin in socat k3dev-agent; do
+              [[ -f "assets/${bin}-${arch}" ]] || echo -n "placeholder" > "assets/${bin}-${arch}"
+            done
+          done
 
       - name: Build (native)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -151,12 +159,10 @@ jobs:
             ~/.cargo/git
             target
             agent/target
+            assets
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
-
-      - name: Build embedded assets (macOS placeholders)
-        run: ./scripts/build-assets.sh --macos
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}

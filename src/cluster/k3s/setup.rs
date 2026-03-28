@@ -106,13 +106,9 @@ impl K3sManager {
             return Ok(());
         }
 
-        self.install_binary_via_docker_cp(
-            SOCAT_BINARY,
-            "socat",
-            "/usr/local/bin/socat",
-        )
-        .await
-        .context("Failed to install socat")?;
+        self.install_binary_via_docker_cp(SOCAT_BINARY, "socat", "/usr/local/bin/socat")
+            .await
+            .context("Failed to install socat")?;
 
         self.docker
             .exec_in_container(&self.config.container_name, &["socat", "-V"])

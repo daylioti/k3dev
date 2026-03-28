@@ -1,11 +1,21 @@
 //! Build script: ensures Linux binaries (k3dev-agent, socat) exist in assets/.
-//! On macOS, these run inside the k3s Linux container, so we cross-compile via Docker.
-//! On Linux, we compile natively with musl.
+//!
+//! Asset resolution order for socat:
+//!   1. Already exists as valid ELF → skip
+//!   2. Download pre-built binary from GitHub releases
+//!   3. Build from source via Docker
+//!   4. Build from source natively (Linux with musl-tools)
+//!   5. Create placeholder (macOS CI — compilation check only)
+//!
+//! k3dev-agent is always built from source (it's part of this repo).
+//!
+//! Override the download URL with K3DEV_ASSET_URL env var.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SOCAT_VERSION: &str = "1.8.0.3";
+const GITHUB_REPO: &str = "daylioti/k3dev";
 
 fn main() {
     let project_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -23,12 +33,14 @@ fn main() {
         let socat_path = assets_dir.join(format!("socat-{}", arch));
 
         if *arch == host_arch {
-            // Build real binaries for the host architecture
+            // Socat: download first, fallback to building from source
+            if needs_build(&socat_path) {
+                acquire_socat(&assets_dir, arch);
+            }
+
+            // Agent: build from source (it's part of this repo)
             if needs_build(&agent_path) {
                 build_agent(&agent_dir, &assets_dir, arch);
-            }
-            if needs_build(&socat_path) {
-                build_socat(&assets_dir, arch);
             }
         } else {
             // Create placeholder for non-host arch (guarded by #[cfg(target_arch)])
@@ -61,144 +73,91 @@ fn needs_build(path: &Path) -> bool {
     false
 }
 
-fn build_agent(agent_dir: &Path, assets_dir: &Path, arch: &str) {
-    let target = format!("{}-unknown-linux-musl", arch);
-    let dest = assets_dir.join(format!("k3dev-agent-{}", arch));
+// ---------------------------------------------------------------------------
+// Socat: download → Docker build → native build → placeholder
+// ---------------------------------------------------------------------------
 
-    println!("cargo:warning=Building k3dev-agent for {} ...", arch);
-
-    // Try Docker-based build (works on macOS and Linux without musl toolchain)
-    if try_docker_build_agent(agent_dir, assets_dir, arch, &target) {
+fn acquire_socat(assets_dir: &Path, arch: &str) {
+    // 1. Try downloading pre-built binary from GitHub releases
+    if try_download_socat(assets_dir, arch) {
         return;
     }
 
-    // Fallback: native musl build (Linux with musl-tools installed)
-    let _ = Command::new("rustup")
-        .args(["target", "add", &target])
-        .status();
-
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--target",
-            &target,
-            "--manifest-path",
-            agent_dir.join("Cargo.toml").to_str().unwrap(),
-        ])
-        .status();
-
-    if let Ok(s) = status {
-        if s.success() {
-            let built = agent_dir
-                .join("target")
-                .join(&target)
-                .join("release")
-                .join("k3dev-agent");
-            if built.exists() {
-                std::fs::copy(&built, &dest).unwrap();
-                println!("cargo:warning=Built k3dev-agent-{} (native musl)", arch);
-                return;
-            }
-        }
-    }
-
-    panic!(
-        "Failed to build k3dev-agent-{}. Install Docker or musl-tools.",
-        arch
-    );
-}
-
-fn try_docker_build_agent(
-    agent_dir: &Path,
-    assets_dir: &Path,
-    arch: &str,
-    _target: &str,
-) -> bool {
-    // Check Docker is available
-    if Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_or(false, |s| s.success())
-        == false
-    {
-        return false;
-    }
-
-    let dest = assets_dir.join(format!("k3dev-agent-{}", arch));
-    let platform = match arch {
-        "aarch64" => "linux/arm64",
-        "x86_64" => "linux/amd64",
-        _ => return false,
-    };
-
-    let status = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--platform",
-            platform,
-            "-v",
-            &format!("{}:/work", agent_dir.display()),
-            "-v",
-            &format!("{}:/out", assets_dir.display()),
-            "-w",
-            "/work",
-            "rust:1.86-alpine",
-            "sh",
-            "-c",
-            &format!(
-                "apk add -q musl-dev && \
-                 cargo build --release && \
-                 strip target/release/k3dev-agent && \
-                 cp target/release/k3dev-agent /out/k3dev-agent-{}",
-                arch
-            ),
-        ])
-        .status();
-
-    if let Ok(s) = status {
-        if s.success() && dest.exists() && needs_build(&dest) == false {
-            println!("cargo:warning=Built k3dev-agent-{} (Docker)", arch);
-            return true;
-        }
-    }
-
-    false
-}
-
-fn build_socat(assets_dir: &Path, arch: &str) {
-    println!("cargo:warning=Building socat {} for {} ...", SOCAT_VERSION, arch);
-
-    // Try Docker-based build (works on macOS and Linux)
+    // 2. Try Docker-based build
     if try_docker_build_socat(assets_dir, arch) {
         return;
     }
 
-    // Fallback: native build (Linux only)
+    // 3. Try native build (Linux only)
     if cfg!(target_os = "linux") && try_native_build_socat(assets_dir, arch) {
         return;
     }
 
-    panic!(
-        "Failed to build socat-{}. Install Docker or build dependencies (gcc, musl-tools, autoconf).",
+    // 4. Create placeholder as last resort (e.g. macOS CI without Docker)
+    let dest = assets_dir.join(format!("socat-{}", arch));
+    std::fs::write(&dest, "placeholder").unwrap();
+    println!(
+        "cargo:warning=Could not download or build socat-{}. Created placeholder.",
         arch
     );
+    println!("cargo:warning=Run the build-assets GitHub workflow to publish pre-built binaries,");
+    println!("cargo:warning=or install Docker to build from source.");
+}
+
+fn try_download_socat(assets_dir: &Path, arch: &str) -> bool {
+    let dest = assets_dir.join(format!("socat-{}", arch));
+    let base_url = std::env::var("K3DEV_ASSET_URL").unwrap_or_else(|_| {
+        format!(
+            "https://github.com/{}/releases/download/socat-{}",
+            GITHUB_REPO, SOCAT_VERSION
+        )
+    });
+    let url = format!("{}/socat-{}", base_url, arch);
+
+    println!("cargo:warning=Downloading socat-{} ...", arch);
+
+    let status = Command::new("curl")
+        .args([
+            "-sSfL",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "60",
+            &url,
+            "-o",
+            dest.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    if let Ok(s) = status {
+        if s.success() && !needs_build(&dest) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+            }
+            println!("cargo:warning=Downloaded socat-{}", arch);
+            return true;
+        }
+    }
+
+    // Clean up partial/invalid download
+    let _ = std::fs::remove_file(&dest);
+    println!("cargo:warning=Download failed, falling back to building from source...");
+    false
 }
 
 fn try_docker_build_socat(assets_dir: &Path, arch: &str) -> bool {
-    if Command::new("docker")
-        .args(["info"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_or(false, |s| s.success())
-        == false
-    {
+    if !docker_available() {
         return false;
     }
+
+    println!(
+        "cargo:warning=Building socat {} for {} via Docker...",
+        SOCAT_VERSION, arch
+    );
 
     let dest = assets_dir.join(format!("socat-{}", arch));
     let platform = match arch {
@@ -245,6 +204,11 @@ fn try_docker_build_socat(assets_dir: &Path, arch: &str) -> bool {
 }
 
 fn try_native_build_socat(assets_dir: &Path, arch: &str) -> bool {
+    println!(
+        "cargo:warning=Building socat {} for {} natively...",
+        SOCAT_VERSION, arch
+    );
+
     let dest = assets_dir.join(format!("socat-{}", arch));
     let tmpdir = std::env::temp_dir().join(format!("k3dev-socat-build-{}", arch));
     let _ = std::fs::remove_dir_all(&tmpdir);
@@ -291,4 +255,119 @@ fn try_native_build_socat(assets_dir: &Path, arch: &str) -> bool {
     }
 
     false
+}
+
+// ---------------------------------------------------------------------------
+// k3dev-agent: Docker build → native musl build → placeholder
+// ---------------------------------------------------------------------------
+
+fn build_agent(agent_dir: &Path, assets_dir: &Path, arch: &str) {
+    let target = format!("{}-unknown-linux-musl", arch);
+    let dest = assets_dir.join(format!("k3dev-agent-{}", arch));
+
+    println!("cargo:warning=Building k3dev-agent for {} ...", arch);
+
+    // Try Docker-based build (works on macOS and Linux without musl toolchain)
+    if try_docker_build_agent(agent_dir, assets_dir, arch, &target) {
+        return;
+    }
+
+    // Fallback: native musl build (Linux with musl-tools installed)
+    let _ = Command::new("rustup")
+        .args(["target", "add", &target])
+        .status();
+
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--target",
+            &target,
+            "--manifest-path",
+            agent_dir.join("Cargo.toml").to_str().unwrap(),
+        ])
+        .status();
+
+    if let Ok(s) = status {
+        if s.success() {
+            let built = agent_dir
+                .join("target")
+                .join(&target)
+                .join("release")
+                .join("k3dev-agent");
+            if built.exists() {
+                std::fs::copy(&built, &dest).unwrap();
+                println!("cargo:warning=Built k3dev-agent-{} (native musl)", arch);
+                return;
+            }
+        }
+    }
+
+    // Create placeholder as last resort (e.g. macOS CI without Docker)
+    std::fs::write(&dest, "placeholder").unwrap();
+    println!(
+        "cargo:warning=Could not build k3dev-agent-{}. Created placeholder.",
+        arch
+    );
+    println!("cargo:warning=Install Docker or musl-tools to build real binaries.");
+}
+
+fn try_docker_build_agent(agent_dir: &Path, assets_dir: &Path, arch: &str, _target: &str) -> bool {
+    if !docker_available() {
+        return false;
+    }
+
+    let dest = assets_dir.join(format!("k3dev-agent-{}", arch));
+    let platform = match arch {
+        "aarch64" => "linux/arm64",
+        "x86_64" => "linux/amd64",
+        _ => return false,
+    };
+
+    let status = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--platform",
+            platform,
+            "-v",
+            &format!("{}:/work", agent_dir.display()),
+            "-v",
+            &format!("{}:/out", assets_dir.display()),
+            "-w",
+            "/work",
+            "rust:1.86-alpine",
+            "sh",
+            "-c",
+            &format!(
+                "apk add -q musl-dev && \
+                 cargo build --release && \
+                 strip target/release/k3dev-agent && \
+                 cp target/release/k3dev-agent /out/k3dev-agent-{}",
+                arch
+            ),
+        ])
+        .status();
+
+    if let Ok(s) = status {
+        if s.success() && dest.exists() && !needs_build(&dest) {
+            println!("cargo:warning=Built k3dev-agent-{} (Docker)", arch);
+            return true;
+        }
+    }
+
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn docker_available() -> bool {
+    Command::new("docker")
+        .args(["info"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }

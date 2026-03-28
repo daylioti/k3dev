@@ -34,12 +34,10 @@ jobs:
             ~/.cargo/git
             target
             agent/target
+            assets
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Build embedded assets
-        run: ./scripts/build-assets.sh --ci
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -72,12 +70,10 @@ jobs:
             ~/.cargo/git
             target
             agent/target
+            assets
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Build embedded assets (macOS placeholders)
-        run: ./scripts/build-assets.sh --macos
 
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings

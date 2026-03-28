@@ -192,10 +192,7 @@ pub async fn run_cli_diagnostics(config_path: Option<&str>) -> Result<i32> {
                             last_category = result.category.to_string();
                             println!("\x1b[1;36m── {} ──\x1b[0m", last_category);
                         }
-                        println!(
-                            "  \x1b[90m⊘ {} (skipped: {})\x1b[0m",
-                            result.name, reason
-                        );
+                        println!("  \x1b[90m⊘ {} (skipped: {})\x1b[0m", result.name, reason);
                         printed_count = i + 1;
                     }
                     DiagnosticStatus::Pending => {}
@@ -281,10 +278,7 @@ pub async fn run_cli_update_hosts(config_path: Option<&str>) -> Result<i32> {
             Ok(0)
         }
         HostsUpdateResult::WrittenDirectly { count } => {
-            println!(
-                "\x1b[32m✓ Updated /etc/hosts with {} entries\x1b[0m",
-                count
-            );
+            println!("\x1b[32m✓ Updated /etc/hosts with {} entries\x1b[0m", count);
             Ok(0)
         }
         HostsUpdateResult::NeedsSudo { content, count } => {
@@ -470,7 +464,10 @@ pub async fn run_cli_delete_pod(
         }
     };
 
-    println!("Deleting pod \x1b[1m{}\x1b[0m in namespace \x1b[1m{}\x1b[0m...", pod, namespace);
+    println!(
+        "Deleting pod \x1b[1m{}\x1b[0m in namespace \x1b[1m{}\x1b[0m...",
+        pod, namespace
+    );
 
     match k8s_client.delete_pod(namespace, pod).await {
         Ok(_) => {

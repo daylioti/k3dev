@@ -1,0 +1,98 @@
+name: Build Assets
+
+# Builds and publishes pre-built socat binaries to a GitHub release.
+# Run this manually when updating the socat version.
+# The release tag (e.g. socat-1.8.0.3) is used by build.rs to download binaries.
+
+on:
+  workflow_dispatch:
+    inputs:
+      socat_version:
+        description: 'Socat version to build'
+        required: true
+        default: '1.8.0.3'
+
+jobs:
+  build-socat:
+    name: Build socat (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+
+    steps:
+      - name: Set up QEMU
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build socat ${{ inputs.socat_version }} for ${{ matrix.arch }}
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "$PWD:/out" \
+            alpine:3.21 sh -c "
+              apk add -q build-base linux-headers && \
+              wget -q http://www.dest-unreach.org/socat/download/socat-${{ inputs.socat_version }}.tar.gz \
+                -O /tmp/socat.tar.gz && \
+              cd /tmp && tar xzf socat.tar.gz && cd socat-${{ inputs.socat_version }} && \
+              CFLAGS='-static -Os' LDFLAGS='-static -s' ./configure \
+                --disable-openssl --disable-readline --disable-libwrap --disable-fips \
+                >/dev/null 2>&1 && \
+              make -j\$(nproc) >/dev/null 2>&1 && \
+              strip socat && \
+              cp socat /out/socat-${{ matrix.arch }}"
+
+      - name: Verify binary
+        run: |
+          file socat-${{ matrix.arch }}
+          ls -lh socat-${{ matrix.arch }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: socat-${{ matrix.arch }}
+          path: socat-${{ matrix.arch }}
+
+  publish:
+    name: Publish release
+    needs: build-socat
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          cp assets/socat-x86_64/socat-x86_64 release/
+          cp assets/socat-aarch64/socat-aarch64 release/
+          cd release
+          sha256sum socat-* > checksums.sha256
+          cat checksums.sha256
+          ls -lh
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: socat-${{ inputs.socat_version }}
+          name: "socat ${{ inputs.socat_version }} (pre-built static binaries)"
+          body: |
+            Pre-built static socat binaries for embedding in k3dev.
+
+            These are downloaded automatically by `build.rs` during `cargo build`.
+            To override the download URL, set `K3DEV_ASSET_URL` env var.
+
+            **Socat version:** ${{ inputs.socat_version }}
+            **Build:** static musl, no OpenSSL/readline/libwrap/FIPS
+          files: |
+            release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

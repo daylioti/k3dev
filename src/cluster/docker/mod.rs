@@ -32,7 +32,7 @@ use bollard::ClientVersion;
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
@@ -56,7 +56,7 @@ impl DockerManager {
 
     /// Connect to Docker using the resolved socket path.
     /// Falls back to DOCKER_HOST / default if the path doesn't exist (TCP/remote).
-    fn connect(socket_path: &PathBuf) -> Result<Docker> {
+    fn connect(socket_path: &Path) -> Result<Docker> {
         // If the socket file exists on disk, connect directly to it.
         // This handles Docker Desktop on macOS (~/.docker/run/docker.sock)
         // and other non-default socket locations.

@@ -189,8 +189,15 @@ async fn main() -> Result<()> {
                 tail,
                 follow,
             } => {
-                cli::run_cli_logs(config_path, pod, namespace, container.as_deref(), *tail, *follow)
-                    .await?
+                cli::run_cli_logs(
+                    config_path,
+                    pod,
+                    namespace,
+                    container.as_deref(),
+                    *tail,
+                    *follow,
+                )
+                .await?
             }
             CliCommand::Describe { pod, namespace } => {
                 cli::run_cli_describe(config_path, pod, namespace).await?
@@ -257,9 +264,7 @@ async fn run_docker_passthrough(args: &[String], config_path: Option<&str>) -> R
     let cluster_config = cluster::ClusterConfig::from(config.infrastructure);
 
     // Check container is running
-    let docker = cluster::DockerManager::new(
-        cluster::PlatformInfo::find_docker_socket_sync(),
-    )?;
+    let docker = cluster::DockerManager::new(cluster::PlatformInfo::find_docker_socket_sync())?;
     let running = docker
         .container_running(&cluster_config.container_name)
         .await;
@@ -288,7 +293,14 @@ async fn find_or_start_docker_relay(
 ) -> Result<u16> {
     // Check if socat is already running on any port
     let ps_output = docker
-        .exec_in_container(container_name, &["sh", "-c", "ps aux 2>/dev/null | grep 'socat TCP-LISTEN' | grep -v grep"])
+        .exec_in_container(
+            container_name,
+            &[
+                "sh",
+                "-c",
+                "ps aux 2>/dev/null | grep 'socat TCP-LISTEN' | grep -v grep",
+            ],
+        )
         .await
         .unwrap_or_default();
 
@@ -316,21 +328,33 @@ async fn find_or_start_docker_relay(
             .args(["exec", container_name, "mkdir", "-p", "/usr/local/bin"])
             .output();
         let cp_status = std::process::Command::new("docker")
-            .args(["cp", tmp.to_str().unwrap(), &format!("{}:/usr/local/bin/socat", container_name)])
+            .args([
+                "cp",
+                tmp.to_str().unwrap(),
+                &format!("{}:/usr/local/bin/socat", container_name),
+            ])
             .output();
         let _ = std::fs::remove_file(&tmp);
         if cp_status.is_err() || !cp_status.unwrap().status.success() {
             anyhow::bail!("Failed to install socat in container");
         }
         let _ = std::process::Command::new("docker")
-            .args(["exec", container_name, "chmod", "+x", "/usr/local/bin/socat"])
+            .args([
+                "exec",
+                container_name,
+                "chmod",
+                "+x",
+                "/usr/local/bin/socat",
+            ])
             .output();
     }
 
     // Start socat relay via docker exec -d
     let output = std::process::Command::new("docker")
         .args([
-            "exec", "-d", container_name,
+            "exec",
+            "-d",
+            container_name,
             "/usr/local/bin/socat",
             &format!("TCP-LISTEN:{},fork,reuseaddr,bind=0.0.0.0", port),
             "UNIX-CONNECT:/proc/1/root/run/docker.sock",
@@ -353,7 +377,12 @@ async fn find_or_start_docker_relay(
 /// Looks for a published port in the 2375-2474 range (Docker API relay).
 fn discover_published_relay_port(container_name: &str) -> Option<u16> {
     let output = std::process::Command::new("docker")
-        .args(["inspect", "--format", "{{json .NetworkSettings.Ports}}", container_name])
+        .args([
+            "inspect",
+            "--format",
+            "{{json .NetworkSettings.Ports}}",
+            container_name,
+        ])
         .output()
         .ok()?;
     if !output.status.success() {

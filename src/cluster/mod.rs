@@ -82,7 +82,10 @@ impl ClusterManager {
                 Ok(mgr) => self.k3s = Some(mgr),
                 Err(e) => {
                     let _ = output_tx
-                        .send(OutputLine::error(&format!("Failed to initialize cluster manager: {:#}", e)))
+                        .send(OutputLine::error(format!(
+                            "Failed to initialize cluster manager: {:#}",
+                            e
+                        )))
                         .await;
                     return Ok(());
                 }
