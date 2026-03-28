@@ -259,7 +259,8 @@ impl K3sManager {
         let iptables_mode = PlatformInfo::detect_iptables_mode();
 
         // Build port mappings
-        let ports: Vec<(u16, u16)> = self
+        #[allow(unused_mut)]
+        let mut ports: Vec<(u16, u16)> = self
             .config
             .port_mappings()
             .iter()
