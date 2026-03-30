@@ -69,9 +69,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
+      - name: Set up QEMU
+        if: contains(matrix.target, 'aarch64')
+        uses: docker/setup-qemu-action@v3
+
       - name: Prepare embedded assets
         run: |
           mkdir -p assets
+          SOCAT_VERSION="1.8.0.3"
 
           # Build k3dev-agent for x86_64 natively (build.rs handles this too,
           # but pre-building avoids redundant work during cross compilation)
@@ -83,13 +88,54 @@ jobs:
             cp agent/target/aarch64-unknown-linux-musl/release/k3dev-agent assets/k3dev-agent-aarch64
           fi
 
-          # Socat is downloaded automatically by build.rs from GitHub releases.
-          # Placeholders are created for any arch that can't be resolved.
-          # Create non-host arch placeholders so include_bytes! compiles.
+          # Build socat for the target architecture via Docker.
+          # Determine which arch this target needs.
+          case "${{ matrix.target }}" in
+            aarch64*) SOCAT_ARCH="aarch64"; PLATFORM="linux/arm64" ;;
+            *)        SOCAT_ARCH="x86_64";  PLATFORM="linux/amd64" ;;
+          esac
+
+          if [[ ! -f "assets/socat-${SOCAT_ARCH}" ]] || ! file "assets/socat-${SOCAT_ARCH}" | grep -q ELF; then
+            echo "Building socat ${SOCAT_VERSION} for ${SOCAT_ARCH} via Docker..."
+            docker run --rm --platform "${PLATFORM}" \
+              -v "$PWD/assets:/out" \
+              alpine:3.21 sh -c "
+                apk add -q build-base linux-headers && \
+                wget -q http://www.dest-unreach.org/socat/download/socat-${SOCAT_VERSION}.tar.gz \
+                  -O /tmp/socat.tar.gz && \
+                cd /tmp && tar xzf socat.tar.gz && cd socat-${SOCAT_VERSION} && \
+                CFLAGS='-static -Os' LDFLAGS='-static -s' ./configure \
+                  --disable-openssl --disable-readline --disable-libwrap --disable-fips \
+                  >/dev/null 2>&1 && \
+                make -j\$(nproc) >/dev/null 2>&1 && \
+                strip socat && \
+                cp socat /out/socat-${SOCAT_ARCH}"
+            echo "Built socat-${SOCAT_ARCH}"
+          else
+            echo "socat-${SOCAT_ARCH} already exists and is valid ELF"
+          fi
+
+          # Create placeholders for the non-target arch so include_bytes! compiles.
           for arch in x86_64 aarch64; do
             for bin in socat k3dev-agent; do
               [[ -f "assets/${bin}-${arch}" ]] || echo -n "placeholder" > "assets/${bin}-${arch}"
             done
+          done
+
+      - name: Verify embedded assets
+        run: |
+          case "${{ matrix.target }}" in
+            aarch64*) TARGET_ARCH="aarch64" ;;
+            *)        TARGET_ARCH="x86_64" ;;
+          esac
+          for bin in socat k3dev-agent; do
+            asset="assets/${bin}-${TARGET_ARCH}"
+            if ! file "$asset" | grep -q ELF; then
+              echo "::error::${asset} is not a valid ELF binary — build would ship a broken placeholder"
+              file "$asset"
+              exit 1
+            fi
+            echo "OK: $(file "$asset")"
           done
 
       - name: Build (native)
