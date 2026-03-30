@@ -91,29 +91,6 @@ impl Menu {
             }
         }
 
-        // Volumes section (when expanded)
-        if self.volumes_expanded {
-            for entry in &self.volume_entries {
-                // PVC line: "  📦 {name} ({namespace}) {usage}"
-                let ns_len = if entry.namespace == "default" {
-                    0
-                } else {
-                    entry.namespace.chars().count() + 3 // " ({ns})"
-                };
-                let vol_w = 2 + 3 + entry.name.chars().count() as u16 + ns_len as u16 + 20;
-                if vol_w > max_width {
-                    max_width = vol_w;
-                }
-                // Pod lines: "    └ {pod}"
-                for pod in &entry.pods {
-                    let pod_w = 6 + pod.chars().count() as u16;
-                    if pod_w > max_width {
-                        max_width = pod_w;
-                    }
-                }
-            }
-        }
-
         // Forwarded ports section
         for (host_port, container_port) in &self.forwarded_ports {
             // "    {port} → k3s:{port}"
@@ -235,20 +212,6 @@ impl Menu {
             2
         };
 
-        // Calculate how many lines the volumes section will take
-        let volume_lines = if self.volume_entries.is_empty() {
-            0
-        } else if self.volumes_expanded {
-            // separator + header + (pvc_name + pods) per entry
-            2 + self
-                .volume_entries
-                .iter()
-                .map(|e| 1 + e.pods.len().max(1))
-                .sum::<usize>()
-        } else {
-            2 // separator + header
-        };
-
         // Calculate how many lines the forwarded ports section will take
         let has_static_ports = !self.forwarded_ports.is_empty();
         let has_active_ports = !self.active_port_forwards.is_empty();
@@ -266,9 +229,8 @@ impl Menu {
             count
         };
 
-        // Available height for commands (leave room for breadcrumb, volumes, ingress and ports at bottom)
+        // Available height for commands (leave room for breadcrumb, ingress and ports at bottom)
         let commands_height = visible_height
-            .saturating_sub(volume_lines)
             .saturating_sub(ingress_lines)
             .saturating_sub(ports_lines)
             .saturating_sub(1);
@@ -327,9 +289,6 @@ impl Menu {
 
         // Add command lines to main lines
         lines.extend(command_lines);
-
-        // Render volumes section (between commands and ingress)
-        self.render_volumes_section(&mut lines, &inner);
 
         // Render ingress section
         self.render_ingress_section(&mut lines, &inner);
@@ -494,105 +453,6 @@ impl Menu {
         }
     }
 
-    /// Render volumes/PVC section
-    fn render_volumes_section(&self, lines: &mut Vec<Line>, inner: &Rect) {
-        if self.volume_entries.is_empty() {
-            return;
-        }
-
-        // Separator
-        lines.push(Line::from(Span::styled(
-            "\u{2500}".repeat(inner.width as usize),
-            self.styles.muted_text,
-        )));
-
-        // Header
-        let expand_icon = if self.volumes_expanded {
-            "\u{25bc}"
-        } else {
-            "\u{25b6}"
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{} \u{1f4be} Volumes", expand_icon),
-            self.styles.group_header,
-        )));
-
-        if !self.volumes_expanded {
-            return;
-        }
-
-        for entry in &self.volume_entries {
-            // PVC name with namespace + usage info on the same line
-            let ns_label = if entry.namespace == "default" {
-                String::new()
-            } else {
-                format!(" ({})", entry.namespace)
-            };
-
-            let usage_info = match entry.used_bytes {
-                Some(used) if entry.capacity_bytes > 0 => {
-                    let percent =
-                        (used as f64 / entry.capacity_bytes as f64 * 100.0).min(100.0) as u8;
-                    format!(
-                        " {}/{} ({}%)",
-                        format_bytes(used),
-                        format_bytes(entry.capacity_bytes),
-                        percent,
-                    )
-                }
-                Some(used) => format!(" {}", format_bytes(used)),
-                None if entry.capacity_bytes > 0 => {
-                    format!(" {}", format_bytes(entry.capacity_bytes))
-                }
-                None => String::new(),
-            };
-
-            let usage_style = match entry.used_bytes {
-                Some(used) if entry.capacity_bytes > 0 => {
-                    let percent =
-                        (used as f64 / entry.capacity_bytes as f64 * 100.0).min(100.0) as u8;
-                    if percent >= 90 {
-                        self.styles.error_text
-                    } else if percent >= 80 {
-                        self.styles.warning_text
-                    } else {
-                        self.styles.muted_text
-                    }
-                }
-                _ => self.styles.muted_text,
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  \u{1f4e6} {}{}", entry.name, ns_label),
-                    self.styles.group_header,
-                ),
-                Span::styled(usage_info, usage_style),
-            ]));
-
-            // Pod list
-            if entry.pods.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "    \u{2514} (no pods)",
-                    self.styles.muted_text,
-                )));
-            } else {
-                let pod_count = entry.pods.len();
-                for (i, pod) in entry.pods.iter().enumerate() {
-                    let branch = if i == pod_count - 1 {
-                        "\u{2514}"
-                    } else {
-                        "\u{251c}"
-                    };
-                    lines.push(Line::from(Span::styled(
-                        format!("    {} {}", branch, pod),
-                        self.styles.normal_text,
-                    )));
-                }
-            }
-        }
-    }
-
     /// Render missing hosts help message at the bottom
     fn render_missing_hosts_help(&self, lines: &mut Vec<Line>, visible_height: usize) {
         if self.missing_hosts.is_empty() {
@@ -621,18 +481,5 @@ impl Menu {
             Span::styled("H", self.styles.warning_text.add_modifier(Modifier::BOLD)),
             Span::styled(" to add", self.styles.muted_text),
         ]));
-    }
-}
-
-/// Format bytes as human-readable (Ki/Mi/Gi)
-fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1}Gi", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1}Mi", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.0}Ki", bytes as f64 / 1024.0)
-    } else {
-        format!("{}B", bytes)
     }
 }

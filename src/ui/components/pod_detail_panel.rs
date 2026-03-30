@@ -1,4 +1,4 @@
-//! Pod detail panel — tabbed split view showing Logs, Describe, Timeline, Shell
+//! Pod detail panel — tabbed split view showing Logs, Describe, Timeline, Volumes, Shell
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::k8s::PodTimeline;
+use crate::k8s::{PodTimeline, PvcInfo};
 use crate::ui::styles::Styles;
 use crate::ui::theme::Theme;
 
@@ -19,6 +19,7 @@ pub enum DetailTab {
     Logs,
     Describe,
     Timeline,
+    Volumes,
     Shell,
 }
 
@@ -28,7 +29,8 @@ impl DetailTab {
             DetailTab::Logs => 0,
             DetailTab::Describe => 1,
             DetailTab::Timeline => 2,
-            DetailTab::Shell => 3,
+            DetailTab::Volumes => 3,
+            DetailTab::Shell => 4,
         }
     }
 
@@ -37,16 +39,17 @@ impl DetailTab {
             0 => DetailTab::Logs,
             1 => DetailTab::Describe,
             2 => DetailTab::Timeline,
+            3 => DetailTab::Volumes,
             _ => DetailTab::Shell,
         }
     }
 
     fn count() -> usize {
-        4
+        5
     }
 }
 
-/// Tabbed detail panel for pod inspection (Logs, Describe, Timeline, Shell)
+/// Tabbed detail panel for pod inspection (Logs, Describe, Timeline, Volumes, Shell)
 pub struct PodDetailPanel {
     styles: Styles,
     is_open: bool,
@@ -57,11 +60,12 @@ pub struct PodDetailPanel {
     logs_lines: Vec<String>,
     describe_lines: Vec<String>,
     timeline: Option<PodTimeline>,
+    volume_entries: Vec<PvcInfo>,
     shell_view: Option<ShellView>,
     // Per-tab scroll offset (indexed by DetailTab::index)
-    scroll_offsets: [usize; 4],
+    scroll_offsets: [usize; 5],
     // Loading state per tab
-    loading: [bool; 4],
+    loading: [bool; 5],
     // Whether shell mode is active (keyboard input goes to shell)
     shell_interactive: bool,
 }
@@ -77,9 +81,10 @@ impl PodDetailPanel {
             logs_lines: Vec::new(),
             describe_lines: Vec::new(),
             timeline: None,
+            volume_entries: Vec::new(),
             shell_view: None,
-            scroll_offsets: [0; 4],
-            loading: [false; 4],
+            scroll_offsets: [0; 5],
+            loading: [false; 5],
             shell_interactive: false,
         }
     }
@@ -93,9 +98,10 @@ impl PodDetailPanel {
         self.logs_lines.clear();
         self.describe_lines.clear();
         self.timeline = None;
+        // Keep volume_entries — they are updated externally and shared across pods
         self.shell_view = None;
-        self.scroll_offsets = [0; 4];
-        self.loading = [false; 4];
+        self.scroll_offsets = [0; 5];
+        self.loading = [false; 5];
         self.shell_interactive = false;
     }
 
@@ -107,9 +113,10 @@ impl PodDetailPanel {
         self.logs_lines.clear();
         self.describe_lines.clear();
         self.timeline = None;
+        self.volume_entries.clear();
         self.shell_view = None;
-        self.scroll_offsets = [0; 4];
-        self.loading = [false; 4];
+        self.scroll_offsets = [0; 5];
+        self.loading = [false; 5];
         self.shell_interactive = false;
     }
 
@@ -150,10 +157,13 @@ impl PodDetailPanel {
         &self.namespace
     }
 
-    /// Set log content and clear loading flag
+    /// Set log content, clear loading flag, and auto-scroll to bottom
     pub fn set_logs(&mut self, lines: Vec<String>) {
         self.logs_lines = lines;
         self.loading[DetailTab::Logs.index()] = false;
+        // Auto-scroll to bottom so the latest logs are visible;
+        // render() clamps this to the actual max scroll offset.
+        self.scroll_offsets[DetailTab::Logs.index()] = usize::MAX;
     }
 
     /// Set describe content and clear loading flag
@@ -166,6 +176,11 @@ impl PodDetailPanel {
     pub fn set_timeline(&mut self, timeline: PodTimeline) {
         self.timeline = Some(timeline);
         self.loading[DetailTab::Timeline.index()] = false;
+    }
+
+    /// Update volume entries (filtered for this pod by the caller)
+    pub fn set_volume_entries(&mut self, entries: Vec<PvcInfo>) {
+        self.volume_entries = entries;
     }
 
     /// Mark a tab as loading
@@ -245,6 +260,7 @@ impl PodDetailPanel {
             DetailTab::Logs => self.logs_lines.len(),
             DetailTab::Describe => self.describe_lines.len(),
             DetailTab::Timeline => self.build_timeline_lines().len(),
+            DetailTab::Volumes => self.build_volumes_lines().len(),
             DetailTab::Shell => {
                 if self.shell_view.is_some() {
                     0 // VT100 handles its own screen
@@ -260,6 +276,7 @@ impl PodDetailPanel {
             DetailTab::Logs => self.build_logs_lines(),
             DetailTab::Describe => self.build_describe_lines(),
             DetailTab::Timeline => self.build_timeline_lines(),
+            DetailTab::Volumes => self.build_volumes_lines(),
             DetailTab::Shell => self.build_shell_lines(),
         }
     }
@@ -412,6 +429,112 @@ impl PodDetailPanel {
         lines
     }
 
+    fn build_volumes_lines(&self) -> Vec<Line<'_>> {
+        // Filter volumes for the current pod
+        let pod_volumes: Vec<&PvcInfo> = self
+            .volume_entries
+            .iter()
+            .filter(|v| v.pods.iter().any(|p| p == &self.pod_name))
+            .collect();
+
+        if pod_volumes.is_empty() {
+            return vec![Line::from(Span::styled(
+                "  No volumes attached to this pod",
+                self.styles.muted_text,
+            ))];
+        }
+
+        let mut lines: Vec<Line> = Vec::new();
+
+        for entry in &pod_volumes {
+            let ns_label = if entry.namespace == "default" {
+                String::new()
+            } else {
+                format!(" ({})", entry.namespace)
+            };
+
+            // PVC name header
+            lines.push(Line::from(Span::styled(
+                format!("  \u{1f4e6} {}{}", entry.name, ns_label),
+                self.styles.title,
+            )));
+
+            // Storage class and phase
+            if !entry.storage_class.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("    Storage class: ", self.styles.muted_text),
+                    Span::styled(&entry.storage_class, self.styles.normal_text),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::styled("    Phase: ", self.styles.muted_text),
+                Span::styled(&entry.phase, self.styles.normal_text),
+            ]));
+
+            // Usage bar
+            match entry.used_bytes {
+                Some(used) if entry.capacity_bytes > 0 => {
+                    let percent =
+                        (used as f64 / entry.capacity_bytes as f64 * 100.0).min(100.0) as u8;
+                    let bar_width = 20;
+                    let filled = ((percent as f64 / 100.0) * bar_width as f64).round() as usize;
+                    let empty = bar_width - filled;
+
+                    let bar_filled = "\u{2588}".repeat(filled);
+                    let bar_empty = "\u{2591}".repeat(empty);
+
+                    let usage_style = if percent >= 90 {
+                        self.styles.error_text
+                    } else if percent >= 80 {
+                        self.styles.warning_text
+                    } else {
+                        self.styles.success_text
+                    };
+
+                    lines.push(Line::from(vec![
+                        Span::styled("    Usage: ", self.styles.muted_text),
+                        Span::styled(bar_filled, usage_style),
+                        Span::styled(bar_empty, self.styles.muted_text),
+                        Span::styled(
+                            format!(
+                                " {} / {} ({}%)",
+                                format_bytes(used),
+                                format_bytes(entry.capacity_bytes),
+                                percent,
+                            ),
+                            usage_style,
+                        ),
+                    ]));
+                }
+                Some(used) => {
+                    lines.push(Line::from(vec![
+                        Span::styled("    Used: ", self.styles.muted_text),
+                        Span::styled(format_bytes(used), self.styles.normal_text),
+                    ]));
+                }
+                None if entry.capacity_bytes > 0 => {
+                    lines.push(Line::from(vec![
+                        Span::styled("    Capacity: ", self.styles.muted_text),
+                        Span::styled(
+                            format_bytes(entry.capacity_bytes),
+                            self.styles.normal_text,
+                        ),
+                    ]));
+                }
+                None => {
+                    lines.push(Line::from(Span::styled(
+                        "    Not provisioned yet",
+                        self.styles.muted_text,
+                    )));
+                }
+            }
+
+            lines.push(Line::from(""));
+        }
+
+        lines
+    }
+
     fn build_shell_lines(&self) -> Vec<Line<'_>> {
         vec![
             Line::from(""),
@@ -439,6 +562,7 @@ impl PodDetailPanel {
             Line::from("Logs(l)"),
             Line::from("Describe(d)"),
             Line::from("Timeline(t)"),
+            Line::from("Volumes(v)"),
             Line::from(shell_label),
         ];
 
@@ -477,6 +601,19 @@ impl PodDetailPanel {
 
         let paragraph = Paragraph::new(visible_lines);
         frame.render_widget(paragraph, content_area);
+    }
+}
+
+/// Format bytes as human-readable (Ki/Mi/Gi)
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1}Gi", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1}Mi", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.0}Ki", bytes as f64 / 1024.0)
+    } else {
+        format!("{}B", bytes)
     }
 }
 

@@ -340,11 +340,12 @@ impl App {
         if self.focus == FocusArea::PodStats {
             if let KeyCode::Char(c) = code {
                 match c {
-                    'l' | 'd' | 't' | 'e' => {
+                    'l' | 'd' | 't' | 'v' | 'e' => {
                         let tab = match c {
                             'l' => DetailTab::Logs,
                             'd' => DetailTab::Describe,
                             't' => DetailTab::Timeline,
+                            'v' => DetailTab::Volumes,
                             _ => DetailTab::Shell,
                         };
                         self.open_or_switch_detail_tab(tab);

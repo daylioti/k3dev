@@ -123,6 +123,9 @@ pub struct App {
     /// Bollard Docker client for spawning pull monitors
     docker_client: Option<Docker>,
 
+    /// Cache of volume/PVC entries (all volumes, filtered per pod when needed)
+    volume_entries_cache: Vec<crate::k8s::PvcInfo>,
+
     /// Cache of pod image architectures (pod_key → architecture)
     image_arch_cache: HashMap<String, String>,
     /// Whether an image arch check is currently in flight
@@ -158,7 +161,10 @@ pub struct App {
 impl App {
     pub async fn new(config_path: Option<&str>) -> Result<Self> {
         let loader = ConfigLoader::new(config_path);
-        let config = loader.load().unwrap_or_default();
+        let (config, config_file_path) = loader
+            .load_with_path()
+            .map(|(c, p)| (c, Some(p)))
+            .unwrap_or_default();
 
         let validation_result = ConfigValidator::new(&config).validate();
         let validation_warnings: Vec<String> = validation_result
@@ -215,6 +221,7 @@ impl App {
             .clone()
             .or_else(|| Some(cluster_config.container_name.clone()));
         action_bar.set_cluster_name(cluster_name);
+        action_bar.set_config_path(config_file_path);
 
         Ok(Self {
             config,
@@ -250,6 +257,7 @@ impl App {
             pull_progress_cache: HashMap::new(),
             active_pull_monitors: HashSet::new(),
             docker_client: crate::cluster::PlatformInfo::connect_docker().ok(),
+            volume_entries_cache: Vec::new(),
             image_arch_cache: HashMap::new(),
             image_arch_check_pending: false,
             shell_session: None,
@@ -326,6 +334,14 @@ impl App {
                         self.spawn_pod_stats_check();
                         self.spawn_pending_pods_check();
                         self.spawn_pull_progress_check();
+                        // Auto-refresh logs when the Logs tab is visible
+                        if self.pod_detail_panel.is_open()
+                            && self.pod_detail_panel.active_tab() == DetailTab::Logs
+                        {
+                            let pod_name = self.pod_detail_panel.pod_name().to_string();
+                            let namespace = self.pod_detail_panel.namespace().to_string();
+                            self.load_detail_logs(&pod_name, &namespace);
+                        }
                     }
                     RefreshTask::VolumeRefresh => {
                         self.spawn_volume_stats_check();

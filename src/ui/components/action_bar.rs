@@ -1,5 +1,7 @@
+use std::path::PathBuf;
+
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::Modifier,
     text::{Line, Span},
     widgets::Paragraph,
@@ -50,6 +52,7 @@ pub struct ActionBar {
     selected_index: usize,
     styles: Styles,
     cluster_name: Option<String>,
+    config_path: Option<PathBuf>,
 }
 
 impl ActionBar {
@@ -99,12 +102,18 @@ impl ActionBar {
             selected_index: 0,
             styles: Styles::from_theme(theme),
             cluster_name: None,
+            config_path: None,
         }
     }
 
     /// Set the cluster name to display
     pub fn set_cluster_name(&mut self, name: Option<String>) {
         self.cluster_name = name;
+    }
+
+    /// Set the config file path to display
+    pub fn set_config_path(&mut self, path: Option<PathBuf>) {
+        self.config_path = path;
     }
 
     pub fn move_left(&mut self) {
@@ -247,8 +256,23 @@ impl ActionBar {
 
         let line = Line::from(spans);
         let paragraph = Paragraph::new(line);
-
         frame.render_widget(paragraph, area);
+
+        // Render config path right-aligned
+        if let Some(path) = &self.config_path {
+            let path_display = path.to_string_lossy();
+            let home = dirs::home_dir();
+            let short_path = match &home {
+                Some(home_dir) => path_display
+                    .strip_prefix(home_dir.to_string_lossy().as_ref())
+                    .map(|rest| format!("~{}", rest))
+                    .unwrap_or_else(|| path_display.to_string()),
+                None => path_display.to_string(),
+            };
+            let config_line = Line::from(Span::styled(short_path, self.styles.muted_text));
+            let config_paragraph = Paragraph::new(config_line).alignment(Alignment::Right);
+            frame.render_widget(config_paragraph, area);
+        }
     }
 }
 

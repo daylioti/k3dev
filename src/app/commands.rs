@@ -525,11 +525,15 @@ impl App {
             if !self.pod_detail_panel.is_open() {
                 // First open — default to Logs tab
                 self.pod_detail_panel.open(name, ns, DetailTab::Logs);
+                self.pod_detail_panel
+                    .set_volume_entries(self.volume_entries_cache.clone());
                 self.load_active_tab();
             } else if self.pod_detail_panel.pod_name() != name {
                 // Pod changed (e.g. pod list shifted) — refresh
                 let tab = self.pod_detail_panel.active_tab();
                 self.pod_detail_panel.open(name, ns, tab);
+                self.pod_detail_panel
+                    .set_volume_entries(self.volume_entries_cache.clone());
                 self.load_active_tab();
             }
         } else if self.pod_detail_panel.is_open() {
@@ -568,11 +572,12 @@ impl App {
             DetailTab::Logs => self.load_detail_logs(&pod_name, &namespace),
             DetailTab::Describe => self.load_detail_describe(&pod_name, &namespace),
             DetailTab::Timeline => self.load_detail_timeline(&pod_name, &namespace),
+            DetailTab::Volumes => self.update_detail_panel_volumes(),
             DetailTab::Shell => self.activate_shell_tab(),
         }
     }
 
-    fn load_detail_logs(&mut self, pod_name: &str, namespace: &str) {
+    pub(super) fn load_detail_logs(&mut self, pod_name: &str, namespace: &str) {
         let k8s_client = match &self.k8s_client {
             Some(c) => c.clone(),
             None => return,

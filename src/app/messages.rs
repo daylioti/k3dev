@@ -211,7 +211,7 @@ impl App {
                         .set_missing_hosts(std::collections::HashSet::new());
                     self.status_bar.set_resource_stats(None);
                     self.pod_stats.set_pods(Vec::new());
-                    self.menu.set_volume_entries(Vec::new());
+                    self.volume_entries_cache.clear();
                 }
             }
             AppMessage::IngressEntriesLoaded(entries) => {
@@ -315,7 +315,8 @@ impl App {
                 self.menu.set_active_port_forwards(forwards);
             }
             AppMessage::VolumeStatsUpdated(entries) => {
-                self.menu.set_volume_entries(entries);
+                self.volume_entries_cache = entries;
+                self.update_detail_panel_volumes();
             }
             AppMessage::ShellOutput(bytes) => {
                 if self.pod_detail_panel.is_open() && self.pod_detail_panel.has_shell_view() {
@@ -590,5 +591,13 @@ impl App {
 
         // Auto-open detail panel when a pod is selected
         self.ensure_detail_panel_synced();
+    }
+
+    /// Forward current volume entries to the detail panel
+    pub(super) fn update_detail_panel_volumes(&mut self) {
+        if self.pod_detail_panel.is_open() {
+            self.pod_detail_panel
+                .set_volume_entries(self.volume_entries_cache.clone());
+        }
     }
 }

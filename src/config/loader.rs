@@ -29,6 +29,12 @@ impl ConfigLoader {
 
     /// Load and parse the configuration file
     pub fn load(&self) -> Result<Config> {
+        let (config, _) = self.load_with_path()?;
+        Ok(config)
+    }
+
+    /// Load and parse the configuration file, returning the resolved config file path
+    pub fn load_with_path(&self) -> Result<(Config, PathBuf)> {
         let path = self.find_config_file()?;
 
         let content = fs::read_to_string(&path)
@@ -40,7 +46,7 @@ impl ConfigLoader {
         self.resolve_placeholders(&mut config);
         self.validate(&config)?;
 
-        Ok(config)
+        Ok((config, path))
     }
 
     /// Search for configuration file in standard locations
