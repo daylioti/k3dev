@@ -515,10 +515,7 @@ impl PodDetailPanel {
                 None if entry.capacity_bytes > 0 => {
                     lines.push(Line::from(vec![
                         Span::styled("    Capacity: ", self.styles.muted_text),
-                        Span::styled(
-                            format_bytes(entry.capacity_bytes),
-                            self.styles.normal_text,
-                        ),
+                        Span::styled(format_bytes(entry.capacity_bytes), self.styles.normal_text),
                     ]));
                 }
                 None => {
