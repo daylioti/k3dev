@@ -221,11 +221,12 @@ impl K3sManager {
                 if !content.is_empty() && content.contains("clusters:") {
                     // Replace 127.0.0.1 with the remote host's address when Docker is remote.
                     // For local Docker, keep 127.0.0.1 (matches k3s default and SAN certs).
-                    let fixed_content = if let Some(remote_host) = PlatformInfo::docker_remote_host() {
-                        content.replace("127.0.0.1", remote_host)
-                    } else {
-                        content
-                    };
+                    let fixed_content =
+                        if let Some(remote_host) = PlatformInfo::docker_remote_host() {
+                            content.replace("127.0.0.1", remote_host)
+                        } else {
+                            content
+                        };
 
                     fs::write(&temp_config, &fixed_content).await?;
                     fs::copy(&temp_config, &kubeconfig_path).await?;
