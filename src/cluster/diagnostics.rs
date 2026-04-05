@@ -634,8 +634,9 @@ async fn execute_preflight_test(
             // Check disk space on Docker root dir using statvfs
             match nix::sys::statvfs::statvfs(docker_root.as_str()) {
                 Ok(stat) => {
-                    let avail_gb =
-                        (stat.blocks_available() * stat.fragment_size()) / (1024 * 1024 * 1024);
+                    #[allow(clippy::unnecessary_cast)]
+                    let avail_gb = (stat.blocks_available() as u64 * stat.fragment_size() as u64)
+                        / (1024 * 1024 * 1024);
                     if avail_gb < 5 {
                         Err(format!(
                             "low disk: {}G free on {} ({} images, {} containers)",
