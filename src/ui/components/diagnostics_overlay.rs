@@ -212,6 +212,80 @@ impl DiagnosticsOverlay {
         let paragraph = Paragraph::new(visible_lines);
         frame.render_widget(paragraph, inner);
     }
+
+    /// Render inline (for stopped screen right panel, not as modal overlay)
+    pub fn render_inline(&self, frame: &mut Frame, area: Rect) {
+        // Summary for title
+        let passed = self
+            .report
+            .results
+            .iter()
+            .filter(|r| matches!(r.status, DiagnosticStatus::Passed))
+            .count();
+        let total = self.report.results.len();
+        let failed = self
+            .report
+            .results
+            .iter()
+            .filter(|r| matches!(r.status, DiagnosticStatus::Failed(_)))
+            .count();
+
+        let summary = if total == 0 {
+            String::new()
+        } else if self.report.finished {
+            if failed == 0 {
+                format!(" {}/{} passed ", passed, total)
+            } else {
+                format!(" {}/{} passed, {} failed ", passed, total, failed)
+            }
+        } else {
+            " running... ".to_string()
+        };
+
+        let summary_style = if failed > 0 {
+            self.styles.error_text
+        } else if self.report.finished {
+            self.styles.success_text
+        } else {
+            self.styles.warning_text
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(self.styles.border_unfocused)
+            .title(" Preflight Checks ")
+            .title_bottom(Line::from(Span::styled(summary, summary_style)).right_aligned());
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if total == 0 {
+            // Show waiting message centered
+            let msg = Line::from(Span::styled(
+                "  Waiting for status check...",
+                self.styles.muted_text,
+            ));
+            let y = inner.height / 2;
+            let row = Rect::new(inner.x, inner.y + y, inner.width, 1);
+            frame.render_widget(Paragraph::new(msg), row);
+            return;
+        }
+
+        let lines = self.build_lines();
+        let visible_height = inner.height as usize;
+        let max_scroll = lines.len().saturating_sub(visible_height);
+        let scroll = self.scroll_offset.min(max_scroll);
+
+        let visible_lines: Vec<Line> = lines
+            .into_iter()
+            .skip(scroll)
+            .take(visible_height)
+            .collect();
+
+        let paragraph = Paragraph::new(visible_lines);
+        frame.render_widget(paragraph, inner);
+    }
 }
 
 impl Default for DiagnosticsOverlay {

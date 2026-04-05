@@ -83,6 +83,7 @@ pub async fn run_cli_action(action: ClusterAction, config_path: Option<&str>) ->
             ClusterAction::Destroy => manager.delete(output_tx).await,
             ClusterAction::Info => manager.info(output_tx).await,
             ClusterAction::DeleteSnapshots => manager.delete_snapshots(output_tx).await,
+            ClusterAction::Diagnostics | ClusterAction::PreflightCheck => unreachable!(),
         }
     });
 
@@ -242,6 +243,128 @@ pub async fn run_cli_diagnostics(config_path: Option<&str>) -> Result<i32> {
         }
     } else {
         eprintln!("Diagnostics did not complete");
+        Ok(1)
+    }
+}
+
+/// Run preflight checks headlessly
+pub async fn run_cli_preflight(config_path: Option<&str>) -> Result<i32> {
+    use crate::app::AppMessage;
+    use crate::cluster::diagnostics::{run_preflight_checks, DiagnosticStatus};
+
+    let (config, cluster_config) = load_cluster_config(config_path);
+    let _ = crate::logging::init_logging(&config.logging, &config.infrastructure.cluster_name);
+
+    let (tx, mut rx) = mpsc::channel::<AppMessage>(100);
+
+    let handle = tokio::spawn(async move {
+        run_preflight_checks(cluster_config, tx).await;
+    });
+
+    let mut last_category = String::new();
+    let mut final_report = None;
+    let mut printed_count: usize = 0;
+    let mut has_running_line = false;
+
+    println!("\x1b[1mRunning preflight checks...\x1b[0m\n");
+
+    while let Some(msg) = rx.recv().await {
+        if let AppMessage::DiagnosticsUpdated(report) = msg {
+            for (i, result) in report.results.iter().enumerate() {
+                if i < printed_count {
+                    continue;
+                }
+                match &result.status {
+                    DiagnosticStatus::Running => {
+                        if result.category != last_category {
+                            last_category = result.category.to_string();
+                            println!("\x1b[1;36m── {} ──\x1b[0m", last_category);
+                        }
+                        print!("  \x1b[33m⟳\x1b[0m {}...", result.name);
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        has_running_line = true;
+                    }
+                    DiagnosticStatus::Passed => {
+                        let duration = result
+                            .duration
+                            .map(|d| format!(" \x1b[90m({:.1}s)\x1b[0m", d.as_secs_f64()))
+                            .unwrap_or_default();
+                        if has_running_line {
+                            print!("\r");
+                            has_running_line = false;
+                        }
+                        println!("  \x1b[32m✓\x1b[0m {}{}", result.name, duration);
+                        printed_count = i + 1;
+                    }
+                    DiagnosticStatus::Failed(reason) => {
+                        let duration = result
+                            .duration
+                            .map(|d| format!(" \x1b[90m({:.1}s)\x1b[0m", d.as_secs_f64()))
+                            .unwrap_or_default();
+                        if has_running_line {
+                            print!("\r");
+                            has_running_line = false;
+                        }
+                        println!(
+                            "  \x1b[31m✗\x1b[0m {}{}\n    \x1b[31m{}\x1b[0m",
+                            result.name, duration, reason
+                        );
+                        printed_count = i + 1;
+                    }
+                    DiagnosticStatus::Skipped(reason) => {
+                        if result.category != last_category {
+                            last_category = result.category.to_string();
+                            println!("\x1b[1;36m── {} ──\x1b[0m", last_category);
+                        }
+                        println!("  \x1b[90m⊘ {} (skipped: {})\x1b[0m", result.name, reason);
+                        printed_count = i + 1;
+                    }
+                    DiagnosticStatus::Pending => {}
+                }
+            }
+
+            if report.finished {
+                final_report = Some(report);
+            }
+        }
+    }
+
+    let _ = handle.await;
+
+    if let Some(report) = final_report {
+        let passed = report
+            .results
+            .iter()
+            .filter(|r| matches!(r.status, DiagnosticStatus::Passed))
+            .count();
+        let failed = report
+            .results
+            .iter()
+            .filter(|r| matches!(r.status, DiagnosticStatus::Failed(_)))
+            .count();
+        let skipped = report
+            .results
+            .iter()
+            .filter(|r| matches!(r.status, DiagnosticStatus::Skipped(_)))
+            .count();
+        let total = report.results.len();
+
+        println!();
+        if failed == 0 {
+            println!(
+                "\x1b[32m✓ Ready to start ({}/{} passed, {} skipped)\x1b[0m",
+                passed, total, skipped
+            );
+            Ok(0)
+        } else {
+            println!(
+                "\x1b[31m✗ {}/{} passed, {} failed, {} skipped\x1b[0m",
+                passed, total, failed, skipped
+            );
+            Ok(1)
+        }
+    } else {
+        eprintln!("Preflight checks did not complete");
         Ok(1)
     }
 }

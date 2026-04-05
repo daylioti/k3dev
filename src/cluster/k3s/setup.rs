@@ -149,16 +149,13 @@ impl K3sManager {
         Ok(())
     }
 
-    /// Install a binary into the container via docker cp (reliable for large files).
+    /// Install a binary into the container via bollard upload (tar stream).
     async fn install_binary_via_docker_cp(
         &self,
         binary: &[u8],
         name: &str,
         dest: &str,
     ) -> Result<()> {
-        let tmp = std::env::temp_dir().join(format!("k3dev-{}", name));
-        tokio::fs::write(&tmp, binary).await?;
-
         // Ensure target directory exists
         let _ = self
             .docker
@@ -168,28 +165,22 @@ impl K3sManager {
             )
             .await;
 
-        // Copy binary into container
-        let tmp_str = tmp.to_str().unwrap().to_string();
-        let dest_arg = format!("{}:{}", self.config.container_name, dest);
-        tracing::info!(src = %tmp_str, dest = %dest_arg, "docker cp binary");
+        // Extract just the filename from dest path (e.g. "/usr/local/bin/agent" -> "agent")
+        let file_name = std::path::Path::new(dest)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(name);
+        let dest_dir = std::path::Path::new(dest)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("/usr/local/bin");
 
-        let output = tokio::process::Command::new("docker")
-            .args(["cp", &tmp_str, &dest_arg])
-            .output()
-            .await
-            .context("docker cp failed")?;
+        tracing::info!(name = %file_name, dest = %dest_dir, "uploading binary to container");
 
-        let _ = tokio::fs::remove_file(&tmp).await;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("docker cp {} failed: {}", name, stderr);
-        }
-
-        // Make executable
         self.docker
-            .exec_in_container(&self.config.container_name, &["chmod", "+x", dest])
-            .await?;
+            .copy_to_container(&self.config.container_name, file_name, binary, dest_dir)
+            .await
+            .with_context(|| format!("Failed to upload {} to container", name))?;
 
         Ok(())
     }

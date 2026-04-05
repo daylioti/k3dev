@@ -1,4 +1,7 @@
 use anyhow::{anyhow, Result};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +13,6 @@ use x509_parser::prelude::*;
 
 use super::config::ClusterConfig;
 use super::kube_ops::KubeOps;
-use super::platform::PlatformInfo;
 use crate::ui::components::OutputLine;
 
 /// Traefik ingress controller manager
@@ -54,7 +56,30 @@ impl TraefikManager {
         Ok(())
     }
 
-    /// Setup TLS certificates using mkcert
+    /// Get the CA directory path
+    fn ca_dir() -> PathBuf {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".k3dev")
+            .join("ca")
+    }
+
+    /// Build CA certificate parameters (shared between generation and reconstruction)
+    fn ca_params() -> Result<CertificateParams> {
+        let mut params = CertificateParams::new(vec![])
+            .map_err(|e| anyhow!("Failed to create CA params: {}", e))?;
+        params.distinguished_name = DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "k3dev Local CA");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "k3dev");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        Ok(params)
+    }
+
+    /// Setup TLS certificates using built-in rcgen CA
     async fn setup_certificates(&self, output_tx: &mpsc::Sender<OutputLine>) -> Result<()> {
         let certs_dir = ClusterConfig::certs_dir();
         fs::create_dir_all(&certs_dir).await?;
@@ -79,66 +104,63 @@ impl TraefikManager {
             }
         }
 
-        // Check if mkcert is installed
-        if PlatformInfo::find_binary("mkcert").is_none() {
-            let _ = output_tx
-                .send(OutputLine::warning(
-                    "mkcert not installed, skipping certificate generation",
-                ))
-                .await;
-            let _ = output_tx.send(OutputLine::warning("Install with: brew install mkcert (macOS) or see https://github.com/FiloSottile/mkcert")).await;
-            return Ok(());
-        }
-
         let _ = output_tx
             .send(OutputLine::info("Generating TLS certificates..."))
             .await;
 
-        // Install mkcert CA in system and browser trust stores
-        let _ = output_tx
-            .send(OutputLine::info(
-                "Installing mkcert CA (may require sudo)...",
-            ))
-            .await;
-        let install_output = Command::new("mkcert").arg("-install").output().await;
+        // Ensure CA exists (generate if needed)
+        let (_, ca_key_pem) = self.ensure_ca(output_tx).await?;
 
-        if let Ok(out) = &install_output {
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let _ = output_tx
-                    .send(OutputLine::warning(format!(
-                        "mkcert CA install warning: {}",
-                        stderr.trim()
-                    )))
-                    .await;
-            }
-        }
+        // Parse CA key and reconstruct issuer for signing
+        let ca_key =
+            KeyPair::from_pem(&ca_key_pem).map_err(|e| anyhow!("Failed to parse CA key: {}", e))?;
+        let ca_issuer = Issuer::new(Self::ca_params()?, ca_key);
 
-        // Try to install CA in Firefox NSS database if certutil is available
-        self.install_ca_in_firefox(output_tx).await;
-
-        // Generate certificates
+        // Generate leaf certificate for the configured domain
         let domain = &self.config.domain;
         let wildcard = self.config.wildcard_domain();
 
-        let output = Command::new("mkcert")
-            .current_dir(&certs_dir)
-            .args([
-                "-cert-file",
-                "local-cert.pem",
-                "-key-file",
-                "local-key.pem",
-                domain,
-                &wildcard,
-                "localhost",
-                "127.0.0.1",
-            ])
-            .output()
-            .await?;
+        let subject_alt_names = vec![
+            rcgen::SanType::DnsName(
+                domain
+                    .clone()
+                    .try_into()
+                    .map_err(|e| anyhow!("Invalid domain '{}': {}", domain, e))?,
+            ),
+            rcgen::SanType::DnsName(
+                wildcard
+                    .clone()
+                    .try_into()
+                    .map_err(|e| anyhow!("Invalid wildcard domain '{}': {}", wildcard, e))?,
+            ),
+            rcgen::SanType::DnsName(
+                "localhost"
+                    .try_into()
+                    .map_err(|e| anyhow!("Invalid domain 'localhost': {}", e))?,
+            ),
+            rcgen::SanType::IpAddress("127.0.0.1".parse().unwrap()),
+        ];
 
-        if !output.status.success() {
-            return Err(anyhow!("Failed to generate certificates"));
-        }
+        let mut leaf_params = CertificateParams::new(vec![])
+            .map_err(|e| anyhow!("Failed to create cert params: {}", e))?;
+        leaf_params.subject_alt_names = subject_alt_names;
+        leaf_params.distinguished_name = DistinguishedName::new();
+        leaf_params
+            .distinguished_name
+            .push(DnType::CommonName, domain.as_str());
+        leaf_params
+            .distinguished_name
+            .push(DnType::OrganizationName, "k3dev");
+
+        let leaf_key =
+            KeyPair::generate().map_err(|e| anyhow!("Failed to generate leaf key: {}", e))?;
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &ca_issuer)
+            .map_err(|e| anyhow!("Failed to sign leaf cert: {}", e))?;
+
+        // Write leaf cert and key
+        fs::write(&cert_path, leaf_cert.pem()).await?;
+        fs::write(&key_path, leaf_key.serialize_pem()).await?;
 
         let _ = output_tx
             .send(OutputLine::success("Certificates generated"))
@@ -146,46 +168,176 @@ impl TraefikManager {
         Ok(())
     }
 
-    /// Install mkcert CA in Firefox NSS database (Firefox uses its own trust store)
-    async fn install_ca_in_firefox(&self, output_tx: &mpsc::Sender<OutputLine>) {
+    /// Ensure a CA certificate exists, generating one if needed.
+    /// Returns (ca_cert_pem, ca_key_pem).
+    async fn ensure_ca(&self, output_tx: &mpsc::Sender<OutputLine>) -> Result<(String, String)> {
+        let ca_dir = Self::ca_dir();
+        fs::create_dir_all(&ca_dir).await?;
+
+        let ca_cert_path = ca_dir.join("rootCA.pem");
+        let ca_key_path = ca_dir.join("rootCA-key.pem");
+
+        // If CA already exists, return it
+        if ca_cert_path.exists() && ca_key_path.exists() {
+            let cert_pem = fs::read_to_string(&ca_cert_path).await?;
+            let key_pem = fs::read_to_string(&ca_key_path).await?;
+            return Ok((cert_pem, key_pem));
+        }
+
+        let _ = output_tx
+            .send(OutputLine::info("Generating k3dev root CA..."))
+            .await;
+
+        // Generate new CA
+        let ca_key =
+            KeyPair::generate().map_err(|e| anyhow!("Failed to generate CA key: {}", e))?;
+        let ca_cert = Self::ca_params()?
+            .self_signed(&ca_key)
+            .map_err(|e| anyhow!("Failed to self-sign CA: {}", e))?;
+
+        let cert_pem = ca_cert.pem();
+        let key_pem = ca_key.serialize_pem();
+
+        fs::write(&ca_cert_path, &cert_pem).await?;
+        fs::write(&ca_key_path, &key_pem).await?;
+
+        // Install CA into trust stores
+        self.install_ca(&ca_cert_path, output_tx).await;
+
+        let _ = output_tx
+            .send(OutputLine::success("Root CA generated and installed"))
+            .await;
+
+        Ok((cert_pem, key_pem))
+    }
+
+    /// Install CA certificate into system and browser trust stores
+    async fn install_ca(
+        &self,
+        ca_cert_path: &std::path::Path,
+        output_tx: &mpsc::Sender<OutputLine>,
+    ) {
+        let ca_path_str = ca_cert_path.to_string_lossy().to_string();
+
+        // Install into system trust store (platform-specific)
+        #[cfg(target_os = "linux")]
+        {
+            let _ = output_tx
+                .send(OutputLine::info(
+                    "Installing CA into system trust store (may require sudo)...",
+                ))
+                .await;
+
+            // Detect distro trust store: Arch, Debian/Ubuntu, Fedora/RHEL
+            let dest_dir_arch = "/etc/ca-certificates/trust-source/anchors";
+            let dest_dir_debian = "/usr/local/share/ca-certificates";
+            let dest_dir_rhel = "/etc/pki/ca-trust/source/anchors";
+
+            let (dest_dir, cert_ext, update_cmd) = if std::path::Path::new(dest_dir_arch).exists() {
+                (dest_dir_arch, "crt", "update-ca-trust")
+            } else if std::path::Path::new(dest_dir_debian).exists() {
+                (dest_dir_debian, "crt", "update-ca-certificates")
+            } else if std::path::Path::new(dest_dir_rhel).exists() {
+                (dest_dir_rhel, "pem", "update-ca-trust")
+            } else {
+                let _ = output_tx
+                    .send(OutputLine::warning(
+                        "Could not detect system CA trust store location",
+                    ))
+                    .await;
+                ("", "", "")
+            };
+
+            if !dest_dir.is_empty() {
+                let dest = format!("{}/k3dev-local-ca.{}", dest_dir, cert_ext);
+                let cp = Command::new("sudo")
+                    .args(["cp", &ca_path_str, &dest])
+                    .output()
+                    .await;
+                if let Ok(out) = cp {
+                    if out.status.success() {
+                        let _ = Command::new("sudo").arg(update_cmd).output().await;
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let _ = output_tx
+                .send(OutputLine::info(
+                    "Installing CA into system keychain (may require sudo)...",
+                ))
+                .await;
+
+            let result = Command::new("sudo")
+                .args([
+                    "security",
+                    "add-trusted-cert",
+                    "-d",
+                    "-r",
+                    "trustRoot",
+                    "-k",
+                    "/Library/Keychains/System.keychain",
+                    &ca_path_str,
+                ])
+                .output()
+                .await;
+
+            if let Ok(out) = &result {
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let _ = output_tx
+                        .send(OutputLine::warning(format!(
+                            "CA system install warning: {}",
+                            stderr.trim()
+                        )))
+                        .await;
+                }
+            }
+        }
+
+        // Install into NSS databases (Firefox, Chrome/Chromium)
+        self.install_ca_in_nss_databases(&ca_path_str, output_tx)
+            .await;
+    }
+
+    /// Install CA in NSS databases used by Firefox and Chrome/Chromium
+    async fn install_ca_in_nss_databases(
+        &self,
+        ca_cert_path: &str,
+        output_tx: &mpsc::Sender<OutputLine>,
+    ) {
+        use super::platform::PlatformInfo;
+
         // Check if certutil is available
         if PlatformInfo::find_binary("certutil").is_none() {
             return;
         }
 
-        // Get mkcert CA root path
-        let ca_root = Command::new("mkcert").arg("-CAROOT").output().await;
-
-        let ca_root_path = match ca_root {
-            Ok(out) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout).trim().to_string()
-            }
-            _ => return,
-        };
-
-        let ca_cert_path = format!("{}/rootCA.pem", ca_root_path);
-        if !std::path::Path::new(&ca_cert_path).exists() {
-            return;
-        }
-
-        // Find Firefox profiles (platform-dependent location)
-        let firefox_dir = match dirs::home_dir() {
-            Some(home) => {
-                // macOS: ~/Library/Application Support/Firefox/Profiles
-                #[cfg(target_os = "macos")]
-                let dir = home
-                    .join("Library")
-                    .join("Application Support")
-                    .join("Firefox")
-                    .join("Profiles");
-                // Linux and others: ~/.mozilla/firefox
-                #[cfg(not(target_os = "macos"))]
-                let dir = home.join(".mozilla").join("firefox");
-                dir
-            }
+        let home = match dirs::home_dir() {
+            Some(h) => h,
             None => return,
         };
-        let firefox_dir = firefox_dir.to_string_lossy().to_string();
+
+        // Collect all NSS database paths to install into
+        let mut nss_dbs: Vec<(String, &str)> = Vec::new();
+
+        // Chrome/Chromium on Linux uses ~/.pki/nssdb
+        let chrome_nss = home.join(".pki").join("nssdb");
+        if chrome_nss.exists() {
+            nss_dbs.push((format!("sql:{}", chrome_nss.display()), "Chrome/Chromium"));
+        }
+
+        // Firefox profiles
+        #[cfg(target_os = "macos")]
+        let firefox_dir = home
+            .join("Library")
+            .join("Application Support")
+            .join("Firefox")
+            .join("Profiles");
+        #[cfg(not(target_os = "macos"))]
+        let firefox_dir = home.join(".mozilla").join("firefox");
 
         if let Ok(entries) = std::fs::read_dir(&firefox_dir) {
             for entry in entries.flatten() {
@@ -193,45 +345,51 @@ impl TraefikManager {
                 if path.is_dir() {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
                     if name.contains("default") {
-                        let nss_db = format!("sql:{}", path.display());
-
-                        // Check if CA already exists
-                        let check = Command::new("certutil")
-                            .args(["-d", &nss_db, "-L"])
-                            .output()
-                            .await;
-
-                        if let Ok(out) = check {
-                            let list = String::from_utf8_lossy(&out.stdout);
-                            if list.contains("mkcert") {
-                                continue; // Already installed
-                            }
-                        }
-
-                        // Install CA
-                        let result = Command::new("certutil")
-                            .args([
-                                "-d",
-                                &nss_db,
-                                "-A",
-                                "-t",
-                                "C,,",
-                                "-n",
-                                "mkcert CA",
-                                "-i",
-                                &ca_cert_path,
-                            ])
-                            .output()
-                            .await;
-
-                        if let Ok(out) = result {
-                            if out.status.success() {
-                                let _ = output_tx
-                                    .send(OutputLine::info("Installed mkcert CA in Firefox"))
-                                    .await;
-                            }
-                        }
+                        nss_dbs.push((format!("sql:{}", path.display()), "Firefox"));
                     }
+                }
+            }
+        }
+
+        // Install CA into each NSS database
+        for (nss_db, browser) in &nss_dbs {
+            // Check if CA already exists
+            let check = Command::new("certutil")
+                .args(["-d", nss_db, "-L"])
+                .output()
+                .await;
+
+            if let Ok(out) = check {
+                let list = String::from_utf8_lossy(&out.stdout);
+                if list.contains("k3dev") {
+                    continue; // Already installed
+                }
+            }
+
+            // Install CA
+            let result = Command::new("certutil")
+                .args([
+                    "-d",
+                    nss_db,
+                    "-A",
+                    "-t",
+                    "C,,",
+                    "-n",
+                    "k3dev Local CA",
+                    "-i",
+                    ca_cert_path,
+                ])
+                .output()
+                .await;
+
+            if let Ok(out) = result {
+                if out.status.success() {
+                    let _ = output_tx
+                        .send(OutputLine::info(format!(
+                            "Installed k3dev CA in {}",
+                            browser
+                        )))
+                        .await;
                 }
             }
         }

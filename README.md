@@ -3,28 +3,34 @@
 A TUI for managing local K3s clusters in Docker.
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)
 
 ## Features
 
 - **Cluster Lifecycle** - Start, stop, restart, and delete K3s clusters
-- **Pod Operations** - Execute commands inside pods with interactive terminal
+- **Fast Startup via Snapshots** - First start creates a snapshot image; subsequent starts take seconds
+- **Headless CLI Mode** - Run cluster actions, diagnostics, and pod operations without the TUI
+- **Diagnostics & Preflight Checks** - Verify the cluster is healthy or ready to start
+- **Image Pull Progress** - Byte-level progress bars for Docker image pulls
+- **Pod Operations** - Execute commands inside pods with an interactive terminal
 - **Ingress Management** - View endpoints with health checks and `/etc/hosts` integration
-- **Custom Commands** - Hierarchical command menus for common tasks
+- **Custom Commands** - Hierarchical command menus with placeholders and keybind shortcuts
 - **Resource Monitoring** - CPU and memory stats for containers and pods
+- **Hooks** - Run shell commands on `on_cluster_available` / `on_services_deployed`
+- **Docker Passthrough** - `k3dev docker ...` targets the cluster's Docker daemon
 - **Themes** - Fallout, Cyberpunk, and Nord
 - **Vim-style Navigation** - Customizable keybindings
 
 ## Requirements
 
-- Linux
-- Docker (running, with cgroupfs driver)
-- kubectl
-- mkcert (optional, for HTTPS)
+- Linux or macOS (Docker Desktop)
+- Docker (running; Linux needs the `cgroupfs` cgroup driver)
+- kubectl (only required for interactive `exec` and `logs --follow`)
+- HTTPS certificates are generated automatically (built-in CA)
 
-### Docker Configuration
+### Docker Configuration (Linux)
 
-k3dev runs K3s inside Docker containers. Docker must be configured to use the `cgroupfs` cgroup driver:
+k3dev runs K3s inside Docker containers. On Linux, Docker must be configured to use the `cgroupfs` cgroup driver:
 
 ```bash
 sudo mkdir -p /etc/docker
@@ -41,6 +47,8 @@ Verify with:
 docker info | grep -i cgroup
 # Should show: Cgroup Driver: cgroupfs
 ```
+
+On macOS, Docker Desktop handles this automatically — no configuration required.
 
 ## Installation
 
@@ -99,7 +107,7 @@ cluster:
 infrastructure:
   cluster_name: "k3dev"
   domain: "myapp.local"
-  k3s_version: "v1.33.4-k3s1"
+  k3s_version: "v1.35.2-k3s1"
 
 theme: fallout
 
@@ -133,6 +141,43 @@ hooks:
     - name: "Deploy"
       command: "helm install myapp ./charts/myapp"
 ```
+
+## CLI (Headless Mode)
+
+Running `k3dev` with no arguments launches the TUI. Passing a subcommand runs the action headlessly and exits — useful for scripts, CI, and shell aliases.
+
+```bash
+# Cluster lifecycle
+k3dev start              # Start the cluster
+k3dev stop               # Stop the cluster
+k3dev restart            # Restart the cluster
+k3dev destroy            # Delete the cluster
+k3dev info               # Show cluster info
+k3dev delete-snapshots   # Delete all snapshot images
+
+# Health
+k3dev preflight          # Verify the cluster can start
+k3dev diagnostics        # Run full cluster diagnostics
+
+# Networking
+k3dev update-hosts       # Sync /etc/hosts with ingress entries
+
+# Pods
+k3dev pods [-n NS]                       # List pods
+k3dev logs POD [-n NS] [-f] [--tail N]   # View pod logs
+k3dev describe POD [-n NS]               # Describe a pod
+k3dev exec POD [-n NS] [--cmd /bin/sh]   # Interactive shell into a pod
+k3dev delete-pod POD [-n NS]             # Delete a pod
+k3dev restart-pod POD [-n NS]            # Delete and let deployment recreate
+
+# Docker passthrough — targets the cluster's Docker daemon
+k3dev docker ps
+k3dev docker images
+```
+
+All subcommands accept `-c, --config <PATH>` to override the config file location.
+
+See [docs/CLI.md](docs/CLI.md) for the full reference.
 
 ## Keybindings
 

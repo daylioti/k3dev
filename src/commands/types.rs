@@ -19,6 +19,7 @@ pub enum PaletteCommandId {
     ClusterInfo,
     ClusterDeleteSnapshots,
     ClusterDiagnostics,
+    ClusterPreflightCheck,
 
     // Application commands
     AppRefresh,
@@ -46,6 +47,7 @@ impl PaletteCommandId {
             "cluster:info" => Some(Self::ClusterInfo),
             "cluster:delete-snapshots" => Some(Self::ClusterDeleteSnapshots),
             "cluster:diagnostics" => Some(Self::ClusterDiagnostics),
+            "cluster:preflight-check" => Some(Self::ClusterPreflightCheck),
             "app:refresh" => Some(Self::AppRefresh),
             "app:update-hosts" => Some(Self::AppUpdateHosts),
             "app:help" => Some(Self::AppHelp),
@@ -66,6 +68,7 @@ impl PaletteCommandId {
             Self::ClusterInfo => "cluster:info",
             Self::ClusterDeleteSnapshots => "cluster:delete-snapshots",
             Self::ClusterDiagnostics => "cluster:diagnostics",
+            Self::ClusterPreflightCheck => "cluster:preflight-check",
             Self::AppRefresh => "app:refresh",
             Self::AppUpdateHosts => "app:update-hosts",
             Self::AppHelp => "app:help",
@@ -98,6 +101,8 @@ impl PaletteCommandId {
             Self::ClusterDestroy => Some(ClusterAction::Destroy),
             Self::ClusterInfo => Some(ClusterAction::Info),
             Self::ClusterDeleteSnapshots => Some(ClusterAction::DeleteSnapshots),
+            Self::ClusterDiagnostics => Some(ClusterAction::Diagnostics),
+            Self::ClusterPreflightCheck => Some(ClusterAction::PreflightCheck),
             _ => None,
         }
     }
@@ -113,6 +118,7 @@ impl PaletteCommandId {
                 | Self::ClusterInfo
                 | Self::ClusterDeleteSnapshots
                 | Self::ClusterDiagnostics
+                | Self::ClusterPreflightCheck
         )
     }
 
@@ -139,6 +145,7 @@ impl PaletteCommandId {
             Self::ClusterInfo,
             Self::ClusterDeleteSnapshots,
             Self::ClusterDiagnostics,
+            Self::ClusterPreflightCheck,
             Self::AppRefresh,
             Self::AppUpdateHosts,
             Self::AppHelp,

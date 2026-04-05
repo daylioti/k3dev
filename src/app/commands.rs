@@ -4,11 +4,10 @@
 //! pod commands, and palette command handling.
 
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use crate::cluster::diagnostics::run_all_diagnostics;
+use crate::cluster::diagnostics::{run_all_diagnostics, run_preflight_checks};
 use crate::cluster::{ClusterManager, HostsUpdateResult, IngressManager};
 use crate::commands::{CommandContext, PaletteCommandId};
 use crate::config::{get_exec_placeholders, CommandEntry, RefreshTask};
@@ -20,35 +19,7 @@ use super::{App, AppMessage, AppMode, FocusArea};
 impl App {
     /// Open a URL in the default browser
     pub(super) fn open_url(&mut self, url: &str) {
-        use std::process::Stdio;
-
-        // Use xdg-open on Linux, open on macOS
-        // Redirect stdin/stdout/stderr to null to prevent terminal corruption
-        #[cfg(target_os = "linux")]
-        let result = Command::new("xdg-open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        #[cfg(target_os = "macos")]
-        let result = Command::new("open")
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        #[cfg(target_os = "windows")]
-        let result = Command::new("cmd")
-            .args(["/C", "start", url])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-
-        match result {
+        match open::that(url) {
             Ok(_) => {
                 self.output.add_info(format!("Opening: {}", url));
             }
@@ -62,12 +33,6 @@ impl App {
         // Handle custom commands from config
         if let Some(path) = cmd_id.custom_path() {
             self.execute_custom_command(path);
-            return;
-        }
-
-        // Handle diagnostics (cluster command but not a ClusterAction)
-        if matches!(cmd_id, PaletteCommandId::ClusterDiagnostics) {
-            self.run_diagnostics();
             return;
         }
 
@@ -143,6 +108,16 @@ impl App {
     }
 
     pub(super) fn execute_cluster_action(&mut self, action: ClusterAction) {
+        // Diagnostics and preflight use the diagnostics overlay, not the output popup
+        if action == ClusterAction::Diagnostics {
+            self.run_diagnostics();
+            return;
+        }
+        if action == ClusterAction::PreflightCheck {
+            self.run_preflight_check();
+            return;
+        }
+
         // Show confirmation for destroy action
         if action == ClusterAction::Destroy {
             self.pending_cluster_action = Some(action);
@@ -216,6 +191,10 @@ impl App {
                     ClusterAction::Destroy => manager.delete(tx).await,
                     ClusterAction::Info => manager.info(tx).await,
                     ClusterAction::DeleteSnapshots => manager.delete_snapshots(tx).await,
+                    // Diagnostics and PreflightCheck are handled before reaching here
+                    ClusterAction::Diagnostics | ClusterAction::PreflightCheck => {
+                        unreachable!()
+                    }
                 };
 
                 action_result.map_err(|e| format!("Error: {}", e))
@@ -389,6 +368,19 @@ impl App {
 
         tokio::spawn(async move {
             run_all_diagnostics(cluster_config, message_tx).await;
+        });
+    }
+
+    /// Run preflight checks (can run without a started cluster)
+    pub(super) fn run_preflight_check(&mut self) {
+        self.diagnostics_overlay.reset();
+        self.mode = AppMode::Diagnostics;
+
+        let message_tx = self.message_tx.clone();
+        let cluster_config = Arc::clone(&self.cluster_config);
+
+        tokio::spawn(async move {
+            run_preflight_checks(cluster_config, message_tx).await;
         });
     }
 

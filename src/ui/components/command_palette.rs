@@ -124,6 +124,15 @@ impl CommandPalette {
                 category: CommandCategory::Cluster,
                 description: Some("Run cluster health checks and diagnostics".to_string()),
             },
+            PaletteCommand {
+                id: PaletteCommandId::ClusterPreflightCheck,
+                name: "Preflight Check".to_string(),
+                shortcut: None,
+                category: CommandCategory::Cluster,
+                description: Some(
+                    "Check if cluster can start (ports, Docker, prerequisites)".to_string(),
+                ),
+            },
             // Application commands
             PaletteCommand {
                 id: PaletteCommandId::AppRefresh,

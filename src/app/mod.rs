@@ -156,6 +156,9 @@ pub struct App {
 
     // Menu width offset from user adjustments (+/- keys)
     menu_width_offset: i16,
+
+    // Whether auto-preflight has been triggered for stopped screen
+    preflight_auto_triggered: bool,
 }
 
 impl App {
@@ -270,6 +273,7 @@ impl App {
             keybinding_resolver,
             current_layout: None,
             menu_width_offset: 0,
+            preflight_auto_triggered: false,
         })
     }
 
@@ -483,10 +487,80 @@ impl App {
             self.menu_width_offset,
         );
 
-        // Render action bar
+        let is_cluster_stopped = !matches!(
+            self.cluster_status,
+            ClusterStatus::Running | ClusterStatus::Starting
+        );
+
+        // Render action bar (always visible)
         self.action_bar
             .render(frame, layout.action_bar, self.focus == FocusArea::ActionBar);
 
+        if is_cluster_stopped {
+            self.render_stopped_screen(frame, &layout);
+        } else {
+            self.render_running_screen(frame, &layout);
+        }
+
+        // Render status bar (always visible)
+        let ui_status = match self.cluster_status {
+            ClusterStatus::Running => UiClusterStatus::Connected,
+            ClusterStatus::Stopped | ClusterStatus::NotCreated => UiClusterStatus::Disconnected,
+            _ => UiClusterStatus::Unknown,
+        };
+        self.status_bar.render(frame, layout.status_bar, &ui_status);
+
+        // Render modal overlays
+        if self.mode == AppMode::Help {
+            self.help_overlay.render(frame, frame.area());
+        }
+        if self.mode == AppMode::CommandPalette {
+            self.command_palette.render(frame, frame.area());
+        }
+        if self.mode == AppMode::Input {
+            self.input_form.render(frame, frame.area());
+        }
+        if self.mode == AppMode::OutputPopup {
+            self.output_popup.render(frame, frame.area());
+        }
+        if self.mode == AppMode::ConfirmDestroy {
+            self.confirm_popup.render(frame, frame.area());
+        }
+        if self.mode == AppMode::PodContextMenu {
+            self.pod_context_menu.render(frame, frame.area());
+        }
+        if self.mode == AppMode::Diagnostics {
+            self.diagnostics_overlay.render(frame, frame.area());
+        }
+    }
+
+    /// Render the stopped screen: action list (left) + preflight results (right)
+    fn render_stopped_screen(&mut self, frame: &mut ratatui::Frame, layout: &AppLayout) {
+        // Use the full content area (menu + pod_stats combined)
+        let content_area = ratatui::layout::Rect::new(
+            layout.menu.x,
+            layout.menu.y,
+            layout.menu.width + layout.pod_stats.width,
+            layout.menu.height,
+        );
+
+        // Split into two columns
+        let columns = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(content_area);
+
+        // Left: vertical action list
+        let focused = self.focus == FocusArea::Content || self.focus == FocusArea::ActionBar;
+        self.action_bar.render_vertical(frame, columns[0], focused);
+
+        // Right: inline preflight results
+        self.diagnostics_overlay.render_inline(frame, columns[1]);
+
+        // Clear selected item in status bar
+        self.status_bar.set_selected_item(None);
+    }
+
+    /// Render the normal running screen: menu (left) + pods (right)
+    fn render_running_screen(&mut self, frame: &mut ratatui::Frame, layout: &AppLayout) {
         // Render menu
         self.menu
             .render(frame, layout.menu, self.focus == FocusArea::Content);
@@ -494,7 +568,6 @@ impl App {
         // Render pod stats panel
         let focused = self.focus == FocusArea::PodStats;
         if self.pod_detail_panel.is_open() {
-            // Unified outer block for the entire right panel
             let border_style = if focused {
                 self.styles.border_focused
             } else {
@@ -526,7 +599,6 @@ impl App {
             let inner = block.inner(layout.pod_stats);
             frame.render_widget(block, layout.pod_stats);
 
-            // Split inner: pod list (top) | separator (1 row) | detail (bottom)
             let split = Layout::vertical([
                 Constraint::Percentage(50),
                 Constraint::Length(1),
@@ -536,7 +608,6 @@ impl App {
 
             self.pod_stats.render_inner(frame, split[0], focused);
 
-            // Thin separator line
             let sep_line = ratatui::text::Line::from("\u{2500}".repeat(split[1].width as usize));
             frame.render_widget(
                 ratatui::widgets::Paragraph::new(sep_line).style(self.styles.border_unfocused),
@@ -548,16 +619,13 @@ impl App {
             self.pod_stats.render(frame, layout.pod_stats, focused);
         }
 
-        // Update selected item in status bar based on focus
+        // Update selected item in status bar
         let selected_item = match self.focus {
-            FocusArea::PodStats => {
-                self.pod_stats.selected_pod().map(|p| {
-                    // Show full pod name with namespace
-                    format!("{} ({})", p.name, p.namespace)
-                })
-            }
+            FocusArea::PodStats => self
+                .pod_stats
+                .selected_pod()
+                .map(|p| format!("{} ({})", p.name, p.namespace)),
             FocusArea::Content => {
-                // Check if ingress is selected
                 if let Some((host, path)) = self.menu.selected_ingress_info() {
                     Some(format!("http://{}{}", host, path))
                 } else {
@@ -567,48 +635,5 @@ impl App {
             FocusArea::ActionBar => None,
         };
         self.status_bar.set_selected_item(selected_item);
-
-        // Render status bar
-        let ui_status = match self.cluster_status {
-            ClusterStatus::Running => UiClusterStatus::Connected,
-            ClusterStatus::Stopped | ClusterStatus::NotCreated => UiClusterStatus::Disconnected,
-            _ => UiClusterStatus::Unknown,
-        };
-        self.status_bar.render(frame, layout.status_bar, &ui_status);
-
-        // Render help overlay if in help mode
-        if self.mode == AppMode::Help {
-            self.help_overlay.render(frame, frame.area());
-        }
-
-        // Render command palette if in command palette mode
-        if self.mode == AppMode::CommandPalette {
-            self.command_palette.render(frame, frame.area());
-        }
-
-        // Render input form as popup if in input mode
-        if self.mode == AppMode::Input {
-            self.input_form.render(frame, frame.area());
-        }
-
-        // Render output popup if in output popup mode
-        if self.mode == AppMode::OutputPopup {
-            self.output_popup.render(frame, frame.area());
-        }
-
-        // Render confirm popup if in confirm destroy mode
-        if self.mode == AppMode::ConfirmDestroy {
-            self.confirm_popup.render(frame, frame.area());
-        }
-
-        // Render pod context menu if in pod context menu mode
-        if self.mode == AppMode::PodContextMenu {
-            self.pod_context_menu.render(frame, frame.area());
-        }
-
-        // Render diagnostics overlay if in diagnostics mode
-        if self.mode == AppMode::Diagnostics {
-            self.diagnostics_overlay.render(frame, frame.area());
-        }
     }
 }

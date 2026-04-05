@@ -162,6 +162,23 @@ impl App {
                 self.cluster_status = status;
                 self.status_bar.update_connection_state(is_running);
 
+                // Toggle action bar: diagnostics only when running, preflight when not
+                self.action_bar
+                    .set_action_enabled("diagnostics", is_running);
+                self.action_bar.set_action_enabled("preflight", !is_running);
+
+                // Auto-trigger preflight checks on stopped screen
+                if !is_running && !self.preflight_auto_triggered {
+                    self.preflight_auto_triggered = true;
+                    self.run_preflight_check();
+                    // Reset mode back to Normal since run_preflight_check sets Diagnostics mode
+                    self.mode = AppMode::Normal;
+                }
+                // Reset auto-trigger when cluster starts (so it re-triggers next time it stops)
+                if is_running {
+                    self.preflight_auto_triggered = false;
+                }
+
                 // If cluster just became running, trigger refresh and show ports
                 if is_running && !was_running {
                     // Set forwarded ports from config

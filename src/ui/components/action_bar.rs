@@ -31,6 +31,8 @@ pub enum ClusterAction {
     Destroy,
     Info,
     DeleteSnapshots,
+    Diagnostics,
+    PreflightCheck,
 }
 
 impl ClusterAction {
@@ -42,6 +44,8 @@ impl ClusterAction {
             ClusterAction::Destroy => "destroy",
             ClusterAction::Info => "info",
             ClusterAction::DeleteSnapshots => "delete-snapshots",
+            ClusterAction::Diagnostics => "diagnostics",
+            ClusterAction::PreflightCheck => "preflight-check",
         }
     }
 }
@@ -98,6 +102,20 @@ impl ActionBar {
                     enabled: true,
                     shortcut: Some('I'),
                 },
+                Action {
+                    id: "preflight".to_string(),
+                    label: "Preflight".to_string(),
+                    icon: "⚑".to_string(),
+                    enabled: true,
+                    shortcut: Some('P'),
+                },
+                Action {
+                    id: "diagnostics".to_string(),
+                    label: "Diagnostics".to_string(),
+                    icon: "✚".to_string(),
+                    enabled: false,
+                    shortcut: Some('G'),
+                },
             ],
             selected_index: 0,
             styles: Styles::from_theme(theme),
@@ -128,6 +146,14 @@ impl ActionBar {
     pub fn move_right(&mut self) {
         self.selected_index = (self.selected_index + 1) % self.actions.len();
         self.skip_disabled_right();
+    }
+
+    pub fn move_up(&mut self) {
+        self.move_left();
+    }
+
+    pub fn move_down(&mut self) {
+        self.move_right();
     }
 
     fn skip_disabled_left(&mut self) {
@@ -173,6 +199,8 @@ impl ActionBar {
             "restart" => Some(ClusterAction::Restart),
             "destroy" => Some(ClusterAction::Destroy),
             "info" => Some(ClusterAction::Info),
+            "diagnostics" => Some(ClusterAction::Diagnostics),
+            "preflight" => Some(ClusterAction::PreflightCheck),
             _ => None,
         }
     }
@@ -272,6 +300,93 @@ impl ActionBar {
             let config_line = Line::from(Span::styled(short_path, self.styles.muted_text));
             let config_paragraph = Paragraph::new(config_line).alignment(Alignment::Right);
             frame.render_widget(config_paragraph, area);
+        }
+    }
+
+    /// Render actions as a vertical list (for stopped screen)
+    pub fn render_vertical(&self, frame: &mut Frame, area: Rect, focused: bool) {
+        let border_style = if focused {
+            self.styles.border_focused
+        } else {
+            self.styles.border_unfocused
+        };
+        let border_type = if focused {
+            ratatui::widgets::BorderType::Double
+        } else {
+            ratatui::widgets::BorderType::Rounded
+        };
+        let title_style = if focused {
+            self.styles.title.add_modifier(Modifier::BOLD)
+        } else {
+            self.styles.normal_text
+        };
+
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_type(border_type)
+            .border_style(border_style)
+            .title(Span::styled(" Actions ", title_style));
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // Align to top
+        let start_y = 0;
+
+        let mut y = 0;
+        for (i, action) in self.actions.iter().enumerate() {
+            if !action.enabled {
+                continue;
+            }
+            if y >= inner.height as usize {
+                break;
+            }
+
+            let is_selected = i == self.selected_index && focused;
+            let base_style = if is_selected {
+                self.styles.action_selected
+            } else {
+                self.styles.action_normal
+            };
+
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled("  ", base_style));
+            spans.push(Span::styled(format!("{} ", action.icon), base_style));
+
+            // Label with underlined shortcut
+            if let Some(shortcut) = action.shortcut {
+                let shortcut_lower = shortcut.to_ascii_lowercase();
+                let mut found = false;
+                for c in action.label.chars() {
+                    if !found && c.to_ascii_lowercase() == shortcut_lower {
+                        spans.push(Span::styled(
+                            c.to_string(),
+                            base_style.add_modifier(Modifier::UNDERLINED),
+                        ));
+                        found = true;
+                    } else {
+                        spans.push(Span::styled(c.to_string(), base_style));
+                    }
+                }
+            } else {
+                spans.push(Span::styled(&action.label, base_style));
+            }
+
+            // Right-aligned shortcut hint
+            if let Some(shortcut) = action.shortcut {
+                let label_len = action.icon.chars().count() + 1 + action.label.len() + 2;
+                let padding = (inner.width as usize).saturating_sub(label_len + 5);
+                spans.push(Span::styled(" ".repeat(padding), base_style));
+                spans.push(Span::styled(
+                    format!("[{}]", shortcut),
+                    self.styles.muted_text,
+                ));
+            }
+
+            let line = Line::from(spans);
+            let row = Rect::new(inner.x, inner.y + start_y as u16 + y as u16, inner.width, 1);
+            frame.render_widget(Paragraph::new(line), row);
+            y += 1;
         }
     }
 }

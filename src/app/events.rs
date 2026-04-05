@@ -4,6 +4,7 @@
 
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
+use crate::cluster::ClusterStatus;
 use crate::config::RefreshTask;
 use crate::keybindings::KeyAction;
 use crate::ui::components::DetailTab;
@@ -270,6 +271,37 @@ impl App {
             return;
         }
 
+        // Skip panel-specific shortcuts when cluster is stopped
+        if self.is_cluster_stopped() {
+            // In stopped screen, only handle keybinding actions (up/down/enter/help/etc.)
+            match action {
+                KeyAction::Quit => {
+                    self.should_quit = true;
+                }
+                KeyAction::Help => {
+                    self.mode = AppMode::Help;
+                }
+                KeyAction::CommandPalette => {
+                    self.command_palette.reset();
+                    self.mode = AppMode::CommandPalette;
+                }
+                KeyAction::MoveUp => {
+                    self.handle_up();
+                }
+                KeyAction::MoveDown => {
+                    self.handle_down();
+                }
+                KeyAction::Execute => {
+                    self.handle_enter();
+                }
+                KeyAction::Refresh => {
+                    self.spawn_status_check();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Handle panel resize shortcuts (+/- keys)
         if let KeyCode::Char(c) = code {
             match c {
@@ -520,6 +552,10 @@ impl App {
     }
 
     fn cycle_focus(&mut self) {
+        if self.is_cluster_stopped() {
+            // In stopped screen, just toggle between ActionBar and Content (both control action list)
+            return;
+        }
         self.focus = match self.focus {
             FocusArea::ActionBar => FocusArea::Content,
             FocusArea::Content => FocusArea::PodStats,
@@ -532,6 +568,11 @@ impl App {
     }
 
     fn handle_up(&mut self) {
+        // When cluster is stopped, up/down navigate the action list
+        if self.is_cluster_stopped() {
+            self.action_bar.move_up();
+            return;
+        }
         match self.focus {
             FocusArea::Content => {
                 self.menu.move_up();
@@ -547,6 +588,10 @@ impl App {
     }
 
     fn handle_down(&mut self) {
+        if self.is_cluster_stopped() {
+            self.action_bar.move_down();
+            return;
+        }
         match self.focus {
             FocusArea::Content => {
                 self.menu.move_down();
@@ -605,6 +650,13 @@ impl App {
     }
 
     fn handle_enter(&mut self) {
+        // When cluster is stopped, enter executes the selected action from the list
+        if self.is_cluster_stopped() {
+            if let Some(action) = self.action_bar.selected_action() {
+                self.execute_cluster_action(action);
+            }
+            return;
+        }
         match self.focus {
             FocusArea::ActionBar => {
                 if let Some(action) = self.action_bar.selected_action() {
@@ -676,5 +728,13 @@ impl App {
                 half.saturating_sub(3) as usize
             })
             .unwrap_or(10)
+    }
+
+    /// Check if the cluster is in a stopped state (not running or starting)
+    fn is_cluster_stopped(&self) -> bool {
+        !matches!(
+            self.cluster_status,
+            ClusterStatus::Running | ClusterStatus::Starting
+        )
     }
 }

@@ -9,14 +9,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, Namespace, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    Container, ContainerPort, Namespace, Node, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, Pod, PodSpec, Service, ServicePort, ServiceSpec, Volume,
     VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::api::{Api, DeleteParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, PostParams};
+use tokio::net::TcpStream;
 
 use crate::app::AppMessage;
 use crate::cluster::kube_ops::KubeOps;
@@ -75,14 +76,34 @@ const DIAG_NAMESPACE: &str = "k3dev-diag";
 /// Per-test timeout in seconds. Deep tests need longer than the default 10s.
 fn test_timeout(test_id: &str) -> Duration {
     let secs = match test_id {
+        "host_ports_reachable" | "no_crash_loops" => 15,
         "deep_setup" => 60,
         "deep_dns" => 90,
         "deep_connectivity" => 120,
         "deep_volume" => 120,
+        "deep_host_http" | "deep_docker_in_container" | "deep_runtime_socket" => 30,
         "deep_cleanup" => 30,
         _ => 10,
     };
     Duration::from_secs(secs)
+}
+
+/// Initialize a K8s client from cluster config.
+async fn init_k8s_client(config: &ClusterConfig) -> Result<K8sClient, String> {
+    K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
+        .await
+        .map_err(|e| format!("client init failed: {}", e))
+}
+
+/// Format a list of items, showing at most `max` with a "(+N)" suffix for the rest.
+fn truncated_list(items: &[&str], max: usize) -> String {
+    let shown: Vec<_> = items.iter().take(max).copied().collect();
+    let suffix = if items.len() > max {
+        format!(" (+{})", items.len() - max)
+    } else {
+        String::new()
+    };
+    format!("{}{}", shown.join(", "), suffix)
 }
 
 fn build_test_list() -> Vec<DiagnosticResult> {
@@ -138,6 +159,20 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             status: DiagnosticStatus::Pending,
             duration: None,
         },
+        DiagnosticResult {
+            id: "container_health",
+            category: CAT_CLUSTER,
+            name: "Container health".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "arch_mismatch",
+            category: CAT_CLUSTER,
+            name: "Architecture match".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
         // Core Services
         DiagnosticResult {
             id: "coredns_running",
@@ -160,7 +195,21 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             status: DiagnosticStatus::Pending,
             duration: None,
         },
+        DiagnosticResult {
+            id: "flannel_running",
+            category: CAT_CORE_SERVICES,
+            name: "Flannel CNI configured".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
         // Networking
+        DiagnosticResult {
+            id: "host_ports_reachable",
+            category: CAT_NETWORKING,
+            name: "Host ports reachable".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
         DiagnosticResult {
             id: "ingress_configured",
             category: CAT_NETWORKING,
@@ -182,6 +231,13 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             status: DiagnosticStatus::Pending,
             duration: None,
         },
+        DiagnosticResult {
+            id: "tls_cert_valid",
+            category: CAT_NETWORKING,
+            name: "TLS certificate valid".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
         // Pods
         DiagnosticResult {
             id: "no_stuck_pods",
@@ -194,6 +250,20 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             id: "no_pull_errors",
             category: CAT_PODS,
             name: "No ImagePullBackOff".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "no_crash_loops",
+            category: CAT_PODS,
+            name: "No CrashLoopBackOff".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "node_conditions",
+            category: CAT_PODS,
+            name: "Node conditions healthy".to_string(),
             status: DiagnosticStatus::Pending,
             duration: None,
         },
@@ -227,6 +297,27 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             duration: None,
         },
         DiagnosticResult {
+            id: "deep_host_http",
+            category: CAT_DEEP_VERIFICATION,
+            name: "Host HTTP to Traefik".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "deep_docker_in_container",
+            category: CAT_DEEP_VERIFICATION,
+            name: "Docker socket in container".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "deep_runtime_socket",
+            category: CAT_DEEP_VERIFICATION,
+            name: "Container runtime socket".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
             id: "deep_cleanup",
             category: CAT_DEEP_VERIFICATION,
             name: "Cleanup test resources".to_string(),
@@ -246,13 +337,15 @@ fn should_skip(report: &DiagnosticsReport, test_idx: usize) -> Option<&'static s
         return None;
     }
 
-    // If any prerequisite failed, skip everything after
-    let prereq_failed = report
+    // Only critical prerequisites (Docker, kubectl) block everything else.
+    // Advisory checks (AppArmor, br_netfilter) are informational and don't cascade.
+    const CRITICAL_PREREQS: &[&str] = &["docker_accessible", "kubectl_installed"];
+    let critical_failed = report
         .results
         .iter()
-        .filter(|r| r.category == CAT_PREREQUISITES)
+        .filter(|r| CRITICAL_PREREQS.contains(&r.id))
         .any(|r| matches!(r.status, DiagnosticStatus::Failed(_)));
-    if prereq_failed {
+    if critical_failed {
         return Some("prerequisite failed");
     }
 
@@ -297,7 +390,9 @@ fn should_skip(report: &DiagnosticsReport, test_idx: usize) -> Option<&'static s
         }
 
         // dns/connectivity/volume require setup to have passed
-        if test_id != "deep_setup" {
+        // host_http, docker_in_container, runtime_socket don't need setup
+        const DEEP_NEEDS_SETUP: &[&str] = &["deep_dns", "deep_connectivity", "deep_volume"];
+        if DEEP_NEEDS_SETUP.contains(&test_id) {
             let setup = report.results.iter().find(|r| r.id == "deep_setup");
             if !matches!(setup, Some(r) if r.status == DiagnosticStatus::Passed) {
                 return Some("setup failed");
@@ -306,6 +401,459 @@ fn should_skip(report: &DiagnosticsReport, test_idx: usize) -> Option<&'static s
     }
 
     None
+}
+
+// ==================== Preflight Check Categories ====================
+
+const CAT_PREFLIGHT_SYSTEM: &str = "System";
+const CAT_PREFLIGHT_DOCKER: &str = "Docker";
+const CAT_PREFLIGHT_PORTS: &str = "Ports";
+const CAT_PREFLIGHT_CONFIG: &str = "Configuration";
+
+fn build_preflight_list(config: &ClusterConfig) -> Vec<DiagnosticResult> {
+    let mut tests = vec![
+        // System
+        DiagnosticResult {
+            id: "pre_docker_accessible",
+            category: CAT_PREFLIGHT_SYSTEM,
+            name: "Docker accessible".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "pre_kubectl_installed",
+            category: CAT_PREFLIGHT_SYSTEM,
+            name: "kubectl installed".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "pre_arch_check",
+            category: CAT_PREFLIGHT_SYSTEM,
+            name: "Architecture".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        // Docker
+        DiagnosticResult {
+            id: "pre_docker_info",
+            category: CAT_PREFLIGHT_DOCKER,
+            name: "Docker daemon healthy".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "pre_docker_disk",
+            category: CAT_PREFLIGHT_DOCKER,
+            name: "Docker disk space".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "pre_k3s_image",
+            category: CAT_PREFLIGHT_DOCKER,
+            name: "K3s image available".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "pre_container_conflict",
+            category: CAT_PREFLIGHT_DOCKER,
+            name: "No container name conflict".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+        DiagnosticResult {
+            id: "pre_network_conflict",
+            category: CAT_PREFLIGHT_DOCKER,
+            name: "No network name conflict".to_string(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        },
+    ];
+
+    // Ports — add one test per core port
+    let core_ports: Vec<(u16, &str)> = vec![
+        (config.http_port, "HTTP"),
+        (config.https_port, "HTTPS"),
+        (config.api_port, "K8s API"),
+    ];
+    for (port, label) in &core_ports {
+        tests.push(DiagnosticResult {
+            id: "pre_port", // All port tests share this id; name differentiates
+            category: CAT_PREFLIGHT_PORTS,
+            name: format!("Port {} ({}) available", port, label),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        });
+    }
+    for (host_port, _) in &config.additional_ports {
+        tests.push(DiagnosticResult {
+            id: "pre_port",
+            category: CAT_PREFLIGHT_PORTS,
+            name: format!("Port {} (additional) available", host_port),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        });
+    }
+
+    // Configuration
+    tests.push(DiagnosticResult {
+        id: "pre_kubeconfig_dir",
+        category: CAT_PREFLIGHT_CONFIG,
+        name: "Kubeconfig directory writable".to_string(),
+        status: DiagnosticStatus::Pending,
+        duration: None,
+    });
+    tests.push(DiagnosticResult {
+        id: "pre_certs_dir",
+        category: CAT_PREFLIGHT_CONFIG,
+        name: "Certs directory writable".to_string(),
+        status: DiagnosticStatus::Pending,
+        duration: None,
+    });
+
+    tests
+}
+
+/// Preflight skip logic: Docker tests require docker_accessible to pass
+fn should_skip_preflight(report: &DiagnosticsReport, test_idx: usize) -> Option<&'static str> {
+    let test_cat = report.results[test_idx].category;
+
+    if test_cat == CAT_PREFLIGHT_SYSTEM {
+        return None;
+    }
+
+    // Docker/Ports categories require Docker to be accessible
+    let docker_ok = report
+        .results
+        .iter()
+        .find(|r| r.id == "pre_docker_accessible")
+        .map(|r| r.status == DiagnosticStatus::Passed)
+        .unwrap_or(false);
+
+    if !docker_ok && (test_cat == CAT_PREFLIGHT_DOCKER || test_cat == CAT_PREFLIGHT_PORTS) {
+        return Some("Docker not accessible");
+    }
+
+    None
+}
+
+/// Execute a single preflight test
+async fn execute_preflight_test(
+    test_id: &str,
+    test_name: &str,
+    config: &ClusterConfig,
+) -> Result<Option<String>, String> {
+    match test_id {
+        "pre_docker_accessible" => {
+            let platform = PlatformInfo::detect().map_err(|e| e.to_string())?;
+            if platform.is_docker_available().await {
+                Ok(None)
+            } else {
+                Err("Docker daemon not reachable".to_string())
+            }
+        }
+        "pre_kubectl_installed" => {
+            let platform = PlatformInfo::detect().map_err(|e| e.to_string())?;
+            if platform.is_kubectl_installed() {
+                Ok(None)
+            } else {
+                Err("kubectl not found in PATH".to_string())
+            }
+        }
+        "pre_arch_check" => {
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let info = docker
+                .client
+                .info()
+                .await
+                .map_err(|e| format!("docker info failed: {}", e))?;
+
+            let docker_arch = info
+                .architecture
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string();
+            let binary_arch = if cfg!(target_arch = "x86_64") {
+                "x86_64"
+            } else if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "unknown"
+            };
+
+            let mismatch = matches!(
+                (binary_arch, docker_arch.as_str()),
+                ("x86_64", "aarch64") | ("aarch64", "x86_64")
+            );
+
+            if mismatch && cfg!(target_os = "macos") {
+                Err(format!(
+                    "binary={}, Docker={} (Rosetta detected)",
+                    binary_arch, docker_arch
+                ))
+            } else if mismatch {
+                Err(format!("binary={}, Docker={}", binary_arch, docker_arch))
+            } else {
+                Ok(Some(docker_arch))
+            }
+        }
+        "pre_docker_info" => {
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let info = docker
+                .client
+                .info()
+                .await
+                .map_err(|e| format!("daemon error: {}", e))?;
+
+            let server_version = info.server_version.unwrap_or_default();
+            let cgroup = info
+                .cgroup_driver
+                .map(|d| format!("{:?}", d))
+                .unwrap_or_else(|| "unknown".to_string());
+            Ok(Some(format!("v{}, cgroup={}", server_version, cgroup)))
+        }
+        "pre_docker_disk" => {
+            // Use docker info to check available disk space
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let info = docker
+                .client
+                .info()
+                .await
+                .map_err(|e| format!("docker info failed: {}", e))?;
+
+            // Check images count as a rough proxy for disk usage
+            let images = info.images.unwrap_or(0);
+            let containers = info.containers.unwrap_or(0);
+            let docker_root = info.docker_root_dir.unwrap_or_default();
+
+            // Check disk space on Docker root dir using statvfs
+            match nix::sys::statvfs::statvfs(docker_root.as_str()) {
+                Ok(stat) => {
+                    let avail_gb =
+                        (stat.blocks_available() * stat.fragment_size()) / (1024 * 1024 * 1024);
+                    if avail_gb < 5 {
+                        Err(format!(
+                            "low disk: {}G free on {} ({} images, {} containers)",
+                            avail_gb, docker_root, images, containers
+                        ))
+                    } else {
+                        Ok(Some(format!("{}G free, {} images", avail_gb, images)))
+                    }
+                }
+                Err(_) => Ok(Some(format!(
+                    "{} images, {} containers",
+                    images, containers
+                ))),
+            }
+        }
+        "pre_k3s_image" => {
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let image = config.k3s_image();
+            if docker.image_exists(&image).await {
+                Ok(Some("cached locally".to_string()))
+            } else {
+                Ok(Some("will be pulled on start".to_string()))
+            }
+        }
+        "pre_container_conflict" => {
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            if docker.container_exists(&config.container_name).await {
+                // Container exists — check if it's running or stopped
+                if docker.container_running(&config.container_name).await {
+                    Err(format!(
+                        "'{}' already running — stop or destroy first",
+                        config.container_name
+                    ))
+                } else {
+                    Ok(Some(format!(
+                        "'{}' exists (stopped) — will be restarted",
+                        config.container_name
+                    )))
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        "pre_network_conflict" => {
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let exists = docker
+                .client
+                .inspect_network(
+                    &config.network_name,
+                    None::<bollard::query_parameters::InspectNetworkOptions>,
+                )
+                .await
+                .is_ok();
+            if exists {
+                Ok(Some(format!(
+                    "'{}' exists (will be reused)",
+                    config.network_name
+                )))
+            } else {
+                Ok(None)
+            }
+        }
+        "pre_port" => {
+            // Extract port number from test name: "Port XXXX (...) available"
+            let port: u16 = test_name
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "invalid port test".to_string())?;
+
+            // First check if our own k3dev container already has this port mapped
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            if let Ok(docker) = DockerManager::new(socket_path) {
+                if let Ok(info) = docker
+                    .client
+                    .inspect_container(
+                        &config.container_name,
+                        None::<bollard::query_parameters::InspectContainerOptions>,
+                    )
+                    .await
+                {
+                    // Container exists — check if it has this port mapped
+                    let has_port = info
+                        .host_config
+                        .as_ref()
+                        .and_then(|hc| hc.port_bindings.as_ref())
+                        .map(|bindings| {
+                            bindings.values().flatten().flatten().any(|pb| {
+                                pb.host_port.as_ref().and_then(|p| p.parse::<u16>().ok())
+                                    == Some(port)
+                            })
+                        })
+                        .unwrap_or(false);
+
+                    if has_port {
+                        let running = info.state.and_then(|s| s.running).unwrap_or(false);
+                        if running {
+                            return Ok(Some("in use by k3dev (running)".to_string()));
+                        } else {
+                            return Ok(Some("mapped by k3dev (stopped)".to_string()));
+                        }
+                    }
+                }
+            }
+
+            // Not used by our container — check if port is actually available
+            // For privileged ports (< 1024), bind() fails without root even if free,
+            // so use TCP connect instead: connection refused = port is free.
+            if port < 1024 {
+                match std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                    std::time::Duration::from_millis(500),
+                ) {
+                    Ok(_) => Err(format!("port {} in use by another service", port)),
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Ok(None),
+                    Err(_) => Ok(None), // Timeout or other error = likely free
+                }
+            } else {
+                match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                    Ok(_) => Ok(None),
+                    Err(_) => Err(format!("port {} already in use by another service", port)),
+                }
+            }
+        }
+        "pre_kubeconfig_dir" => {
+            let kc_path = ClusterConfig::kubeconfig_path();
+            if let Some(parent) = kc_path.parent() {
+                if parent.exists() {
+                    Ok(Some(format!("{}", parent.display())))
+                } else {
+                    // Try to create it
+                    match std::fs::create_dir_all(parent) {
+                        Ok(_) => Ok(Some(format!("created {}", parent.display()))),
+                        Err(e) => Err(format!("{}: {}", parent.display(), e)),
+                    }
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        "pre_certs_dir" => {
+            let certs_dir = ClusterConfig::certs_dir();
+            if certs_dir.exists() {
+                Ok(Some(format!("{}", certs_dir.display())))
+            } else {
+                match std::fs::create_dir_all(&certs_dir) {
+                    Ok(_) => Ok(Some(format!("created {}", certs_dir.display()))),
+                    Err(e) => Err(format!("{}: {}", certs_dir.display(), e)),
+                }
+            }
+        }
+        _ => Err(format!("unknown preflight test: {}", test_id)),
+    }
+}
+
+/// Run preflight checks (no running cluster required)
+pub async fn run_preflight_checks(config: Arc<ClusterConfig>, tx: mpsc::Sender<AppMessage>) {
+    let mut report = DiagnosticsReport {
+        results: build_preflight_list(&config),
+        finished: false,
+    };
+
+    let _ = tx
+        .send(AppMessage::DiagnosticsUpdated(report.clone()))
+        .await;
+
+    for i in 0..report.results.len() {
+        if let Some(reason) = should_skip_preflight(&report, i) {
+            report.results[i].status = DiagnosticStatus::Skipped(reason.to_string());
+            let _ = tx
+                .send(AppMessage::DiagnosticsUpdated(report.clone()))
+                .await;
+            continue;
+        }
+
+        report.results[i].status = DiagnosticStatus::Running;
+        let _ = tx
+            .send(AppMessage::DiagnosticsUpdated(report.clone()))
+            .await;
+
+        let start = Instant::now();
+        let test_id = report.results[i].id;
+        let test_name = report.results[i].name.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_preflight_test(test_id, &test_name, &config),
+        )
+        .await;
+
+        report.results[i].duration = Some(start.elapsed());
+
+        match result {
+            Ok(Ok(msg)) => {
+                if let Some(detail) = msg {
+                    report.results[i].name = format!("{} ({})", report.results[i].name, detail);
+                }
+                report.results[i].status = DiagnosticStatus::Passed;
+            }
+            Ok(Err(reason)) => {
+                report.results[i].status = DiagnosticStatus::Failed(reason);
+            }
+            Err(_) => {
+                report.results[i].status = DiagnosticStatus::Failed("timed out".to_string());
+            }
+        }
+
+        let _ = tx
+            .send(AppMessage::DiagnosticsUpdated(report.clone()))
+            .await;
+    }
+
+    report.finished = true;
+    let _ = tx
+        .send(AppMessage::DiagnosticsUpdated(report.clone()))
+        .await;
 }
 
 /// Run all diagnostic tests, sending incremental updates to the UI
@@ -424,29 +972,31 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "br_netfilter_loaded" => {
-            // Only relevant on Linux
+            // Only relevant on Linux; k3s-in-Docker handles bridge networking
+            // inside the container, so this is advisory — not a hard failure.
             #[cfg(not(target_os = "linux"))]
             {
                 Ok(Some("not applicable (non-Linux)".to_string()))
             }
             #[cfg(target_os = "linux")]
             {
-                // Check if br_netfilter module is loaded
                 let modules = std::fs::read_to_string("/proc/modules").unwrap_or_default();
                 let br_loaded = modules.lines().any(|l| l.starts_with("br_netfilter "));
 
                 if br_loaded {
-                    // Also check sysctl value
                     let sysctl_val =
                         std::fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-iptables")
                             .unwrap_or_default();
                     if sysctl_val.trim() == "1" {
                         Ok(Some("loaded, bridge-nf-call-iptables=1".to_string()))
                     } else {
-                        Err("br_netfilter loaded but bridge-nf-call-iptables != 1".to_string())
+                        Ok(Some(
+                            "loaded, bridge-nf-call-iptables!=1 (ok for Docker mode)".to_string(),
+                        ))
                     }
                 } else {
-                    Err("br_netfilter not loaded (run: sudo modprobe br_netfilter)".to_string())
+                    // Not loaded — advisory only since k3s uses Docker mode
+                    Ok(Some("not loaded (ok for Docker mode)".to_string()))
                 }
             }
         }
@@ -460,9 +1010,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "k8s_api_reachable" => {
-            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
-                .await
-                .map_err(|e| format!("client init failed: {}", e))?;
+            let k8s = init_k8s_client(config).await?;
             if k8s.is_connected().await {
                 Ok(None)
             } else {
@@ -486,10 +1034,82 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 Err(format!("not ready: {}", names.join(", ")))
             }
         }
-        "coredns_running" => {
-            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
+        "container_health" => {
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let info = docker
+                .client
+                .inspect_container(
+                    &config.container_name,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("inspect failed: {}", e))?;
+
+            let restart_count = info.restart_count.unwrap_or(0);
+            let started_at = info.state.and_then(|s| s.started_at).unwrap_or_default();
+
+            if restart_count > 5 {
+                Err(format!(
+                    "high restart count: {} (started: {})",
+                    restart_count,
+                    started_at.get(..19).unwrap_or(&started_at)
+                ))
+            } else {
+                let ts = started_at
+                    .get(..19)
+                    .unwrap_or(&started_at)
+                    .replace('T', " ");
+                let detail = if restart_count > 0 {
+                    format!("{} restart(s), up since {}", restart_count, ts)
+                } else {
+                    format!("up since {}", ts)
+                };
+                Ok(Some(detail))
+            }
+        }
+        "arch_mismatch" => {
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let info = docker
+                .client
+                .info()
+                .await
+                .map_err(|e| format!("docker info failed: {}", e))?;
+
+            let docker_arch = info
+                .architecture
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string();
+            let binary_arch = if cfg!(target_arch = "x86_64") {
+                "x86_64"
+            } else if cfg!(target_arch = "aarch64") {
+                "aarch64"
+            } else {
+                "unknown"
+            };
+
+            let mismatch = matches!(
+                (binary_arch, docker_arch.as_str()),
+                ("x86_64", "aarch64") | ("aarch64", "x86_64")
+            );
+
+            if mismatch {
+                if cfg!(target_os = "macos") {
+                    Err(format!(
+                        "binary={}, Docker={} (Rosetta detected)",
+                        binary_arch, docker_arch
+                    ))
+                } else {
+                    Err(format!("binary={}, Docker={}", binary_arch, docker_arch))
+                }
+            } else {
+                Ok(Some(docker_arch))
+            }
+        }
+        "coredns_running" => {
+            let k8s = init_k8s_client(config).await?;
             let pods = k8s
                 .list_pods("kube-system", Some("k8s-app=kube-dns"))
                 .await
@@ -510,9 +1130,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "local_path_provisioner" => {
-            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
-                .await
-                .map_err(|e| e.to_string())?;
+            let k8s = init_k8s_client(config).await?;
             let pods = k8s
                 .list_pods("kube-system", Some("app=local-path-provisioner"))
                 .await
@@ -522,6 +1140,88 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 Ok(None)
             } else {
                 Err("no running local-path-provisioner pods".to_string())
+            }
+        }
+        "flannel_running" => {
+            // K3s embeds flannel in the k3s binary — no separate pods.
+            // Verify CNI config and flannel subnet exist inside the container.
+            let socket_path = PlatformInfo::find_docker_socket_sync();
+            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+
+            let cni_check = docker
+                .exec_in_container(
+                    &config.container_name,
+                    &[
+                        "sh",
+                        "-c",
+                        "test -f /var/lib/rancher/k3s/agent/etc/cni/net.d/10-flannel.conflist && echo 'ok' || echo 'missing'",
+                    ],
+                )
+                .await
+                .map_err(|e| format!("exec failed: {}", e))?;
+
+            if cni_check.trim() != "ok" {
+                return Err("flannel CNI config not found in k3s container".to_string());
+            }
+
+            let subnet = docker
+                .exec_in_container(
+                    &config.container_name,
+                    &[
+                        "sh",
+                        "-c",
+                        "cat /run/flannel/subnet.env 2>/dev/null || echo 'missing'",
+                    ],
+                )
+                .await
+                .map_err(|e| format!("exec failed: {}", e))?;
+
+            if subnet.contains("FLANNEL_NETWORK") {
+                // Extract the network CIDR for display
+                let network = subnet
+                    .lines()
+                    .find(|l| l.starts_with("FLANNEL_NETWORK="))
+                    .and_then(|l| l.strip_prefix("FLANNEL_NETWORK="))
+                    .unwrap_or("configured");
+                Ok(Some(format!("embedded, {}", network)))
+            } else {
+                Err("flannel subnet not configured".to_string())
+            }
+        }
+        "host_ports_reachable" => {
+            let host = if PlatformInfo::is_docker_remote() {
+                PlatformInfo::docker_remote_host()
+                    .unwrap_or("127.0.0.1")
+                    .to_string()
+            } else {
+                "127.0.0.1".to_string()
+            };
+
+            let ports: Vec<(u16, &str)> = vec![
+                (config.http_port, "HTTP"),
+                (config.https_port, "HTTPS"),
+                (config.api_port, "K8s API"),
+            ];
+
+            let mut failed = Vec::new();
+            let mut passed = 0u32;
+
+            for (port, label) in &ports {
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    TcpStream::connect(format!("{}:{}", host, port)),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => passed += 1,
+                    _ => failed.push(format!("{}({})", label, port)),
+                }
+            }
+
+            if failed.is_empty() {
+                Ok(Some(format!("{} port(s) reachable", passed)))
+            } else {
+                Err(format!("unreachable: {}", failed.join(", ")))
             }
         }
         "ingress_configured" => {
@@ -545,13 +1245,8 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             if missing.is_empty() {
                 Ok(None)
             } else {
-                let hosts: Vec<_> = missing.iter().take(3).cloned().collect();
-                let suffix = if missing.len() > 3 {
-                    format!(" (+{})", missing.len() - 3)
-                } else {
-                    String::new()
-                };
-                Err(format!("missing: {}{}", hosts.join(", "), suffix))
+                let hosts: Vec<_> = missing.iter().map(|s| s.as_str()).collect();
+                Err(format!("missing: {}", truncated_list(&hosts, 3)))
             }
         }
         "ingress_healthy" => {
@@ -572,19 +1267,47 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             if unhealthy.is_empty() {
                 Ok(Some(format!("{} endpoint(s)", health.len())))
             } else {
-                let show: Vec<_> = unhealthy.iter().take(3).copied().collect();
-                let suffix = if unhealthy.len() > 3 {
-                    format!(" (+{})", unhealthy.len() - 3)
-                } else {
-                    String::new()
-                };
-                Err(format!("unhealthy: {}{}", show.join(", "), suffix))
+                Err(format!("unhealthy: {}", truncated_list(&unhealthy, 3)))
+            }
+        }
+        "tls_cert_valid" => {
+            let certs_dir = ClusterConfig::certs_dir();
+            let cert_path = certs_dir.join("local-cert.pem");
+            let key_path = certs_dir.join("local-key.pem");
+
+            if !cert_path.exists() {
+                return Err(format!("cert not found: {}", cert_path.display()));
+            }
+            if !key_path.exists() {
+                return Err(format!("key not found: {}", key_path.display()));
+            }
+
+            // Check cert expiry using x509-parser
+            {
+                use x509_parser::prelude::*;
+                let pem_data =
+                    std::fs::read(&cert_path).map_err(|e| format!("failed to read cert: {}", e))?;
+                let pem_parsed =
+                    ::pem::parse(&pem_data).map_err(|e| format!("failed to parse PEM: {}", e))?;
+                match X509Certificate::from_der(pem_parsed.contents()) {
+                    Ok((_, cert)) => {
+                        let now = chrono::Utc::now().timestamp();
+                        let not_after = cert.validity().not_after.timestamp();
+                        let remaining_secs = not_after - now;
+                        if remaining_secs < 0 {
+                            Err("certificate expired".to_string())
+                        } else if remaining_secs < 86400 {
+                            Err("certificate expiring within 24h".to_string())
+                        } else {
+                            Ok(Some("valid, not expiring within 24h".to_string()))
+                        }
+                    }
+                    Err(e) => Err(format!("failed to parse certificate: {}", e)),
+                }
             }
         }
         "no_stuck_pods" => {
-            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
-                .await
-                .map_err(|e| e.to_string())?;
+            let k8s = init_k8s_client(config).await?;
             let pending = k8s
                 .list_pending_pods()
                 .await
@@ -592,19 +1315,12 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             if pending.is_empty() {
                 Ok(None)
             } else {
-                let names: Vec<_> = pending.iter().take(3).map(|p| p.name.as_str()).collect();
-                let suffix = if pending.len() > 3 {
-                    format!(" (+{})", pending.len() - 3)
-                } else {
-                    String::new()
-                };
-                Err(format!("stuck: {}{}", names.join(", "), suffix))
+                let names: Vec<_> = pending.iter().map(|p| p.name.as_str()).collect();
+                Err(format!("stuck: {}", truncated_list(&names, 3)))
             }
         }
         "no_pull_errors" => {
-            let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
-                .await
-                .map_err(|e| e.to_string())?;
+            let k8s = init_k8s_client(config).await?;
             let pending = k8s
                 .list_pending_pods()
                 .await
@@ -628,11 +1344,110 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 Err(format!("pull errors: {}", names.join(", ")))
             }
         }
+        "no_crash_loops" => {
+            let k8s = init_k8s_client(config).await?;
+            let client = k8s.client().clone();
+            let namespaces = k8s
+                .list_namespaces()
+                .await
+                .map_err(|e| format!("failed to list namespaces: {}", e))?;
+
+            let mut problems = Vec::new();
+
+            for ns in &namespaces {
+                let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+                let list = pods
+                    .list(&ListParams::default())
+                    .await
+                    .map_err(|e| format!("failed to list pods in {}: {}", ns, e))?;
+
+                for pod in list.items {
+                    let pod_name = pod.metadata.name.clone().unwrap_or_default();
+                    if let Some(status) = &pod.status {
+                        let all_statuses = status
+                            .container_statuses
+                            .iter()
+                            .flatten()
+                            .chain(status.init_container_statuses.iter().flatten());
+
+                        for cs in all_statuses {
+                            if let Some(state) = &cs.state {
+                                if let Some(waiting) = &state.waiting {
+                                    if waiting.reason.as_deref() == Some("CrashLoopBackOff") {
+                                        problems
+                                            .push(format!("{}/{}: CrashLoopBackOff", ns, pod_name));
+                                    }
+                                }
+                                if let Some(terminated) = &state.terminated {
+                                    let reason = terminated.reason.as_deref().unwrap_or("");
+                                    if reason == "OOMKilled" || reason == "Error" {
+                                        problems.push(format!("{}/{}: {}", ns, pod_name, reason));
+                                    }
+                                }
+                            }
+                            // High restart count without an obvious state issue
+                            if cs.restart_count > 10 {
+                                let already = problems.iter().any(|p| p.contains(&pod_name));
+                                if !already {
+                                    problems.push(format!(
+                                        "{}/{}: {} restarts",
+                                        ns, pod_name, cs.restart_count
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if problems.is_empty() {
+                Ok(None)
+            } else {
+                let shown: Vec<_> = problems.iter().take(3).map(|s| s.as_str()).collect();
+                Err(truncated_list(&shown, 3))
+            }
+        }
+        "node_conditions" => {
+            let k8s = init_k8s_client(config).await?;
+            let client = k8s.client().clone();
+            let nodes: Api<Node> = Api::all(client);
+            let list = nodes
+                .list(&ListParams::default())
+                .await
+                .map_err(|e| format!("failed to list nodes: {}", e))?;
+
+            let pressure_types = ["MemoryPressure", "DiskPressure", "PIDPressure"];
+            let mut warnings = Vec::new();
+
+            for node in &list.items {
+                let node_name = node.metadata.name.as_deref().unwrap_or("unknown");
+                if let Some(status) = &node.status {
+                    if let Some(conditions) = &status.conditions {
+                        for cond in conditions {
+                            if pressure_types.contains(&cond.type_.as_str())
+                                && cond.status == "True"
+                            {
+                                warnings.push(format!("{}: {}", node_name, cond.type_));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if warnings.is_empty() {
+                Ok(Some("no pressure conditions".to_string()))
+            } else {
+                Err(format!("pressure: {}", warnings.join(", ")))
+            }
+        }
         // Deep Verification tests
         "deep_setup" => deep_setup(config).await,
         "deep_dns" => deep_dns(config).await,
         "deep_connectivity" => deep_connectivity(config).await,
         "deep_volume" => deep_volume(config).await,
+        "deep_host_http" => deep_host_http(config).await,
+        "deep_docker_in_container" => deep_docker_in_container(config).await,
+        "deep_runtime_socket" => deep_runtime_socket(config).await,
         "deep_cleanup" => deep_cleanup(config).await,
 
         _ => Err(format!("unknown test: {}", test_id)),
@@ -676,9 +1491,7 @@ async fn delete_pod_if_exists(client: &kube::Client, namespace: &str, name: &str
 
 /// Create the k3dev-diag namespace (clean up stale one first)
 async fn deep_setup(config: &ClusterConfig) -> Result<Option<String>, String> {
-    let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
-        .await
-        .map_err(|e| format!("client init failed: {}", e))?;
+    let k8s = init_k8s_client(config).await?;
     let client = k8s.client().clone();
     let namespaces: Api<Namespace> = Api::all(client.clone());
 
@@ -721,9 +1534,7 @@ async fn deep_setup(config: &ClusterConfig) -> Result<Option<String>, String> {
 
 /// Deploy busybox pod and exec nslookup to verify DNS works
 async fn deep_dns(config: &ClusterConfig) -> Result<Option<String>, String> {
-    let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
-        .await
-        .map_err(|e| format!("client init failed: {}", e))?;
+    let k8s = init_k8s_client(config).await?;
     let client = k8s.client().clone();
     let pods: Api<Pod> = Api::namespaced(client.clone(), DIAG_NAMESPACE);
 
@@ -786,9 +1597,7 @@ async fn deep_dns(config: &ClusterConfig) -> Result<Option<String>, String> {
 
 /// Deploy nginx + service + client pod, verify wget from client to nginx service
 async fn deep_connectivity(config: &ClusterConfig) -> Result<Option<String>, String> {
-    let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
-        .await
-        .map_err(|e| format!("client init failed: {}", e))?;
+    let k8s = init_k8s_client(config).await?;
     let client = k8s.client().clone();
 
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), DIAG_NAMESPACE);
@@ -919,9 +1728,7 @@ async fn deep_connectivity(config: &ClusterConfig) -> Result<Option<String>, Str
 
 /// Create PVC, mount in pod, write file, read it back
 async fn deep_volume(config: &ClusterConfig) -> Result<Option<String>, String> {
-    let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
-        .await
-        .map_err(|e| format!("client init failed: {}", e))?;
+    let k8s = init_k8s_client(config).await?;
     let client = k8s.client().clone();
 
     let pods_api: Api<Pod> = Api::namespaced(client.clone(), DIAG_NAMESPACE);
@@ -1033,11 +1840,96 @@ async fn deep_volume(config: &ClusterConfig) -> Result<Option<String>, String> {
     }
 }
 
+/// HTTP GET from host to Traefik — verifies full port mapping + Traefik chain
+async fn deep_host_http(config: &ClusterConfig) -> Result<Option<String>, String> {
+    let host = if PlatformInfo::is_docker_remote() {
+        PlatformInfo::docker_remote_host()
+            .unwrap_or("127.0.0.1")
+            .to_string()
+    } else {
+        "127.0.0.1".to_string()
+    };
+
+    let url = format!("http://{}:{}", host, config.http_port);
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP GET {} failed: {}", url, e))?;
+
+    let status = resp.status().as_u16();
+    // Any response from Traefik proves the path works (404 = no matching routes, etc.)
+    Ok(Some(format!("HTTP {}", status)))
+}
+
+/// Verify Docker socket is accessible inside the k3s container
+async fn deep_docker_in_container(config: &ClusterConfig) -> Result<Option<String>, String> {
+    let socket_path = PlatformInfo::find_docker_socket_sync();
+    let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+
+    let output = docker
+        .exec_in_container(
+            &config.container_name,
+            &[
+                "sh",
+                "-c",
+                "test -S /var/run/docker.sock && echo 'ok' || echo 'missing'",
+            ],
+        )
+        .await
+        .map_err(|e| format!("exec failed: {}", e))?;
+
+    if output.trim() == "ok" {
+        Ok(Some("socket mounted".to_string()))
+    } else {
+        Err("Docker socket not accessible inside k3s container".to_string())
+    }
+}
+
+/// Verify container runtime socket (macOS: /proc/1/root/run/docker.sock bypass)
+async fn deep_runtime_socket(config: &ClusterConfig) -> Result<Option<String>, String> {
+    if cfg!(not(target_os = "macos")) {
+        return Ok(Some(
+            "not applicable (Linux uses direct socket)".to_string(),
+        ));
+    }
+
+    let socket_path = PlatformInfo::find_docker_socket_sync();
+    let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+
+    // On macOS (Docker Desktop), k3s uses --container-runtime-endpoint /proc/1/root/run/docker.sock
+    // to bypass the proxy socket. Verify this path exists and is a socket.
+    let output = docker
+        .exec_in_container(
+            &config.container_name,
+            &[
+                "sh",
+                "-c",
+                "test -S /proc/1/root/run/docker.sock && echo 'ok' || echo 'missing'",
+            ],
+        )
+        .await
+        .map_err(|e| format!("exec failed: {}", e))?;
+
+    if output.trim() == "ok" {
+        Ok(Some("runtime socket accessible".to_string()))
+    } else {
+        Err("/proc/1/root/run/docker.sock not accessible (Docker Desktop VM issue)".to_string())
+    }
+}
+
 /// Delete the k3dev-diag namespace (cascades to all resources)
 async fn deep_cleanup(config: &ClusterConfig) -> Result<Option<String>, String> {
-    let k8s = K8sClient::new(config.kubeconfig.as_deref(), config.context.as_deref())
-        .await
-        .map_err(|e| format!("client init failed: {}", e))?;
+    let k8s = init_k8s_client(config).await?;
     let client = k8s.client().clone();
     let namespaces: Api<Namespace> = Api::all(client);
 
@@ -1059,7 +1951,7 @@ mod tests {
     #[test]
     fn test_build_test_list() {
         let tests = build_test_list();
-        assert_eq!(tests.len(), 20);
+        assert_eq!(tests.len(), 30);
         assert!(tests.iter().all(|t| t.status == DiagnosticStatus::Pending));
     }
 
@@ -1104,6 +1996,32 @@ mod tests {
         // Prerequisite tests themselves should not be skipped
         assert!(should_skip(&report, 0).is_none());
         assert!(should_skip(&report, 1).is_none());
+    }
+
+    #[test]
+    fn test_no_skip_on_advisory_prerequisite_failure() {
+        let mut report = DiagnosticsReport::new();
+        // Pass critical prerequisites, fail br_netfilter (advisory)
+        for r in report.results.iter_mut() {
+            if r.category == CAT_PREREQUISITES {
+                r.status = DiagnosticStatus::Passed;
+            }
+        }
+        let br_idx = report
+            .results
+            .iter()
+            .position(|r| r.id == "br_netfilter_loaded")
+            .unwrap();
+        report.results[br_idx].status =
+            DiagnosticStatus::Failed("br_netfilter not loaded".to_string());
+
+        // Cluster tests should NOT be skipped (only advisory prereq failed)
+        let cluster_idx = report
+            .results
+            .iter()
+            .position(|r| r.category == CAT_CLUSTER)
+            .unwrap();
+        assert!(should_skip(&report, cluster_idx).is_none());
     }
 
     #[test]
@@ -1220,6 +2138,49 @@ mod tests {
     }
 
     #[test]
+    fn test_deep_no_setup_tests_run_independently() {
+        let mut report = DiagnosticsReport::new();
+        // Pass everything before deep, but fail deep_setup
+        for r in report.results.iter_mut() {
+            if r.category != CAT_DEEP_VERIFICATION {
+                r.status = DiagnosticStatus::Passed;
+            }
+        }
+        let setup_idx = report
+            .results
+            .iter()
+            .position(|r| r.id == "deep_setup")
+            .unwrap();
+        report.results[setup_idx].status =
+            DiagnosticStatus::Failed("ns creation failed".to_string());
+
+        // deep_host_http, deep_docker_in_container, deep_runtime_socket should NOT be skipped
+        for id in &[
+            "deep_host_http",
+            "deep_docker_in_container",
+            "deep_runtime_socket",
+        ] {
+            let idx = report.results.iter().position(|r| r.id == *id).unwrap();
+            assert!(
+                should_skip(&report, idx).is_none(),
+                "{} should not be skipped when setup fails",
+                id
+            );
+        }
+
+        // deep_dns/connectivity/volume SHOULD be skipped
+        for id in &["deep_dns", "deep_connectivity", "deep_volume"] {
+            let idx = report.results.iter().position(|r| r.id == *id).unwrap();
+            assert_eq!(
+                should_skip(&report, idx),
+                Some("setup failed"),
+                "{} should be skipped when setup fails",
+                id
+            );
+        }
+    }
+
+    #[test]
     fn test_deep_cleanup_skipped_if_no_setup() {
         let mut report = DiagnosticsReport::new();
         // Pass everything before deep
@@ -1243,10 +2204,21 @@ mod tests {
     #[test]
     fn test_timeout_values() {
         assert_eq!(test_timeout("docker_accessible"), Duration::from_secs(10));
+        assert_eq!(
+            test_timeout("host_ports_reachable"),
+            Duration::from_secs(15)
+        );
+        assert_eq!(test_timeout("no_crash_loops"), Duration::from_secs(15));
         assert_eq!(test_timeout("deep_setup"), Duration::from_secs(60));
         assert_eq!(test_timeout("deep_dns"), Duration::from_secs(90));
         assert_eq!(test_timeout("deep_connectivity"), Duration::from_secs(120));
         assert_eq!(test_timeout("deep_volume"), Duration::from_secs(120));
+        assert_eq!(test_timeout("deep_host_http"), Duration::from_secs(30));
+        assert_eq!(
+            test_timeout("deep_docker_in_container"),
+            Duration::from_secs(30)
+        );
+        assert_eq!(test_timeout("deep_runtime_socket"), Duration::from_secs(30));
         assert_eq!(test_timeout("deep_cleanup"), Duration::from_secs(30));
     }
 }

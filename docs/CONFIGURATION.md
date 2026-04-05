@@ -37,7 +37,7 @@ K3s cluster infrastructure settings.
 infrastructure:
   cluster_name: "k3dev"
   domain: "myapp.local"
-  k3s_version: "v1.33.4-k3s1"
+  k3s_version: "v1.35.2-k3s1"
   api_port: 6443
   http_port: 80
   https_port: 443
@@ -53,7 +53,7 @@ infrastructure:
 |--------|------|---------|-------------|
 | `cluster_name` | string | `k3dev` | Cluster name (derives container name: `{cluster_name}-server`, network name: `{cluster_name}-net`) |
 | `domain` | string | `local.k8s.dev` | Domain for local cluster ingress |
-| `k3s_version` | string | `v1.33.4-k3s1` | K3s container image version |
+| `k3s_version` | string | `v1.35.2-k3s1` | K3s container image version |
 | `api_port` | integer | `6443` | Kubernetes API port |
 | `http_port` | integer | `80` | HTTP ingress port |
 | `https_port` | integer | `443` | HTTPS ingress port |
@@ -122,7 +122,7 @@ logging:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | boolean | `true` | Enable file logging |
-| `file` | string | `/tmp/k3dev-{cluster_name}.log` | Log file path (supports `{cluster_name}` placeholder) |
+| `file` | string | `<temp_dir>/k3dev-{cluster_name}.log` | Log file path (supports `{cluster_name}` placeholder). Default uses the OS temp directory (`/tmp` on Linux, `$TMPDIR` on macOS) |
 | `level` | string | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 
 **Log Format:**
@@ -363,7 +363,7 @@ cluster:
 infrastructure:
   cluster_name: "k3dev"
   domain: "myapp.local"
-  k3s_version: "v1.33.4-k3s1"
+  k3s_version: "v1.35.2-k3s1"
   api_port: 6443
   http_port: 80
   https_port: 443

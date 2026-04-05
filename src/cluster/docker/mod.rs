@@ -329,6 +329,110 @@ impl DockerManager {
         Ok(result)
     }
 
+    /// Copy a file into a container at the specified directory path.
+    /// The file will be created with mode 0755 (executable).
+    pub async fn copy_to_container(
+        &self,
+        container: &str,
+        file_name: &str,
+        data: &[u8],
+        dest_dir: &str,
+    ) -> Result<()> {
+        // Build a tar archive in memory containing the file
+        let mut tar_builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar_builder.append_data(&mut header, file_name, data)?;
+        let tar_bytes = tar_builder.into_inner()?;
+
+        self.client
+            .upload_to_container(
+                container,
+                Some(bollard::query_parameters::UploadToContainerOptions {
+                    path: dest_dir.to_string(),
+                    ..Default::default()
+                }),
+                bollard::body_full(tar_bytes.into()),
+            )
+            .await
+            .with_context(|| {
+                format!("Failed to copy {} to {}:{}", file_name, container, dest_dir)
+            })?;
+
+        Ok(())
+    }
+
+    /// Execute a command in a container without waiting for it to finish (detached).
+    /// Achieves the same effect as `docker exec -d` by not attaching stdout/stderr.
+    pub async fn exec_detached(&self, container: &str, command: &[&str]) -> Result<()> {
+        let exec = self
+            .client
+            .create_exec(
+                container,
+                CreateExecOptions {
+                    cmd: Some(command.to_vec()),
+                    attach_stdout: Some(false),
+                    attach_stderr: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("Failed to create detached exec")?;
+
+        // Start and immediately drop — the process runs in the background
+        let _ = self
+            .client
+            .start_exec(&exec.id, Some(StartExecOptions::default()))
+            .await
+            .context("Failed to start detached exec")?;
+
+        Ok(())
+    }
+
+    /// Get published port bindings for a container.
+    /// Returns a map of container_port -> host_port.
+    pub async fn get_container_ports(
+        &self,
+        container: &str,
+    ) -> Result<std::collections::HashMap<u16, u16>> {
+        let info = self
+            .client
+            .inspect_container(container, None::<InspectContainerOptions>)
+            .await
+            .with_context(|| format!("Failed to inspect container {}", container))?;
+
+        let mut port_map = std::collections::HashMap::new();
+
+        if let Some(network) = info.network_settings {
+            if let Some(ports) = network.ports {
+                for (container_port_str, bindings) in ports {
+                    // container_port_str is like "2375/tcp"
+                    let container_port: u16 = container_port_str
+                        .split('/')
+                        .next()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(0);
+                    if container_port == 0 {
+                        continue;
+                    }
+                    if let Some(binding_list) = bindings {
+                        for binding in binding_list {
+                            if let Some(ref host_port_str) = binding.host_port {
+                                if let Ok(host_port) = host_port_str.parse::<u16>() {
+                                    port_map.insert(container_port, host_port);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(port_map)
+    }
+
     /// Copy a file from a container
     #[allow(dead_code)]
     pub async fn copy_from_container(

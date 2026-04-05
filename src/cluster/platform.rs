@@ -438,24 +438,20 @@ impl PlatformInfo {
         #[cfg(target_os = "linux")]
         {
             // Check what /usr/sbin/iptables or /sbin/iptables resolves to
-            let check_paths = ["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"];
+            let check_paths = [
+                "/usr/sbin/iptables",
+                "/sbin/iptables",
+                "/usr/bin/iptables",
+                "/etc/alternatives/iptables",
+            ];
             for path in &check_paths {
-                if let Ok(resolved) = std::fs::read_link(path) {
+                // Follow the full symlink chain to the final binary
+                if let Ok(resolved) = std::fs::canonicalize(path) {
                     let resolved_str = resolved.to_string_lossy();
                     if resolved_str.contains("nft") {
                         return "nft";
                     }
                     if resolved_str.contains("legacy") {
-                        return "legacy";
-                    }
-                }
-                // Also check iptables --version output
-                if let Ok(output) = std::process::Command::new(path).arg("--version").output() {
-                    let version = String::from_utf8_lossy(&output.stdout);
-                    if version.contains("nf_tables") {
-                        return "nft";
-                    }
-                    if version.contains("legacy") {
                         return "legacy";
                     }
                 }
@@ -538,12 +534,6 @@ impl PlatformInfo {
     /// Check if helm is installed
     pub fn is_helm_installed(&self) -> bool {
         Self::find_binary("helm").is_some()
-    }
-
-    /// Check if mkcert is installed
-    #[allow(dead_code)]
-    pub fn is_mkcert_installed(&self) -> bool {
-        Self::find_binary("mkcert").is_some()
     }
 
     /// Find Docker socket path synchronously (for use in spawned tasks).
