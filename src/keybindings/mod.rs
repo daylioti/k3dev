@@ -17,12 +17,6 @@ pub struct KeyBinding {
 }
 
 impl KeyBinding {
-    /// Create a new keybinding
-    #[allow(dead_code)]
-    pub fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
-        Self { code, modifiers }
-    }
-
     /// Parse a keybinding string into a KeyBinding
     ///
     /// Supported formats:

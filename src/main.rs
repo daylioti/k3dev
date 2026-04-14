@@ -19,7 +19,6 @@ mod hooks;
 mod k8s;
 mod keybindings;
 mod logging;
-mod shell;
 mod ui;
 
 use app::App;
@@ -267,7 +266,7 @@ async fn run_docker_passthrough(args: &[String], config_path: Option<&str>) -> R
     let cluster_config = cluster::ClusterConfig::from(config.infrastructure);
 
     // Check container is running
-    let docker = cluster::DockerManager::new(cluster::PlatformInfo::find_docker_socket_sync())?;
+    let docker = cluster::DockerManager::from_default_socket()?;
     let running = docker
         .container_running(&cluster_config.container_name)
         .await;

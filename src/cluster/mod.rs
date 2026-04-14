@@ -32,8 +32,6 @@ use crate::ui::components::OutputLine;
 pub struct ClusterManager {
     config: Arc<ClusterConfig>,
     k3s: Option<K3sManager>,
-    #[allow(dead_code)] // Used during start(), may be used for future operations
-    traefik: TraefikManager,
     ingress: IngressManager,
     platform: PlatformInfo,
 }
@@ -46,23 +44,15 @@ impl ClusterManager {
         // Try to create K3sManager, but don't fail if Docker isn't available yet
         let k3s = K3sManager::new(Arc::clone(&config)).await.ok();
 
-        let traefik = TraefikManager::new(Arc::clone(&config));
         // IngressManager without sudo - auto hosts update will try non-interactive
         let ingress = IngressManager::new();
 
         Ok(Self {
             config,
             k3s,
-            traefik,
             ingress,
             platform,
         })
-    }
-
-    /// Get the cluster configuration
-    #[allow(dead_code)]
-    pub fn config(&self) -> &ClusterConfig {
-        &self.config
     }
 
     /// Get cluster status
@@ -264,12 +254,4 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Update /etc/hosts with current ingress entries
-    #[allow(dead_code)]
-    pub async fn update_hosts(
-        &mut self,
-        output_tx: mpsc::Sender<OutputLine>,
-    ) -> Result<HostsUpdateResult> {
-        self.ingress.update_hosts(Some(output_tx)).await
-    }
 }

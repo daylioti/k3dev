@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::types::{CommandEntry, CommandGroup, Config, ExecConfig};
+use super::types::{CommandEntry, CommandGroup, Config, ExecConfig, ExecutionTarget};
 
 /// Lazy-compiled regex for matching @placeholder patterns (without capture)
 static PLACEHOLDER_CHECK_REGEX: Lazy<Regex> =
@@ -117,10 +117,7 @@ impl ConfigLoader {
         entry.name = self.replace_placeholders(&entry.name, placeholders);
 
         if let Some(exec) = &mut entry.exec {
-            exec.target.namespace = self.replace_placeholders(&exec.target.namespace, placeholders);
-            exec.target.selector = self.replace_placeholders(&exec.target.selector, placeholders);
-            exec.target.pod_name = self.replace_placeholders(&exec.target.pod_name, placeholders);
-            exec.target.container = self.replace_placeholders(&exec.target.container, placeholders);
+            self.resolve_target(&mut exec.target, placeholders);
             exec.workdir = self.replace_placeholders(&exec.workdir, placeholders);
             exec.cmd = self.replace_placeholders(&exec.cmd, placeholders);
         }
@@ -128,6 +125,30 @@ impl ConfigLoader {
         // Recurse into nested commands
         for nested in &mut entry.commands {
             self.resolve_command_entry(nested, placeholders);
+        }
+    }
+
+    fn resolve_target(
+        &self,
+        target: &mut ExecutionTarget,
+        placeholders: &HashMap<String, String>,
+    ) {
+        match target {
+            ExecutionTarget::Host => {}
+            ExecutionTarget::Docker { container } => {
+                *container = self.replace_placeholders(container, placeholders);
+            }
+            ExecutionTarget::Kubernetes {
+                namespace,
+                selector,
+                pod_name,
+                container,
+            } => {
+                *namespace = self.replace_placeholders(namespace, placeholders);
+                *selector = self.replace_placeholders(selector, placeholders);
+                *pod_name = self.replace_placeholders(pod_name, placeholders);
+                *container = self.replace_placeholders(container, placeholders);
+            }
         }
     }
 
@@ -176,17 +197,32 @@ impl ConfigLoader {
                 ));
             }
 
-            // Must have either selector or pod_name (unless it has input placeholders)
-            if exec.target.selector.is_empty()
-                && exec.target.pod_name.is_empty()
-                && !has_input_placeholders(&exec.target.selector)
-                && !has_input_placeholders(&exec.target.pod_name)
-            {
-                return Err(anyhow!(
-                    "In group '{}': command '{}': target must specify selector or pod_name",
-                    group_name,
-                    entry.name
-                ));
+            match &exec.target {
+                ExecutionTarget::Host => {}
+                ExecutionTarget::Docker { container } => {
+                    if container.is_empty() && !has_input_placeholders(container) {
+                        return Err(anyhow!(
+                            "In group '{}': command '{}': docker target requires 'container'",
+                            group_name,
+                            entry.name
+                        ));
+                    }
+                }
+                ExecutionTarget::Kubernetes {
+                    selector, pod_name, ..
+                } => {
+                    if selector.is_empty()
+                        && pod_name.is_empty()
+                        && !has_input_placeholders(selector)
+                        && !has_input_placeholders(pod_name)
+                    {
+                        return Err(anyhow!(
+                            "In group '{}': command '{}': kubernetes target must specify selector or pod_name",
+                            group_name,
+                            entry.name
+                        ));
+                    }
+                }
             }
         }
 
@@ -243,14 +279,24 @@ pub fn get_exec_placeholders(exec: &ExecConfig) -> Vec<String> {
     let mut all_placeholders = Vec::new();
     let mut seen = HashSet::new();
 
-    let fields = [
-        &exec.target.namespace,
-        &exec.target.selector,
-        &exec.target.pod_name,
-        &exec.target.container,
-        &exec.workdir,
-        &exec.cmd,
-    ];
+    let mut fields: Vec<&str> = vec![&exec.workdir, &exec.cmd];
+    match &exec.target {
+        ExecutionTarget::Host => {}
+        ExecutionTarget::Docker { container } => {
+            fields.push(container);
+        }
+        ExecutionTarget::Kubernetes {
+            namespace,
+            selector,
+            pod_name,
+            container,
+        } => {
+            fields.push(namespace);
+            fields.push(selector);
+            fields.push(pod_name);
+            fields.push(container);
+        }
+    }
 
     for field in fields {
         for placeholder in get_input_placeholders(field) {

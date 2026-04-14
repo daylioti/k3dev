@@ -7,7 +7,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
 use super::{ConfigValidator, ValidationWarning};
-use crate::config::types::CommandEntry;
+use crate::config::types::{CommandEntry, ExecutionTarget};
 
 /// Lazy-compiled regex for extracting @placeholder names
 static PLACEHOLDER_REGEX: Lazy<Regex> =
@@ -113,10 +113,23 @@ impl<'a> ConfigValidator<'a> {
 
             // Check exec config fields
             if let Some(exec) = &entry.exec {
-                self.extract_placeholders(&exec.target.namespace, used);
-                self.extract_placeholders(&exec.target.selector, used);
-                self.extract_placeholders(&exec.target.pod_name, used);
-                self.extract_placeholders(&exec.target.container, used);
+                match &exec.target {
+                    ExecutionTarget::Host => {}
+                    ExecutionTarget::Docker { container } => {
+                        self.extract_placeholders(container, used);
+                    }
+                    ExecutionTarget::Kubernetes {
+                        namespace,
+                        selector,
+                        pod_name,
+                        container,
+                    } => {
+                        self.extract_placeholders(namespace, used);
+                        self.extract_placeholders(selector, used);
+                        self.extract_placeholders(pod_name, used);
+                        self.extract_placeholders(container, used);
+                    }
+                }
                 self.extract_placeholders(&exec.workdir, used);
                 self.extract_placeholders(&exec.cmd, used);
             }
@@ -154,14 +167,26 @@ impl<'a> ConfigValidator<'a> {
 
             // Check all fields for unresolved placeholders
             let fields_to_check: Vec<(&str, &str)> = if let Some(exec) = &entry.exec {
-                vec![
-                    ("target.namespace", &exec.target.namespace),
-                    ("target.selector", &exec.target.selector),
-                    ("target.pod_name", &exec.target.pod_name),
-                    ("target.container", &exec.target.container),
-                    ("workdir", &exec.workdir),
-                    ("cmd", &exec.cmd),
-                ]
+                let mut fields: Vec<(&str, &str)> =
+                    vec![("workdir", &exec.workdir), ("cmd", &exec.cmd)];
+                match &exec.target {
+                    ExecutionTarget::Host => {}
+                    ExecutionTarget::Docker { container } => {
+                        fields.push(("target.container", container));
+                    }
+                    ExecutionTarget::Kubernetes {
+                        namespace,
+                        selector,
+                        pod_name,
+                        container,
+                    } => {
+                        fields.push(("target.namespace", namespace));
+                        fields.push(("target.selector", selector));
+                        fields.push(("target.pod_name", pod_name));
+                        fields.push(("target.container", container));
+                    }
+                }
+                fields
             } else {
                 vec![]
             };

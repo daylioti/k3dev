@@ -12,7 +12,6 @@ use crate::ui::styles::Styles;
 use crate::ui::theme::Theme;
 
 /// Cluster action definition
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Action {
     pub id: String,
@@ -180,7 +179,6 @@ impl ActionBar {
         }
     }
 
-    #[allow(dead_code)]
     pub fn set_action_enabled(&mut self, id: &str, enabled: bool) {
         if let Some(action) = self.actions.iter_mut().find(|a| a.id == id) {
             action.enabled = enabled;
@@ -210,7 +208,7 @@ impl ActionBar {
     pub fn get_action_at_x(&self, x: usize) -> Option<usize> {
         // Each action is: icon (1-2 chars) + space + label + separator " │ " (3 chars)
         // Approximate: "▶ Start │ " = ~10 chars per action
-        let mut pos = 1; // Start after border
+        let mut pos = 3; // Start after focus-stripe prefix ("▌ " or "  ")
         for (i, action) in self.actions.iter().enumerate() {
             let action_width = action.icon.chars().count() + 1 + action.label.len();
             if x >= pos && x < pos + action_width {
@@ -231,6 +229,16 @@ impl ActionBar {
     pub fn render(&self, frame: &mut Frame, area: Rect, focused: bool) {
         // Build action spans - compact 1-line style (no borders)
         let mut spans: Vec<Span> = Vec::new();
+
+        // Focus stripe on the left when this panel is active
+        if focused {
+            spans.push(Span::styled(
+                "▌ ",
+                self.styles.border_focused,
+            ));
+        } else {
+            spans.push(Span::raw("  "));
+        }
 
         // Add cluster name badge if available
         if let Some(name) = &self.cluster_name {
@@ -311,7 +319,7 @@ impl ActionBar {
             self.styles.border_unfocused
         };
         let border_type = if focused {
-            ratatui::widgets::BorderType::Double
+            ratatui::widgets::BorderType::Thick
         } else {
             ratatui::widgets::BorderType::Rounded
         };
@@ -320,12 +328,17 @@ impl ActionBar {
         } else {
             self.styles.normal_text
         };
+        let title = if focused {
+            " ▶ Actions ◀ "
+        } else {
+            " Actions "
+        };
 
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_type(border_type)
             .border_style(border_style)
-            .title(Span::styled(" Actions ", title_style));
+            .title(Span::styled(title, title_style));
 
         let inner = block.inner(area);
         frame.render_widget(block, area);

@@ -31,9 +31,7 @@ pub enum StartOutcome {
 
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
 
 use super::config::ClusterConfig;
 use super::docker::{ContainerRunConfig, DockerManager};
@@ -587,15 +585,6 @@ impl K3sManager {
         Ok(())
     }
 
-    /// Restart the k3s cluster
-    #[allow(dead_code)]
-    pub async fn restart(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
-        self.stop(output_tx.clone()).await?;
-        sleep(Duration::from_secs(2)).await;
-        self.start(output_tx).await?;
-        Ok(())
-    }
-
     /// Get cluster info
     pub async fn info(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
         let _ = output_tx
@@ -662,9 +651,4 @@ impl K3sManager {
         Ok(())
     }
 
-    /// Reset the kube client (call after kubeconfig changes)
-    #[allow(dead_code)]
-    pub fn reset_kube_client(&mut self) {
-        self.kube_ops.reset();
-    }
 }

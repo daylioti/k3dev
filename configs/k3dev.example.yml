@@ -81,9 +81,11 @@ placeholders:
 commands:
   - name: "App"
     commands:
+      # Kubernetes pod exec (interactive shell tab)
       - name: "Shell"
         exec:
           target:
+            type: kubernetes
             namespace: "@ns"
             selector: "@app_selector"
           cmd: "/bin/sh"
@@ -91,6 +93,7 @@ commands:
       - name: "View Logs"
         exec:
           target:
+            type: kubernetes
             namespace: "@ns"
             selector: "@app_selector"
           cmd: "tail -f /var/log/app.log"
@@ -98,8 +101,26 @@ commands:
       - name: "Custom Command"
         exec:
           target:
+            type: kubernetes
             namespace: "@ns"
             selector: "@app_selector"
           cmd: "@command"
           input:
             command: "Enter command:"
+
+  - name: "Local"
+    commands:
+      # Host command — runs on your machine, output streams to the popup
+      - name: "Git Status"
+        exec:
+          target: { type: host }
+          workdir: "."
+          cmd: "git status"
+
+      # Docker exec into the k3s container (one-shot, output to popup)
+      - name: "K3s Process List"
+        exec:
+          target:
+            type: docker
+            container: "k3dev-server"
+          cmd: "ps -ef"

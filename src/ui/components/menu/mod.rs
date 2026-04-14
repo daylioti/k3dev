@@ -23,7 +23,6 @@ pub struct FlatMenuItem {
     pub has_children: bool,
     pub command: Option<CommandEntry>,
     pub group_index: usize,
-    #[allow(dead_code)]
     pub item_path: Vec<usize>,
 }
 
@@ -213,23 +212,7 @@ impl Menu {
         }
     }
 
-    /// Get the number of matches (for display)
-    #[allow(dead_code)]
-    pub fn match_count(&self) -> usize {
-        if self.search_query.is_empty() {
-            self.flat_items.len()
-        } else {
-            self.filtered_indices.len()
-        }
-    }
-
     // === Ingress Selection ===
-
-    /// Check if ingress is currently selected
-    #[allow(dead_code)]
-    pub fn is_ingress_selected(&self) -> bool {
-        self.ingress_selected
-    }
 
     /// Select the ingress section (called when scrolling past commands)
     pub fn select_ingress(&mut self) {
@@ -238,12 +221,6 @@ impl Menu {
             self.selected_ingress_entry = 0;
             self.selected_ingress_path = 0;
         }
-    }
-
-    /// Deselect ingress and return to commands
-    #[allow(dead_code)]
-    pub fn deselect_ingress(&mut self) {
-        self.ingress_selected = false;
     }
 
     /// Move up in ingress selection
@@ -459,15 +436,6 @@ impl Menu {
         // Will be called with visible height during render
     }
 
-    #[allow(dead_code)]
-    pub fn adjust_scroll_for_height(&mut self, visible_height: usize) {
-        if self.selected_index < self.scroll_offset {
-            self.scroll_offset = self.selected_index;
-        } else if self.selected_index >= self.scroll_offset + visible_height {
-            self.scroll_offset = self.selected_index - visible_height + 1;
-        }
-    }
-
     /// Toggle expansion of current item
     pub fn toggle(&mut self) {
         if let Some(item) = self.flat_items.get(self.selected_index) {
@@ -500,14 +468,6 @@ impl Menu {
     }
 
     // === Selection ===
-
-    /// Get the currently selected command (if it's an executable command)
-    #[allow(dead_code)]
-    pub fn selected_command(&self) -> Option<&CommandEntry> {
-        self.flat_items
-            .get(self.selected_index)
-            .and_then(|item| item.command.as_ref())
-    }
 
     /// Get selected item
     pub fn selected_item(&self) -> Option<&FlatMenuItem> {

@@ -78,9 +78,6 @@ async fn set_cached_manifest(cache_key: String, info: ManifestInfo) {
 
 #[derive(Debug, Deserialize)]
 struct ManifestV2 {
-    #[serde(rename = "mediaType")]
-    #[allow(dead_code)]
-    media_type: Option<String>,
     layers: Option<Vec<ManifestLayer>>,
     manifests: Option<Vec<ManifestListEntry>>,
 }
@@ -1214,7 +1211,6 @@ mod tests {
     #[test]
     fn test_manifest_info_extraction() {
         let manifest = ManifestV2 {
-            media_type: None,
             layers: Some(vec![
                 ManifestLayer {
                     size: Some(1000),
@@ -1238,7 +1234,6 @@ mod tests {
     #[test]
     fn test_manifest_info_empty_layers() {
         let manifest = ManifestV2 {
-            media_type: None,
             layers: Some(vec![]),
             manifests: None,
         };
@@ -1248,7 +1243,6 @@ mod tests {
     #[test]
     fn test_manifest_info_no_layers() {
         let manifest = ManifestV2 {
-            media_type: None,
             layers: None,
             manifests: None,
         };
@@ -1429,7 +1423,6 @@ mod tests {
     #[test]
     fn test_manifest_list_with_matching_platform() {
         let manifest = ManifestV2 {
-            media_type: None,
             layers: None,
             manifests: Some(vec![
                 ManifestListEntry {

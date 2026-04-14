@@ -23,10 +23,9 @@ use bollard::models::{
     PortBinding, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
-    CommitContainerOptions, CreateContainerOptions, CreateImageOptions,
-    DownloadFromContainerOptions, InspectContainerOptions, InspectNetworkOptions,
-    ListContainersOptions, ListImagesOptions, RemoveContainerOptions, RemoveImageOptions,
-    RemoveVolumeOptions, StartContainerOptions, StopContainerOptions, WaitContainerOptions,
+    CommitContainerOptions, CreateContainerOptions, CreateImageOptions, InspectContainerOptions,
+    InspectNetworkOptions, ListContainersOptions, ListImagesOptions, RemoveContainerOptions,
+    RemoveImageOptions, RemoveVolumeOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::ClientVersion;
 use bollard::Docker;
@@ -34,12 +33,9 @@ use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::time::sleep;
 
 /// Docker container and network management
 pub struct DockerManager {
-    #[allow(dead_code)]
     socket_path: PathBuf,
     pub(crate) client: Docker,
 }
@@ -52,6 +48,11 @@ impl DockerManager {
             socket_path,
             client,
         })
+    }
+
+    /// Build a DockerManager using the auto-detected host socket path.
+    pub fn from_default_socket() -> Result<Self> {
+        Self::new(crate::cluster::PlatformInfo::find_docker_socket_sync())
     }
 
     /// Connect to Docker using the resolved socket path.
@@ -192,23 +193,6 @@ impl DockerManager {
             );
         }
         Ok(())
-    }
-
-    /// Wait for Docker to become accessible
-    #[allow(dead_code)]
-    pub async fn wait_for_docker(&self, max_retries: u32, interval: Duration) -> Result<()> {
-        for i in 0..max_retries {
-            if self.is_accessible().await {
-                return Ok(());
-            }
-            if i < max_retries - 1 {
-                sleep(interval).await;
-            }
-        }
-        Err(anyhow!(
-            "Docker not accessible after {} retries",
-            max_retries
-        ))
     }
 
     // === Container Operations ===
@@ -433,35 +417,6 @@ impl DockerManager {
         Ok(port_map)
     }
 
-    /// Copy a file from a container
-    #[allow(dead_code)]
-    pub async fn copy_from_container(
-        &self,
-        container: &str,
-        src: &str,
-        dst: &PathBuf,
-    ) -> Result<()> {
-        let mut stream = self.client.download_from_container(
-            container,
-            Some(DownloadFromContainerOptions {
-                path: src.to_string(),
-            }),
-        );
-
-        let mut file = tokio::fs::File::create(dst)
-            .await
-            .with_context(|| format!("Failed to create file {:?}", dst))?;
-
-        while let Some(chunk) = stream.next().await {
-            let data = chunk.context("Failed to read from container")?;
-            file.write_all(&data)
-                .await
-                .context("Failed to write to file")?;
-        }
-
-        Ok(())
-    }
-
     /// List containers by name prefix
     pub async fn list_containers_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         let mut filters = HashMap::new();
@@ -515,33 +470,22 @@ impl DockerManager {
                 .map(|n| n.trim_start_matches('/').to_string())
                 .unwrap_or_default();
 
-            // Parse pod name + namespace from k8s container name
+            // Parse pod name from k8s container name
             let parts: Vec<&str> = container_name.split('_').collect();
             if parts.len() < 4 {
                 continue;
             }
             let pod_name = parts[2].to_string();
-            let namespace = parts[3].to_string();
 
             // Extract mount sources
             let mounts = c
                 .mounts
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|m| {
-                    Some(MountSource {
-                        source: m.source?,
-                        destination: m.destination.unwrap_or_default(),
-                    })
-                })
+                .filter_map(|m| Some(MountSource { source: m.source? }))
                 .collect();
 
-            result.push(ContainerMountInfo {
-                container_name,
-                pod_name,
-                namespace,
-                mounts,
-            });
+            result.push(ContainerMountInfo { pod_name, mounts });
         }
 
         Ok(result)
@@ -623,12 +567,6 @@ impl DockerManager {
             .remove_volume(name, Some(RemoveVolumeOptions { force: true }))
             .await;
         Ok(())
-    }
-
-    /// Check if a Docker volume exists
-    #[allow(dead_code)]
-    pub async fn volume_exists(&self, name: &str) -> bool {
-        self.client.inspect_volume(name).await.is_ok()
     }
 
     // === Image Operations ===
@@ -815,87 +753,6 @@ impl DockerManager {
     }
 
     // === Container Run Operations ===
-
-    /// Run an ephemeral container (like `docker run --rm`)
-    /// Useful for running one-off commands with specific mounts
-    #[allow(dead_code)]
-    pub async fn run_ephemeral_container(
-        &self,
-        image: &str,
-        command: &[&str],
-        volumes: &[(&str, &str)],
-    ) -> Result<()> {
-        // Ensure image exists
-        if !self.image_exists(image).await {
-            self.pull_image(image).await?;
-        }
-
-        let container_name = format!("ephemeral-{}", std::process::id());
-
-        let binds: Vec<String> = volumes
-            .iter()
-            .map(|(src, dst)| format!("{}:{}", src, dst))
-            .collect();
-
-        let host_config = HostConfig {
-            binds: if binds.is_empty() { None } else { Some(binds) },
-            auto_remove: Some(true),
-            ..Default::default()
-        };
-
-        let container_config = ContainerCreateBody {
-            image: Some(image.to_string()),
-            cmd: Some(command.iter().map(|s| s.to_string()).collect()),
-            host_config: Some(host_config),
-            ..Default::default()
-        };
-
-        self.client
-            .create_container(
-                Some(CreateContainerOptions {
-                    name: Some(container_name.clone()),
-                    ..Default::default()
-                }),
-                container_config,
-            )
-            .await
-            .with_context(|| "Failed to create ephemeral container")?;
-
-        self.client
-            .start_container(&container_name, None::<StartContainerOptions>)
-            .await
-            .with_context(|| "Failed to start ephemeral container")?;
-
-        let mut wait_stream = self
-            .client
-            .wait_container(&container_name, None::<WaitContainerOptions>);
-        while let Some(result) = wait_stream.next().await {
-            match result {
-                Ok(response) => {
-                    if response.status_code != 0 {
-                        // Try to remove container in case auto_remove didn't work
-                        let _ = self.remove_container(&container_name, true).await;
-                        return Err(anyhow!(
-                            "Ephemeral container exited with code {}",
-                            response.status_code
-                        ));
-                    }
-                }
-                Err(e) => {
-                    // Container might have been auto-removed, check if it's a "not found" error
-                    let err_str = e.to_string();
-                    if !err_str.contains("No such container") && !err_str.contains("not found") {
-                        let _ = self.remove_container(&container_name, true).await;
-                        return Err(anyhow!("Error waiting for ephemeral container: {}", e));
-                    }
-                }
-            }
-        }
-
-        let _ = self.remove_container(&container_name, true).await;
-
-        Ok(())
-    }
 
     /// Run a new container
     pub async fn run_container(&self, config: &ContainerRunConfig) -> Result<()> {
@@ -1106,19 +963,13 @@ impl DockerManager {
 
 /// Container with parsed pod info and volume mounts
 pub struct ContainerMountInfo {
-    #[allow(dead_code)]
-    pub container_name: String,
     pub pod_name: String,
-    #[allow(dead_code)]
-    pub namespace: String,
     pub mounts: Vec<MountSource>,
 }
 
-/// A single mount source/destination pair from a container
+/// A single mount source from a container
 pub struct MountSource {
     pub source: String,
-    #[allow(dead_code)]
-    pub destination: String,
 }
 
 /// Configuration for running a Docker container

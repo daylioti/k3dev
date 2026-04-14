@@ -54,15 +54,6 @@ impl IngressHealthStatus {
     }
 }
 
-/// Information about an ingress endpoint with health status
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct IngressInfo {
-    pub host: String,
-    pub path: String,
-    pub health: IngressHealthStatus,
-}
-
 /// Ingress entry with host and all its paths
 #[derive(Debug, Clone)]
 pub struct IngressEntry {
@@ -133,7 +124,6 @@ impl IngressHealthChecker {
 }
 
 /// Result of an /etc/hosts update attempt
-#[allow(dead_code)]
 pub enum HostsUpdateResult {
     /// No update was needed (all hosts already present)
     NoUpdateNeeded,
@@ -300,41 +290,6 @@ impl IngressManager {
         hosts
     }
 
-    /// Read hosts from /etc/hosts that belong to k3dev (for cleanup)
-    #[allow(dead_code)]
-    pub async fn get_k3dev_hosts_from_etc_hosts(&self) -> HashSet<String> {
-        let hosts_path = hosts_file_path();
-        let content = fs::read_to_string(&hosts_path).await.unwrap_or_default();
-
-        let mut hosts = HashSet::new();
-        for line in content.lines() {
-            if line.contains(&self.hosts_marker) {
-                // Line format: "127.0.0.1 hostname # k3dev-ingress"
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    hosts.insert(parts[1].to_string());
-                }
-            }
-        }
-        hosts
-    }
-
-    /// Check if all required hosts are already in /etc/hosts
-    #[allow(dead_code)]
-    pub async fn hosts_need_update(&mut self) -> Result<bool> {
-        let ingress_hosts: HashSet<String> = self.get_ingress_hosts().await?.into_iter().collect();
-
-        if ingress_hosts.is_empty() {
-            return Ok(false);
-        }
-
-        // Check ALL hosts in /etc/hosts
-        let etc_hosts = self.get_all_hosts_from_etc_hosts().await;
-
-        // Check if all ingress hosts are already in /etc/hosts
-        Ok(!ingress_hosts.is_subset(&etc_hosts))
-    }
-
     /// Get hosts that are NOT in /etc/hosts (for UI indication)
     pub async fn get_missing_hosts(&mut self) -> Result<HashSet<String>> {
         let ingress_hosts: HashSet<String> = self.get_ingress_hosts().await?.into_iter().collect();
@@ -460,48 +415,6 @@ impl IngressManager {
         Ok(HostsUpdateResult::NeedsSudo {
             content: final_content,
             count: hosts.len(),
-        })
-    }
-
-    /// Clean all k3dev entries from /etc/hosts
-    #[allow(dead_code)]
-    pub async fn clean_hosts(
-        &self,
-        output_tx: Option<mpsc::Sender<OutputLine>>,
-    ) -> Result<HostsUpdateResult> {
-        let hosts_path = hosts_file_path();
-        let current_content = fs::read_to_string(&hosts_path).await.unwrap_or_default();
-
-        // Remove k3dev entries
-        let cleaned: Vec<&str> = current_content
-            .lines()
-            .filter(|line| !line.contains(&self.hosts_marker))
-            .collect();
-
-        let final_content = cleaned.join("\n") + "\n";
-
-        // Try to write directly first
-        if fs::write(&hosts_path, &final_content).await.is_ok() {
-            if let Some(tx) = &output_tx {
-                let _ = tx
-                    .send(OutputLine::success("Cleaned /etc/hosts entries"))
-                    .await;
-            }
-            return Ok(HostsUpdateResult::WrittenDirectly { count: 0 });
-        }
-
-        // Needs elevated privileges
-        if let Some(tx) = &output_tx {
-            let _ = tx
-                .send(OutputLine::info(
-                    "Requesting elevated privileges to clean /etc/hosts...",
-                ))
-                .await;
-        }
-
-        Ok(HostsUpdateResult::NeedsSudo {
-            content: final_content,
-            count: 0,
         })
     }
 

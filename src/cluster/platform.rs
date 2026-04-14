@@ -409,24 +409,6 @@ impl PlatformInfo {
             .ok()
     }
 
-    /// Check if SELinux is enforcing on this system
-    /// Returns true if SELinux is in enforcing or permissive mode
-    #[allow(dead_code)]
-    pub fn is_selinux_active() -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            // Check /sys/fs/selinux/enforce (most reliable)
-            if let Ok(content) = std::fs::read_to_string("/sys/fs/selinux/enforce") {
-                return matches!(content.trim(), "0" | "1"); // 0=permissive, 1=enforcing
-            }
-            false
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
-    }
-
     /// Detect the host's iptables backend mode ("nft" or "legacy").
     /// K3s should use the same mode to avoid invisible rules.
     /// For remote Docker, returns "legacy" (safe default — local iptables is irrelevant).

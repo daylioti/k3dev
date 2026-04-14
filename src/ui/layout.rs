@@ -12,12 +12,6 @@ pub struct AppLayout {
 }
 
 impl AppLayout {
-    /// Calculate layout from terminal area with default config
-    #[allow(dead_code)]
-    pub fn calculate(area: Rect) -> Self {
-        Self::calculate_with_config(area, &UiConfig::default(), 0, 0)
-    }
-
     /// Calculate layout from terminal area with UI config and menu width offset
     pub fn calculate_with_config(
         area: Rect,
@@ -70,24 +64,3 @@ impl AppLayout {
     }
 }
 
-/// Helper to create a centered rect for modals
-#[allow(dead_code)]
-pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}

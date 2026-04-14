@@ -152,20 +152,6 @@ impl KeybindingResolver {
         self.binding_display.get(action).map(|s| s.as_str())
     }
 
-    /// Get all keybindings for display in help
-    #[allow(dead_code)]
-    pub fn get_all_bindings(&self) -> Vec<(&KeyAction, &str)> {
-        self.binding_display
-            .iter()
-            .map(|(action, display)| (action, display.as_str()))
-            .collect()
-    }
-
-    /// Check if a specific action has a binding
-    #[allow(dead_code)]
-    pub fn has_binding(&self, action: &KeyAction) -> bool {
-        self.bindings.values().any(|a| a == action)
-    }
 }
 
 impl Default for KeybindingResolver {

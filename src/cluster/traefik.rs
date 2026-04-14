@@ -563,30 +563,4 @@ spec:
         Err(anyhow!("Timeout waiting for Traefik"))
     }
 
-    /// Uninstall Traefik configuration (removes HelmChartConfig, K3s will reset to defaults)
-    #[allow(dead_code)] // May be used for selective cleanup in the future
-    pub async fn uninstall(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
-        let _ = output_tx
-            .send(OutputLine::info("Removing Traefik configuration..."))
-            .await;
-
-        // Delete the HelmChartConfig (K3s will redeploy Traefik with defaults)
-        let _ = self
-            .kube_ops
-            .delete_custom_resource(
-                "helm.cattle.io/v1",
-                "HelmChartConfig",
-                "traefik",
-                "kube-system",
-            )
-            .await;
-
-        // Delete TLS secret
-        let _ = self
-            .kube_ops
-            .delete_secret("traefik-tls", "kube-system")
-            .await;
-
-        Ok(())
-    }
 }

@@ -11,7 +11,6 @@ use crate::ui::styles::Styles;
 use crate::ui::theme::Theme;
 
 /// A single input field
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct InputField {
     pub name: String,
@@ -94,11 +93,6 @@ impl InputForm {
         self.fields.clear();
         self.focused_field = 0;
         self.submit_focused = false;
-    }
-
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.fields.is_empty()
     }
 
     /// Get all field values as a map

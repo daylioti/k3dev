@@ -401,10 +401,10 @@ pub struct CommandEntry {
     pub commands: Vec<CommandEntry>,
 }
 
-/// How to execute a command in a pod
+/// How to execute a command
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecConfig {
-    pub target: TargetConfig,
+    pub target: ExecutionTarget,
 
     #[serde(default)]
     pub workdir: String,
@@ -415,20 +415,123 @@ pub struct ExecConfig {
     pub input: HashMap<String, String>,
 }
 
-/// Which pod to target
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct TargetConfig {
-    #[serde(default)]
-    pub namespace: String,
+/// Where a command runs.
+///
+/// Tagged YAML representation; if `type:` is omitted, defaults to `kubernetes`:
+/// ```yaml
+/// target: { type: host }
+/// target: { type: docker, container: "k3dev-server" }
+/// target: { type: kubernetes, namespace: "default", selector: "app=foo" }
+/// target: { namespace: "default", selector: "app=foo" }   # implicit kubernetes
+/// ```
+#[derive(Debug, Clone)]
+pub enum ExecutionTarget {
+    /// Run on the user's host shell.
+    Host,
+    /// `docker exec` into a named container.
+    Docker { container: String },
+    /// `kubectl exec` style — into a pod located by selector or name.
+    Kubernetes {
+        namespace: String,
+        selector: String,
+        pod_name: String,
+        container: String,
+    },
+}
 
-    #[serde(default)]
-    pub selector: String,
+// Tagged shape used internally by the deserializer. The public `ExecutionTarget`
+// converts from this — that lets us inject a default `type: kubernetes` when the
+// user omits the discriminator.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum ExecutionTargetTagged {
+    Host,
+    Docker {
+        #[serde(default)]
+        container: String,
+    },
+    Kubernetes {
+        #[serde(default)]
+        namespace: String,
+        #[serde(default)]
+        selector: String,
+        #[serde(default)]
+        pod_name: String,
+        #[serde(default)]
+        container: String,
+    },
+}
 
-    #[serde(default)]
-    pub pod_name: String,
+impl From<ExecutionTargetTagged> for ExecutionTarget {
+    fn from(t: ExecutionTargetTagged) -> Self {
+        match t {
+            ExecutionTargetTagged::Host => ExecutionTarget::Host,
+            ExecutionTargetTagged::Docker { container } => ExecutionTarget::Docker { container },
+            ExecutionTargetTagged::Kubernetes {
+                namespace,
+                selector,
+                pod_name,
+                container,
+            } => ExecutionTarget::Kubernetes {
+                namespace,
+                selector,
+                pod_name,
+                container,
+            },
+        }
+    }
+}
 
-    #[serde(default)]
-    pub container: String,
+impl<'de> serde::Deserialize<'de> for ExecutionTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Deserialize into a free-form YAML value first so we can inject
+        // `type: kubernetes` when the user omits the discriminator.
+        let mut value = serde_yml::Value::deserialize(deserializer)?;
+
+        if let serde_yml::Value::Mapping(map) = &mut value {
+            let type_key = serde_yml::Value::String("type".into());
+            if !map.contains_key(&type_key) {
+                map.insert(type_key, serde_yml::Value::String("kubernetes".into()));
+            }
+        }
+
+        let tagged: ExecutionTargetTagged =
+            serde_yml::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(tagged.into())
+    }
+}
+
+impl ExecutionTarget {
+    /// Return the K8s target fields if this is a Kubernetes target.
+    pub fn as_kubernetes(&self) -> Option<KubernetesTargetRef<'_>> {
+        if let ExecutionTarget::Kubernetes {
+            namespace,
+            selector,
+            pod_name,
+            container,
+        } = self
+        {
+            Some(KubernetesTargetRef {
+                namespace,
+                selector,
+                pod_name,
+                container,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// Borrowed view of a Kubernetes target's fields.
+pub struct KubernetesTargetRef<'a> {
+    pub namespace: &'a str,
+    pub selector: &'a str,
+    pub pod_name: &'a str,
+    pub container: &'a str,
 }
 
 /// Logging configuration

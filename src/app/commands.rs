@@ -10,9 +10,10 @@ use tokio_util::sync::CancellationToken;
 use crate::cluster::diagnostics::{run_all_diagnostics, run_preflight_checks};
 use crate::cluster::{ClusterManager, HostsUpdateResult, IngressManager};
 use crate::commands::{CommandContext, PaletteCommandId};
-use crate::config::{get_exec_placeholders, CommandEntry, RefreshTask};
+use crate::cluster::DockerManager;
+use crate::config::{get_exec_placeholders, CommandEntry, ExecutionTarget, RefreshTask};
 use crate::k8s::PodExecutor;
-use crate::ui::components::{ClusterAction, DetailTab, OutputLine};
+use crate::ui::components::{ClusterAction, DetailTab};
 
 use super::{App, AppMessage, AppMode, FocusArea};
 
@@ -230,7 +231,7 @@ impl App {
             return;
         }
 
-        self.execute_pod_command(&cmd);
+        self.dispatch_command(&cmd);
     }
 
     pub(super) fn submit_input(&mut self) {
@@ -246,23 +247,56 @@ impl App {
         // Substitute placeholders
         let mut cmd = cmd.clone();
         if let Some(exec) = &mut cmd.exec {
-            for (key, value) in &values {
-                let pattern = format!("@{}", key);
-                exec.target.namespace = exec.target.namespace.replace(&pattern, value);
-                exec.target.selector = exec.target.selector.replace(&pattern, value);
-                exec.target.pod_name = exec.target.pod_name.replace(&pattern, value);
-                exec.target.container = exec.target.container.replace(&pattern, value);
-                exec.workdir = exec.workdir.replace(&pattern, value);
-                exec.cmd = exec.cmd.replace(&pattern, value);
+            let subst = |s: &mut String| {
+                for (key, value) in &values {
+                    let pattern = format!("@{}", key);
+                    *s = s.replace(&pattern, value);
+                }
+            };
+            match &mut exec.target {
+                ExecutionTarget::Host => {}
+                ExecutionTarget::Docker { container } => subst(container),
+                ExecutionTarget::Kubernetes {
+                    namespace,
+                    selector,
+                    pod_name,
+                    container,
+                } => {
+                    subst(namespace);
+                    subst(selector);
+                    subst(pod_name);
+                    subst(container);
+                }
             }
+            subst(&mut exec.workdir);
+            subst(&mut exec.cmd);
         }
 
-        self.execute_pod_command(&cmd);
+        self.dispatch_command(&cmd);
+    }
+
+    /// Dispatch a command to the right executor based on its target.
+    fn dispatch_command(&mut self, cmd: &crate::config::CommandEntry) {
+        let exec = match &cmd.exec {
+            Some(e) => e,
+            None => return,
+        };
+
+        match &exec.target {
+            ExecutionTarget::Kubernetes { .. } => self.execute_pod_command(cmd),
+            ExecutionTarget::Host => self.execute_host_command(cmd),
+            ExecutionTarget::Docker { .. } => self.execute_docker_command(cmd),
+        }
     }
 
     fn execute_pod_command(&mut self, cmd: &crate::config::CommandEntry) {
         let exec = match &cmd.exec {
             Some(e) => e,
+            None => return,
+        };
+
+        let k8s_target = match exec.target.as_kubernetes() {
+            Some(t) => t,
             None => return,
         };
 
@@ -274,10 +308,10 @@ impl App {
             }
         };
 
-        let namespace = exec.target.namespace.clone();
-        let selector = exec.target.selector.clone();
-        let pod_name = exec.target.pod_name.clone();
-        let container = exec.target.container.clone();
+        let namespace = k8s_target.namespace.to_string();
+        let selector = k8s_target.selector.to_string();
+        let pod_name = k8s_target.pod_name.to_string();
+        let container = k8s_target.container.to_string();
         let workdir = exec.workdir.clone();
         let command = exec.cmd.clone();
         let executor = PodExecutor::new(k8s_client);
@@ -320,6 +354,69 @@ impl App {
                 })
                 .await;
         });
+    }
+
+    /// Run a command on the user's host shell, streaming output to the popup.
+    fn execute_host_command(&mut self, cmd: &crate::config::CommandEntry) {
+        let exec = match &cmd.exec {
+            Some(e) => e,
+            None => return,
+        };
+        let command = exec.cmd.clone();
+        let workdir = exec.workdir.clone();
+        let title = format!("Host: {}", cmd.name);
+
+        self.start_popup_command(title);
+        let timeout_duration = self.refresh_config.cluster_operation_timeout;
+        let (ctx, output_tx) = CommandContext::new(self.message_tx.clone(), timeout_duration);
+
+        tokio::spawn(async move {
+            ctx.execute(move |tx| async move {
+                run_host_command(&command, &workdir, tx).await
+            })
+            .await;
+            drop(output_tx);
+        });
+    }
+
+    /// Run a command in a docker container via `docker exec`, streaming output to the popup.
+    fn execute_docker_command(&mut self, cmd: &crate::config::CommandEntry) {
+        let exec = match &cmd.exec {
+            Some(e) => e,
+            None => return,
+        };
+        let container = match &exec.target {
+            ExecutionTarget::Docker { container } => container.clone(),
+            _ => return,
+        };
+        let command = exec.cmd.clone();
+        let workdir = exec.workdir.clone();
+        let title = format!("Docker [{}]: {}", container, cmd.name);
+
+        self.start_popup_command(title);
+        let timeout_duration = self.refresh_config.cluster_operation_timeout;
+        let (ctx, output_tx) = CommandContext::new(self.message_tx.clone(), timeout_duration);
+
+        tokio::spawn(async move {
+            ctx.execute(move |tx| async move {
+                run_docker_command(&container, &command, &workdir, tx).await
+            })
+            .await;
+            drop(output_tx);
+        });
+    }
+
+    fn start_popup_command(&mut self, title: String) {
+        self.output.clear();
+        self.output.set_title(title.clone());
+        self.output_popup.clear();
+        self.output_popup.set_title(title);
+        self.is_executing = true;
+        self.status_bar.set_executing(true);
+        self.mode = super::AppMode::OutputPopup;
+
+        let cancel_token = CancellationToken::new();
+        self.cancel_token = Some(cancel_token);
     }
 
     pub(super) fn trigger_manual_hosts_update(&mut self) {
@@ -382,131 +479,6 @@ impl App {
         tokio::spawn(async move {
             run_preflight_checks(cluster_config, message_tx).await;
         });
-    }
-
-    /// Execute a pod action from the context menu
-    pub(super) fn execute_pod_action(
-        &mut self,
-        action: crate::ui::components::PodAction,
-        pod_name: &str,
-        namespace: &str,
-    ) {
-        use crate::ui::components::PodAction;
-
-        // View actions route to the detail panel (no k8s_client needed here)
-        match action {
-            PodAction::ViewLogs => {
-                self.open_or_switch_detail_tab(DetailTab::Logs);
-                return;
-            }
-            PodAction::Describe => {
-                self.open_or_switch_detail_tab(DetailTab::Describe);
-                return;
-            }
-            PodAction::Timeline => {
-                self.open_or_switch_detail_tab(DetailTab::Timeline);
-                return;
-            }
-            PodAction::ExecShell => {
-                self.open_or_switch_detail_tab(DetailTab::Shell);
-                return;
-            }
-            PodAction::Delete | PodAction::Restart => {}
-        }
-
-        // Destructive actions need k8s_client and output popup
-        let k8s_client = match &self.k8s_client {
-            Some(c) => c.clone(),
-            None => {
-                self.output.add_error("Kubernetes client not connected");
-                return;
-            }
-        };
-
-        let action_name = action.label();
-        self.output.clear();
-        self.output
-            .set_title(format!("{} - {}", action_name, pod_name));
-        self.output_popup.clear();
-        self.output_popup
-            .set_title(format!("{} - {}", action_name, pod_name));
-
-        match action {
-            PodAction::Delete => {
-                self.is_executing = true;
-                self.status_bar.set_executing(true);
-                self.mode = super::AppMode::OutputPopup;
-
-                let message_tx = self.message_tx.clone();
-                let namespace = namespace.to_string();
-                let pod_name = pod_name.to_string();
-
-                tokio::spawn(async move {
-                    let _ = message_tx
-                        .send(AppMessage::OutputLine(OutputLine::info(format!(
-                            "Deleting pod {}...",
-                            pod_name
-                        ))))
-                        .await;
-
-                    match k8s_client.delete_pod(&namespace, &pod_name).await {
-                        Ok(_) => {
-                            let _ = message_tx
-                                .send(AppMessage::OutputLine(OutputLine::info(format!(
-                                    "Pod {} deleted successfully",
-                                    pod_name
-                                ))))
-                                .await;
-                            let _ = message_tx.send(AppMessage::CommandComplete(0)).await;
-                        }
-                        Err(e) => {
-                            let _ = message_tx
-                                .send(AppMessage::Error(format!("Failed to delete pod: {}", e)))
-                                .await;
-                            let _ = message_tx.send(AppMessage::CommandComplete(1)).await;
-                        }
-                    }
-                });
-            }
-            PodAction::Restart => {
-                self.is_executing = true;
-                self.status_bar.set_executing(true);
-                self.mode = super::AppMode::OutputPopup;
-
-                let message_tx = self.message_tx.clone();
-                let namespace = namespace.to_string();
-                let pod_name = pod_name.to_string();
-
-                tokio::spawn(async move {
-                    let _ = message_tx
-                        .send(AppMessage::OutputLine(OutputLine::info(format!(
-                            "Restarting pod {} (delete and let deployment recreate)...",
-                            pod_name
-                        ))))
-                        .await;
-
-                    match k8s_client.delete_pod(&namespace, &pod_name).await {
-                        Ok(_) => {
-                            let _ = message_tx
-                                .send(AppMessage::OutputLine(OutputLine::info(format!(
-                                    "Pod {} deleted - deployment will recreate it",
-                                    pod_name
-                                ))))
-                                .await;
-                            let _ = message_tx.send(AppMessage::CommandComplete(0)).await;
-                        }
-                        Err(e) => {
-                            let _ = message_tx
-                                .send(AppMessage::Error(format!("Failed to restart pod: {}", e)))
-                                .await;
-                            let _ = message_tx.send(AppMessage::CommandComplete(1)).await;
-                        }
-                    }
-                });
-            }
-            // View actions already handled above
-            _ => {}
-        }
     }
 
     /// Auto-open detail panel when a pod is selected, close when no pods
@@ -739,13 +711,15 @@ impl App {
             None => return result,
         };
 
-        // Collect owned TargetConfigs to match against pods
-        let mut targets: Vec<crate::config::TargetConfig> = Vec::new();
+        // Collect owned K8s targets to match against pods (other targets don't highlight)
+        let mut targets: Vec<KubernetesTargetOwned> = Vec::new();
 
         // For leaf commands, use the target directly
         if let Some(cmd) = &selected.command {
             if let Some(exec) = &cmd.exec {
-                targets.push(exec.target.clone());
+                if let Some(t) = kubernetes_target_owned(&exec.target) {
+                    targets.push(t);
+                }
             }
         }
 
@@ -766,7 +740,9 @@ impl App {
                     }
                     if let Some(cmd) = &item.command {
                         if let Some(exec) = &cmd.exec {
-                            targets.push(exec.target.clone());
+                            if let Some(t) = kubernetes_target_owned(&exec.target) {
+                                targets.push(t);
+                            }
                         }
                     }
                 }
@@ -800,14 +776,31 @@ impl App {
     }
 }
 
-/// Recursively collect all TargetConfigs from a list of command entries
+/// Owned snapshot of a Kubernetes target — used for pod-highlight matching.
+struct KubernetesTargetOwned {
+    namespace: String,
+    selector: String,
+    pod_name: String,
+}
+
+fn kubernetes_target_owned(target: &ExecutionTarget) -> Option<KubernetesTargetOwned> {
+    target.as_kubernetes().map(|k| KubernetesTargetOwned {
+        namespace: k.namespace.to_string(),
+        selector: k.selector.to_string(),
+        pod_name: k.pod_name.to_string(),
+    })
+}
+
+/// Recursively collect all Kubernetes targets from a list of command entries
 fn collect_targets_recursive(
     entries: &[crate::config::CommandEntry],
-    targets: &mut Vec<crate::config::TargetConfig>,
+    targets: &mut Vec<KubernetesTargetOwned>,
 ) {
     for entry in entries {
         if let Some(exec) = &entry.exec {
-            targets.push(exec.target.clone());
+            if let Some(t) = kubernetes_target_owned(&exec.target) {
+                targets.push(t);
+            }
         }
         if !entry.commands.is_empty() {
             collect_targets_recursive(&entry.commands, targets);
@@ -815,11 +808,8 @@ fn collect_targets_recursive(
     }
 }
 
-/// Check if a target config matches a pod
-fn matches_target(
-    target: &crate::config::TargetConfig,
-    pod: &crate::ui::components::PodStat,
-) -> bool {
+/// Check if a Kubernetes target matches a pod
+fn matches_target(target: &KubernetesTargetOwned, pod: &crate::ui::components::PodStat) -> bool {
     // Check namespace if specified
     if !target.namespace.is_empty() && target.namespace != pod.namespace {
         return false;
@@ -845,4 +835,104 @@ fn matches_target(
 
     // If only namespace specified, match all pods in that namespace
     !target.namespace.is_empty()
+}
+
+/// Run a host-side shell command, streaming combined stdout+stderr to the popup.
+async fn run_host_command(
+    command: &str,
+    workdir: &str,
+    output_tx: tokio::sync::mpsc::Sender<crate::ui::components::OutputLine>,
+) -> Result<(), String> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
+    if !workdir.is_empty() {
+        cmd.current_dir(workdir);
+    }
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn host command: {}", e))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_tx = output_tx.clone();
+    let stdout_handle = tokio::spawn(async move {
+        if let Some(out) = stdout {
+            let mut reader = BufReader::new(out).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = stdout_tx
+                    .send(crate::ui::components::OutputLine::info(line))
+                    .await;
+            }
+        }
+    });
+
+    let stderr_tx = output_tx.clone();
+    let stderr_handle = tokio::spawn(async move {
+        if let Some(err) = stderr {
+            let mut reader = BufReader::new(err).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = stderr_tx
+                    .send(crate::ui::components::OutputLine::error(line))
+                    .await;
+            }
+        }
+    });
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Failed to wait on host command: {}", e))?;
+
+    let _ = stdout_handle.await;
+    let _ = stderr_handle.await;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Host command exited with code {}",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+/// Run a one-shot command inside a docker container, sending output to the popup.
+async fn run_docker_command(
+    container: &str,
+    command: &str,
+    workdir: &str,
+    output_tx: tokio::sync::mpsc::Sender<crate::ui::components::OutputLine>,
+) -> Result<(), String> {
+    let docker = DockerManager::from_default_socket()
+        .map_err(|e| format!("Failed to connect to docker: {}", e))?;
+
+    // Compose `cd <workdir> && <cmd>` so the user's workdir is honored.
+    let full_cmd = if workdir.is_empty() {
+        command.to_string()
+    } else {
+        format!("cd {} && {}", workdir, command)
+    };
+
+    match docker
+        .exec_in_container(container, &["sh", "-c", &full_cmd])
+        .await
+    {
+        Ok(out) => {
+            for line in out.lines() {
+                let _ = output_tx
+                    .send(crate::ui::components::OutputLine::info(line.to_string()))
+                    .await;
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("docker exec failed: {}", e)),
+    }
 }

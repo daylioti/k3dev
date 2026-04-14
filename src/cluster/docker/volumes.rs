@@ -14,8 +14,6 @@ const PVC_DIR_PREFIX: &str = "pvc-";
 
 /// Volume/PVC info gathered from Docker + filesystem
 pub struct VolumeStats {
-    #[allow(dead_code)]
-    pub pvc_dir_name: String,
     pub pvc_name: String,
     pub namespace: String,
     pub used_bytes: u64,
@@ -114,7 +112,6 @@ impl DockerManager {
         for (dir_name, size) in &pvc_entries {
             if let Some((namespace, pvc_name)) = parse_pvc_dir_name(dir_name) {
                 results.push(VolumeStats {
-                    pvc_dir_name: dir_name.clone(),
                     pvc_name,
                     namespace,
                     used_bytes: *size,

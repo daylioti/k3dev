@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use bollard::Docker;
 
 use crate::cluster::{
-    ClusterConfig, ClusterManager, ClusterStatus, ContainerPullProgress, ContainerStats,
+    ClusterConfig, ClusterStatus, ContainerPullProgress, ContainerStats,
 };
 use crate::config::{
     Config, ConfigLoader, ConfigValidator, RefreshConfig, RefreshScheduler, RefreshTask,
@@ -35,7 +35,7 @@ use crate::keybindings::KeybindingResolver;
 use crate::ui::components::{
     ActionBar, ClusterAction, ClusterStatus as UiClusterStatus, CommandPalette, ConfirmPopup,
     DetailTab, DiagnosticsOverlay, HelpOverlay, InputForm, Menu, Output, OutputPopup,
-    PodContextMenu, PodDetailPanel, PodStats, StatusBar,
+    PodDetailPanel, PodStats, StatusBar,
 };
 use crate::ui::{AppLayout, Styles};
 use std::collections::{HashMap, HashSet};
@@ -59,7 +59,6 @@ pub enum AppMode {
     CommandPalette,
     OutputPopup,
     ConfirmDestroy,
-    PodContextMenu,
     Diagnostics,
     Shell,
 }
@@ -67,15 +66,12 @@ pub enum AppMode {
 /// Main application
 pub struct App {
     // Configuration
-    #[allow(dead_code)]
     config: Config,
     cluster_config: Arc<ClusterConfig>,
     refresh_config: RefreshConfig,
 
     // Clients
     k8s_client: Option<K8sClient>,
-    #[allow(dead_code)]
-    cluster_manager: Option<ClusterManager>,
 
     // UI Components
     action_bar: ActionBar,
@@ -88,10 +84,8 @@ pub struct App {
     help_overlay: HelpOverlay,
     command_palette: CommandPalette,
     confirm_popup: ConfirmPopup,
-    pod_context_menu: PodContextMenu,
     diagnostics_overlay: DiagnosticsOverlay,
     pod_detail_panel: PodDetailPanel,
-    #[allow(dead_code)]
     styles: Styles,
 
     // State
@@ -197,7 +191,6 @@ impl App {
         // K8s client is created lazily - not at startup.
         let k8s_client: Option<K8sClient> = None;
 
-        let cluster_manager = ClusterManager::new(Arc::clone(&cluster_config)).await.ok();
         let (message_tx, message_rx) = mpsc::channel(100);
         let theme = config.theme;
 
@@ -231,7 +224,6 @@ impl App {
             cluster_config,
             refresh_config,
             k8s_client,
-            cluster_manager,
             action_bar,
             menu,
             output,
@@ -242,7 +234,6 @@ impl App {
             help_overlay,
             command_palette,
             confirm_popup: ConfirmPopup::with_theme(theme),
-            pod_context_menu: PodContextMenu::with_theme(theme),
             diagnostics_overlay: DiagnosticsOverlay::with_theme(theme),
             pod_detail_panel: PodDetailPanel::with_theme(theme),
             styles: Styles::from_theme(theme),
@@ -322,8 +313,6 @@ impl App {
                 match task {
                     RefreshTask::BlinkToggle => {
                         self.menu.toggle_blink();
-                        // Tick animation for pulling pods progress bars
-                        self.pod_stats.tick_animation();
                     }
                     RefreshTask::IngressRefresh => {
                         self.spawn_ingress_health_check();
@@ -526,9 +515,6 @@ impl App {
         if self.mode == AppMode::ConfirmDestroy {
             self.confirm_popup.render(frame, frame.area());
         }
-        if self.mode == AppMode::PodContextMenu {
-            self.pod_context_menu.render(frame, frame.area());
-        }
         if self.mode == AppMode::Diagnostics {
             self.diagnostics_overlay.render(frame, frame.area());
         }
@@ -574,12 +560,12 @@ impl App {
                 self.styles.border_unfocused
             };
             let border_type = if focused {
-                ratatui::widgets::BorderType::Double
+                ratatui::widgets::BorderType::Thick
             } else {
                 ratatui::widgets::BorderType::Rounded
             };
             let title = if focused {
-                " \u{25cf} Pods "
+                " \u{25b6} Pods \u{25c0} "
             } else {
                 "   Pods "
             };

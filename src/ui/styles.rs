@@ -5,7 +5,6 @@ use super::theme::{ColorPalette, Theme};
 /// Pre-computed styles for the UI
 #[derive(Clone)]
 pub struct Styles {
-    #[allow(dead_code)]
     pub palette: ColorPalette,
 
     // Text styles
@@ -23,8 +22,6 @@ pub struct Styles {
     // Border styles
     pub border_focused: Style,
     pub border_unfocused: Style,
-    #[allow(dead_code)]
-    pub border_secondary: Style,
 
     // Panel title styles
     pub panel_title_focused: Style,
@@ -69,9 +66,10 @@ impl Styles {
                 .add_modifier(Modifier::BOLD),
             primary: Style::default().fg(palette.primary),
 
-            border_focused: Style::default().fg(palette.primary),
+            border_focused: Style::default()
+                .fg(palette.highlight)
+                .add_modifier(Modifier::BOLD),
             border_unfocused: Style::default().fg(palette.border),
-            border_secondary: Style::default().fg(palette.muted),
 
             panel_title_focused: Style::default()
                 .fg(palette.primary)

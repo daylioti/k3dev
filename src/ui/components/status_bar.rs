@@ -291,18 +291,6 @@ impl StatusBar {
     }
 }
 
-/// Format a size in MB to a human readable string
-#[allow(dead_code)]
-fn format_size(mb: f64) -> String {
-    if mb >= 1024.0 {
-        format!("{:.1}GB", mb / 1024.0)
-    } else if mb >= 1.0 {
-        format!("{:.0}MB", mb)
-    } else {
-        format!("{:.0}KB", mb * 1024.0)
-    }
-}
-
 /// Format a rate in KB/s to a compact human readable string
 fn format_rate(kb_per_sec: f64) -> String {
     if kb_per_sec >= 1024.0 {

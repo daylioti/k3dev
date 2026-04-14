@@ -72,12 +72,6 @@ impl OutputPopup {
         self.scroll_position = self.lines.len();
     }
 
-    /// Check if there are any lines to display
-    #[allow(dead_code)]
-    pub fn has_content(&self) -> bool {
-        !self.lines.is_empty()
-    }
-
     /// Create a centered rectangle for the popup
     fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         let popup_layout = Layout::default()
@@ -181,13 +175,6 @@ impl OutputPopup {
         frame.render_widget(hint, hint_area);
     }
 
-    /// Get visible lines count for scroll calculations
-    #[allow(dead_code)]
-    pub fn get_visible_lines(&self, area: Rect) -> usize {
-        let popup_area = Self::centered_rect(70, 60, area);
-        // Account for borders (2) and hint line (2)
-        popup_area.height.saturating_sub(4) as usize
-    }
 }
 
 impl Default for OutputPopup {

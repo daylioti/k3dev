@@ -79,29 +79,6 @@ impl CommandContext {
     }
 }
 
-/// Helper to spawn a background refresh task that silently handles failures
-#[allow(dead_code)]
-pub fn spawn_refresh<F, Fut, T, M>(
-    message_tx: mpsc::Sender<AppMessage>,
-    timeout: Duration,
-    operation: F,
-    on_success: M,
-) where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = Result<T, anyhow::Error>> + Send,
-    T: Send + 'static,
-    M: FnOnce(T) -> AppMessage + Send + 'static,
-{
-    tokio::spawn(async move {
-        let result = tokio::time::timeout(timeout, operation()).await;
-
-        if let Ok(Ok(value)) = result {
-            let _ = message_tx.send(on_success(value)).await;
-        }
-        // Silently ignore errors and timeouts for refresh operations
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

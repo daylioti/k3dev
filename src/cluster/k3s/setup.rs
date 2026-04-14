@@ -331,44 +331,4 @@ impl K3sManager {
         Ok(())
     }
 
-    /// Wait for a deployment to be ready
-    #[allow(dead_code)]
-    pub(super) async fn wait_for_deployment(
-        &mut self,
-        name: &str,
-        namespace: &str,
-        timeout_secs: u64,
-        output_tx: &mpsc::Sender<OutputLine>,
-    ) -> Result<()> {
-        let _ = output_tx
-            .send(OutputLine::info(format!("Waiting for {}...", name)))
-            .await;
-
-        match self
-            .kube_ops
-            .wait_for_deployment_ready(name, namespace, timeout_secs)
-            .await
-        {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                // Don't fail if a component isn't ready, just warn
-                let _ = output_tx
-                    .send(OutputLine::warning(format!(
-                        "{} not ready after {}s, continuing...",
-                        name, timeout_secs
-                    )))
-                    .await;
-                Ok(())
-            }
-            Err(_) => {
-                let _ = output_tx
-                    .send(OutputLine::warning(format!(
-                        "{} not ready after {}s, continuing...",
-                        name, timeout_secs
-                    )))
-                    .await;
-                Ok(())
-            }
-        }
-    }
 }
