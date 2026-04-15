@@ -7,5 +7,4 @@ pub mod hooks;
 pub mod k8s;
 pub mod keybindings;
 pub mod logging;
-pub mod shell;
 pub mod ui;

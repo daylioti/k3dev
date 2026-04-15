@@ -46,6 +46,18 @@ pub struct DiagnosticResult {
     pub duration: Option<Duration>,
 }
 
+impl DiagnosticResult {
+    fn pending(id: &'static str, category: &'static str, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            category,
+            name: name.into(),
+            status: DiagnosticStatus::Pending,
+            duration: None,
+        }
+    }
+}
+
 /// Full diagnostics report sent to UI
 #[derive(Debug, Clone)]
 pub struct DiagnosticsReport {
@@ -95,6 +107,71 @@ async fn init_k8s_client(config: &ClusterConfig) -> Result<K8sClient, String> {
         .map_err(|e| format!("client init failed: {}", e))
 }
 
+/// Construct a DockerManager using the auto-detected host socket.
+fn docker_mgr() -> Result<DockerManager, String> {
+    DockerManager::from_default_socket().map_err(|e| e.to_string())
+}
+
+/// Shared check: Docker daemon reachable.
+async fn check_docker_accessible() -> Result<Option<String>, String> {
+    let platform = PlatformInfo::detect().map_err(|e| e.to_string())?;
+    if platform.is_docker_available().await {
+        Ok(None)
+    } else {
+        Err("Docker daemon not reachable".to_string())
+    }
+}
+
+/// Shared check: kubectl present on PATH.
+async fn check_kubectl_installed() -> Result<Option<String>, String> {
+    let platform = PlatformInfo::detect().map_err(|e| e.to_string())?;
+    if platform.is_kubectl_installed() {
+        Ok(None)
+    } else {
+        Err("kubectl not found in PATH".to_string())
+    }
+}
+
+/// Shared check: binary arch matches Docker daemon arch.
+/// On macOS a mismatch is reported as a Rosetta situation.
+async fn check_arch_mismatch() -> Result<Option<String>, String> {
+    let docker = docker_mgr()?;
+    let info = docker
+        .client
+        .info()
+        .await
+        .map_err(|e| format!("docker info failed: {}", e))?;
+
+    let docker_arch = info
+        .architecture
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string();
+    let binary_arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
+    };
+
+    let mismatch = matches!(
+        (binary_arch, docker_arch.as_str()),
+        ("x86_64", "aarch64") | ("aarch64", "x86_64")
+    );
+
+    if mismatch && cfg!(target_os = "macos") {
+        Err(format!(
+            "binary={}, Docker={} (Rosetta detected)",
+            binary_arch, docker_arch
+        ))
+    } else if mismatch {
+        Err(format!("binary={}, Docker={}", binary_arch, docker_arch))
+    } else {
+        Ok(Some(docker_arch))
+    }
+}
+
 /// Format a list of items, showing at most `max` with a "(+N)" suffix for the rest.
 fn truncated_list(items: &[&str], max: usize) -> String {
     let shown: Vec<_> = items.iter().take(max).copied().collect();
@@ -107,224 +184,96 @@ fn truncated_list(items: &[&str], max: usize) -> String {
 }
 
 fn build_test_list() -> Vec<DiagnosticResult> {
-    vec![
+    let specs: &[(&'static str, &'static str, &'static str)] = &[
         // Prerequisites
-        DiagnosticResult {
-            id: "docker_accessible",
-            category: CAT_PREREQUISITES,
-            name: "Docker accessible".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "kubectl_installed",
-            category: CAT_PREREQUISITES,
-            name: "kubectl installed".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "apparmor_check",
-            category: CAT_PREREQUISITES,
-            name: "AppArmor profile".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "br_netfilter_loaded",
-            category: CAT_PREREQUISITES,
-            name: "br_netfilter module".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
+        ("docker_accessible", CAT_PREREQUISITES, "Docker accessible"),
+        ("kubectl_installed", CAT_PREREQUISITES, "kubectl installed"),
+        ("apparmor_check", CAT_PREREQUISITES, "AppArmor profile"),
+        (
+            "br_netfilter_loaded",
+            CAT_PREREQUISITES,
+            "br_netfilter module",
+        ),
         // Cluster
-        DiagnosticResult {
-            id: "container_running",
-            category: CAT_CLUSTER,
-            name: "K3s container running".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "k8s_api_reachable",
-            category: CAT_CLUSTER,
-            name: "K8s API reachable".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "nodes_ready",
-            category: CAT_CLUSTER,
-            name: "Node(s) Ready".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "container_health",
-            category: CAT_CLUSTER,
-            name: "Container health".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "arch_mismatch",
-            category: CAT_CLUSTER,
-            name: "Architecture match".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
+        ("container_running", CAT_CLUSTER, "K3s container running"),
+        ("k8s_api_reachable", CAT_CLUSTER, "K8s API reachable"),
+        ("nodes_ready", CAT_CLUSTER, "Node(s) Ready"),
+        ("container_health", CAT_CLUSTER, "Container health"),
+        ("arch_mismatch", CAT_CLUSTER, "Architecture match"),
         // Core Services
-        DiagnosticResult {
-            id: "coredns_running",
-            category: CAT_CORE_SERVICES,
-            name: "CoreDNS running".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "traefik_service",
-            category: CAT_CORE_SERVICES,
-            name: "Traefik service exists".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "local_path_provisioner",
-            category: CAT_CORE_SERVICES,
-            name: "local-path-provisioner running".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "flannel_running",
-            category: CAT_CORE_SERVICES,
-            name: "Flannel CNI configured".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
+        ("coredns_running", CAT_CORE_SERVICES, "CoreDNS running"),
+        (
+            "traefik_service",
+            CAT_CORE_SERVICES,
+            "Traefik service exists",
+        ),
+        (
+            "local_path_provisioner",
+            CAT_CORE_SERVICES,
+            "local-path-provisioner running",
+        ),
+        (
+            "flannel_running",
+            CAT_CORE_SERVICES,
+            "Flannel CNI configured",
+        ),
         // Networking
-        DiagnosticResult {
-            id: "host_ports_reachable",
-            category: CAT_NETWORKING,
-            name: "Host ports reachable".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "ingress_configured",
-            category: CAT_NETWORKING,
-            name: "Ingress routes configured".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "hosts_uptodate",
-            category: CAT_NETWORKING,
-            name: "/etc/hosts up-to-date".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "ingress_healthy",
-            category: CAT_NETWORKING,
-            name: "Ingress endpoints healthy".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "tls_cert_valid",
-            category: CAT_NETWORKING,
-            name: "TLS certificate valid".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
+        (
+            "host_ports_reachable",
+            CAT_NETWORKING,
+            "Host ports reachable",
+        ),
+        (
+            "ingress_configured",
+            CAT_NETWORKING,
+            "Ingress routes configured",
+        ),
+        ("hosts_uptodate", CAT_NETWORKING, "/etc/hosts up-to-date"),
+        (
+            "ingress_healthy",
+            CAT_NETWORKING,
+            "Ingress endpoints healthy",
+        ),
+        ("tls_cert_valid", CAT_NETWORKING, "TLS certificate valid"),
         // Pods
-        DiagnosticResult {
-            id: "no_stuck_pods",
-            category: CAT_PODS,
-            name: "No stuck pods".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "no_pull_errors",
-            category: CAT_PODS,
-            name: "No ImagePullBackOff".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "no_crash_loops",
-            category: CAT_PODS,
-            name: "No CrashLoopBackOff".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "node_conditions",
-            category: CAT_PODS,
-            name: "Node conditions healthy".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
+        ("no_stuck_pods", CAT_PODS, "No stuck pods"),
+        ("no_pull_errors", CAT_PODS, "No ImagePullBackOff"),
+        ("no_crash_loops", CAT_PODS, "No CrashLoopBackOff"),
+        ("node_conditions", CAT_PODS, "Node conditions healthy"),
         // Deep Verification
-        DiagnosticResult {
-            id: "deep_setup",
-            category: CAT_DEEP_VERIFICATION,
-            name: "Create test namespace".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "deep_dns",
-            category: CAT_DEEP_VERIFICATION,
-            name: "DNS resolution".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "deep_connectivity",
-            category: CAT_DEEP_VERIFICATION,
-            name: "Pod-to-Service connectivity".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "deep_volume",
-            category: CAT_DEEP_VERIFICATION,
-            name: "Volume write/read".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "deep_host_http",
-            category: CAT_DEEP_VERIFICATION,
-            name: "Host HTTP to Traefik".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "deep_docker_in_container",
-            category: CAT_DEEP_VERIFICATION,
-            name: "Docker socket in container".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "deep_runtime_socket",
-            category: CAT_DEEP_VERIFICATION,
-            name: "Container runtime socket".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "deep_cleanup",
-            category: CAT_DEEP_VERIFICATION,
-            name: "Cleanup test resources".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-    ]
+        ("deep_setup", CAT_DEEP_VERIFICATION, "Create test namespace"),
+        ("deep_dns", CAT_DEEP_VERIFICATION, "DNS resolution"),
+        (
+            "deep_connectivity",
+            CAT_DEEP_VERIFICATION,
+            "Pod-to-Service connectivity",
+        ),
+        ("deep_volume", CAT_DEEP_VERIFICATION, "Volume write/read"),
+        (
+            "deep_host_http",
+            CAT_DEEP_VERIFICATION,
+            "Host HTTP to Traefik",
+        ),
+        (
+            "deep_docker_in_container",
+            CAT_DEEP_VERIFICATION,
+            "Docker socket in container",
+        ),
+        (
+            "deep_runtime_socket",
+            CAT_DEEP_VERIFICATION,
+            "Container runtime socket",
+        ),
+        (
+            "deep_cleanup",
+            CAT_DEEP_VERIFICATION,
+            "Cleanup test resources",
+        ),
+    ];
+    specs
+        .iter()
+        .map(|(id, cat, name)| DiagnosticResult::pending(id, cat, *name))
+        .collect()
 }
 
 /// Check if a test should be skipped based on prior failures
@@ -411,107 +360,76 @@ const CAT_PREFLIGHT_PORTS: &str = "Ports";
 const CAT_PREFLIGHT_CONFIG: &str = "Configuration";
 
 fn build_preflight_list(config: &ClusterConfig) -> Vec<DiagnosticResult> {
-    let mut tests = vec![
+    let fixed: &[(&'static str, &'static str, &'static str)] = &[
         // System
-        DiagnosticResult {
-            id: "pre_docker_accessible",
-            category: CAT_PREFLIGHT_SYSTEM,
-            name: "Docker accessible".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "pre_kubectl_installed",
-            category: CAT_PREFLIGHT_SYSTEM,
-            name: "kubectl installed".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "pre_arch_check",
-            category: CAT_PREFLIGHT_SYSTEM,
-            name: "Architecture".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
+        (
+            "pre_docker_accessible",
+            CAT_PREFLIGHT_SYSTEM,
+            "Docker accessible",
+        ),
+        (
+            "pre_kubectl_installed",
+            CAT_PREFLIGHT_SYSTEM,
+            "kubectl installed",
+        ),
+        ("pre_arch_check", CAT_PREFLIGHT_SYSTEM, "Architecture"),
         // Docker
-        DiagnosticResult {
-            id: "pre_docker_info",
-            category: CAT_PREFLIGHT_DOCKER,
-            name: "Docker daemon healthy".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "pre_docker_disk",
-            category: CAT_PREFLIGHT_DOCKER,
-            name: "Docker disk space".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "pre_k3s_image",
-            category: CAT_PREFLIGHT_DOCKER,
-            name: "K3s image available".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "pre_container_conflict",
-            category: CAT_PREFLIGHT_DOCKER,
-            name: "No container name conflict".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
-        DiagnosticResult {
-            id: "pre_network_conflict",
-            category: CAT_PREFLIGHT_DOCKER,
-            name: "No network name conflict".to_string(),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        },
+        (
+            "pre_docker_info",
+            CAT_PREFLIGHT_DOCKER,
+            "Docker daemon healthy",
+        ),
+        ("pre_docker_disk", CAT_PREFLIGHT_DOCKER, "Docker disk space"),
+        ("pre_k3s_image", CAT_PREFLIGHT_DOCKER, "K3s image available"),
+        (
+            "pre_container_conflict",
+            CAT_PREFLIGHT_DOCKER,
+            "No container name conflict",
+        ),
+        (
+            "pre_network_conflict",
+            CAT_PREFLIGHT_DOCKER,
+            "No network name conflict",
+        ),
     ];
+    let mut tests: Vec<DiagnosticResult> = fixed
+        .iter()
+        .map(|(id, cat, name)| DiagnosticResult::pending(id, cat, *name))
+        .collect();
 
-    // Ports — add one test per core port
-    let core_ports: Vec<(u16, &str)> = vec![
+    // Ports — one test per core port plus any additional_ports.
+    // All port tests share the "pre_port" id; the name carries the port number.
+    let core_ports = [
         (config.http_port, "HTTP"),
         (config.https_port, "HTTPS"),
         (config.api_port, "K8s API"),
     ];
-    for (port, label) in &core_ports {
-        tests.push(DiagnosticResult {
-            id: "pre_port", // All port tests share this id; name differentiates
-            category: CAT_PREFLIGHT_PORTS,
-            name: format!("Port {} ({}) available", port, label),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        });
+    for (port, label) in core_ports {
+        tests.push(DiagnosticResult::pending(
+            "pre_port",
+            CAT_PREFLIGHT_PORTS,
+            format!("Port {} ({}) available", port, label),
+        ));
     }
     for (host_port, _) in &config.additional_ports {
-        tests.push(DiagnosticResult {
-            id: "pre_port",
-            category: CAT_PREFLIGHT_PORTS,
-            name: format!("Port {} (additional) available", host_port),
-            status: DiagnosticStatus::Pending,
-            duration: None,
-        });
+        tests.push(DiagnosticResult::pending(
+            "pre_port",
+            CAT_PREFLIGHT_PORTS,
+            format!("Port {} (additional) available", host_port),
+        ));
     }
 
     // Configuration
-    tests.push(DiagnosticResult {
-        id: "pre_kubeconfig_dir",
-        category: CAT_PREFLIGHT_CONFIG,
-        name: "Kubeconfig directory writable".to_string(),
-        status: DiagnosticStatus::Pending,
-        duration: None,
-    });
-    tests.push(DiagnosticResult {
-        id: "pre_certs_dir",
-        category: CAT_PREFLIGHT_CONFIG,
-        name: "Certs directory writable".to_string(),
-        status: DiagnosticStatus::Pending,
-        duration: None,
-    });
+    tests.push(DiagnosticResult::pending(
+        "pre_kubeconfig_dir",
+        CAT_PREFLIGHT_CONFIG,
+        "Kubeconfig directory writable",
+    ));
+    tests.push(DiagnosticResult::pending(
+        "pre_certs_dir",
+        CAT_PREFLIGHT_CONFIG,
+        "Certs directory writable",
+    ));
 
     tests
 }
@@ -546,63 +464,11 @@ async fn execute_preflight_test(
     config: &ClusterConfig,
 ) -> Result<Option<String>, String> {
     match test_id {
-        "pre_docker_accessible" => {
-            let platform = PlatformInfo::detect().map_err(|e| e.to_string())?;
-            if platform.is_docker_available().await {
-                Ok(None)
-            } else {
-                Err("Docker daemon not reachable".to_string())
-            }
-        }
-        "pre_kubectl_installed" => {
-            let platform = PlatformInfo::detect().map_err(|e| e.to_string())?;
-            if platform.is_kubectl_installed() {
-                Ok(None)
-            } else {
-                Err("kubectl not found in PATH".to_string())
-            }
-        }
-        "pre_arch_check" => {
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
-            let info = docker
-                .client
-                .info()
-                .await
-                .map_err(|e| format!("docker info failed: {}", e))?;
-
-            let docker_arch = info
-                .architecture
-                .as_deref()
-                .unwrap_or("unknown")
-                .to_string();
-            let binary_arch = if cfg!(target_arch = "x86_64") {
-                "x86_64"
-            } else if cfg!(target_arch = "aarch64") {
-                "aarch64"
-            } else {
-                "unknown"
-            };
-
-            let mismatch = matches!(
-                (binary_arch, docker_arch.as_str()),
-                ("x86_64", "aarch64") | ("aarch64", "x86_64")
-            );
-
-            if mismatch && cfg!(target_os = "macos") {
-                Err(format!(
-                    "binary={}, Docker={} (Rosetta detected)",
-                    binary_arch, docker_arch
-                ))
-            } else if mismatch {
-                Err(format!("binary={}, Docker={}", binary_arch, docker_arch))
-            } else {
-                Ok(Some(docker_arch))
-            }
-        }
+        "pre_docker_accessible" => check_docker_accessible().await,
+        "pre_kubectl_installed" => check_kubectl_installed().await,
+        "pre_arch_check" => check_arch_mismatch().await,
         "pre_docker_info" => {
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let docker = docker_mgr()?;
             let info = docker
                 .client
                 .info()
@@ -617,21 +483,19 @@ async fn execute_preflight_test(
             Ok(Some(format!("v{}, cgroup={}", server_version, cgroup)))
         }
         "pre_docker_disk" => {
-            // Use docker info to check available disk space
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let docker = docker_mgr()?;
             let info = docker
                 .client
                 .info()
                 .await
                 .map_err(|e| format!("docker info failed: {}", e))?;
 
-            // Check images count as a rough proxy for disk usage
             let images = info.images.unwrap_or(0);
             let containers = info.containers.unwrap_or(0);
             let docker_root = info.docker_root_dir.unwrap_or_default();
 
-            // Check disk space on Docker root dir using statvfs
+            // Disk space on Docker root dir via statvfs; fall back to summary
+            // counts if statvfs fails (e.g. path is remote).
             match nix::sys::statvfs::statvfs(docker_root.as_str()) {
                 Ok(stat) => {
                     #[allow(clippy::unnecessary_cast)]
@@ -653,8 +517,7 @@ async fn execute_preflight_test(
             }
         }
         "pre_k3s_image" => {
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let docker = docker_mgr()?;
             let image = config.k3s_image();
             if docker.image_exists(&image).await {
                 Ok(Some("cached locally".to_string()))
@@ -663,10 +526,8 @@ async fn execute_preflight_test(
             }
         }
         "pre_container_conflict" => {
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let docker = docker_mgr()?;
             if docker.container_exists(&config.container_name).await {
-                // Container exists — check if it's running or stopped
                 if docker.container_running(&config.container_name).await {
                     Err(format!(
                         "'{}' already running — stop or destroy first",
@@ -683,8 +544,7 @@ async fn execute_preflight_test(
             }
         }
         "pre_network_conflict" => {
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let docker = docker_mgr()?;
             let exists = docker
                 .client
                 .inspect_network(
@@ -711,8 +571,7 @@ async fn execute_preflight_test(
                 .ok_or_else(|| "invalid port test".to_string())?;
 
             // First check if our own k3dev container already has this port mapped
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            if let Ok(docker) = DockerManager::new(socket_path) {
+            if let Ok(docker) = docker_mgr() {
                 if let Ok(info) = docker
                     .client
                     .inspect_container(
@@ -797,17 +656,60 @@ async fn execute_preflight_test(
 
 /// Run preflight checks (no running cluster required)
 pub async fn run_preflight_checks(config: Arc<ClusterConfig>, tx: mpsc::Sender<AppMessage>) {
-    let mut report = DiagnosticsReport {
+    let report = DiagnosticsReport {
         results: build_preflight_list(&config),
         finished: false,
     };
+    run_suite(
+        report,
+        tx,
+        should_skip_preflight,
+        |_id| Duration::from_secs(10),
+        |id, name, cfg| Box::pin(execute_preflight_test(id, name, cfg)),
+        config,
+    )
+    .await;
+}
 
+/// Run all diagnostic tests, sending incremental updates to the UI
+pub async fn run_all_diagnostics(config: Arc<ClusterConfig>, tx: mpsc::Sender<AppMessage>) {
+    run_suite(
+        DiagnosticsReport::new(),
+        tx,
+        should_skip,
+        test_timeout,
+        |id, _name, cfg| Box::pin(execute_test(id, cfg)),
+        config,
+    )
+    .await;
+}
+
+/// Generic runner for a diagnostic suite. Drives the report through Running →
+/// Passed/Failed/Skipped, sending an update after every transition.
+async fn run_suite<Skip, Timeout, Exec>(
+    mut report: DiagnosticsReport,
+    tx: mpsc::Sender<AppMessage>,
+    skip: Skip,
+    timeout: Timeout,
+    exec: Exec,
+    config: Arc<ClusterConfig>,
+) where
+    Skip: Fn(&DiagnosticsReport, usize) -> Option<&'static str>,
+    Timeout: Fn(&str) -> Duration,
+    Exec: for<'a> Fn(
+        &'a str,
+        &'a str,
+        &'a ClusterConfig,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send + 'a>,
+    >,
+{
     let _ = tx
         .send(AppMessage::DiagnosticsUpdated(report.clone()))
         .await;
 
     for i in 0..report.results.len() {
-        if let Some(reason) = should_skip_preflight(&report, i) {
+        if let Some(reason) = skip(&report, i) {
             report.results[i].status = DiagnosticStatus::Skipped(reason.to_string());
             let _ = tx
                 .send(AppMessage::DiagnosticsUpdated(report.clone()))
@@ -823,11 +725,8 @@ pub async fn run_preflight_checks(config: Arc<ClusterConfig>, tx: mpsc::Sender<A
         let start = Instant::now();
         let test_id = report.results[i].id;
         let test_name = report.results[i].name.clone();
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            execute_preflight_test(test_id, &test_name, &config),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(timeout(test_id), exec(test_id, &test_name, &config)).await;
 
         report.results[i].duration = Some(start.elapsed());
 
@@ -852,92 +751,15 @@ pub async fn run_preflight_checks(config: Arc<ClusterConfig>, tx: mpsc::Sender<A
     }
 
     report.finished = true;
-    let _ = tx
-        .send(AppMessage::DiagnosticsUpdated(report.clone()))
-        .await;
-}
-
-/// Run all diagnostic tests, sending incremental updates to the UI
-pub async fn run_all_diagnostics(config: Arc<ClusterConfig>, tx: mpsc::Sender<AppMessage>) {
-    let mut report = DiagnosticsReport::new();
-
-    // Send initial state (all Pending)
-    let _ = tx
-        .send(AppMessage::DiagnosticsUpdated(report.clone()))
-        .await;
-
-    for i in 0..report.results.len() {
-        // Check skip logic
-        if let Some(reason) = should_skip(&report, i) {
-            report.results[i].status = DiagnosticStatus::Skipped(reason.to_string());
-            let _ = tx
-                .send(AppMessage::DiagnosticsUpdated(report.clone()))
-                .await;
-            continue;
-        }
-
-        // Mark as Running
-        report.results[i].status = DiagnosticStatus::Running;
-        let _ = tx
-            .send(AppMessage::DiagnosticsUpdated(report.clone()))
-            .await;
-
-        // Execute with per-test timeout
-        let start = Instant::now();
-        let test_id = report.results[i].id;
-        let result =
-            tokio::time::timeout(test_timeout(test_id), execute_test(test_id, &config)).await;
-
-        let elapsed = start.elapsed();
-        report.results[i].duration = Some(elapsed);
-
-        match result {
-            Ok(Ok(msg)) => {
-                // Update name with extra info if provided
-                if let Some(detail) = msg {
-                    report.results[i].name = format!("{} ({})", report.results[i].name, detail);
-                }
-                report.results[i].status = DiagnosticStatus::Passed;
-            }
-            Ok(Err(reason)) => {
-                report.results[i].status = DiagnosticStatus::Failed(reason);
-            }
-            Err(_) => {
-                report.results[i].status = DiagnosticStatus::Failed("timed out".to_string());
-            }
-        }
-
-        let _ = tx
-            .send(AppMessage::DiagnosticsUpdated(report.clone()))
-            .await;
-    }
-
-    report.finished = true;
-    let _ = tx
-        .send(AppMessage::DiagnosticsUpdated(report.clone()))
-        .await;
+    let _ = tx.send(AppMessage::DiagnosticsUpdated(report)).await;
 }
 
 /// Execute a single diagnostic test by ID.
 /// Returns Ok(Some(detail)) for passed with extra info, Ok(None) for simple pass, Err(reason) for failure.
 async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<String>, String> {
     match test_id {
-        "docker_accessible" => {
-            let platform = PlatformInfo::detect().map_err(|e| e.to_string())?;
-            if platform.is_docker_available().await {
-                Ok(None)
-            } else {
-                Err("Docker daemon not reachable".to_string())
-            }
-        }
-        "kubectl_installed" => {
-            let platform = PlatformInfo::detect().map_err(|e| e.to_string())?;
-            if platform.is_kubectl_installed() {
-                Ok(None)
-            } else {
-                Err("kubectl not found in PATH".to_string())
-            }
-        }
+        "docker_accessible" => check_docker_accessible().await,
+        "kubectl_installed" => check_kubectl_installed().await,
         "apparmor_check" => {
             // Only relevant on Linux
             #[cfg(not(target_os = "linux"))]
@@ -1002,8 +824,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "container_running" => {
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let docker = docker_mgr()?;
             if docker.container_running(&config.container_name).await {
                 Ok(None)
             } else {
@@ -1036,8 +857,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "container_health" => {
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let docker = docker_mgr()?;
             let info = docker
                 .client
                 .inspect_container(
@@ -1069,46 +889,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 Ok(Some(detail))
             }
         }
-        "arch_mismatch" => {
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
-            let info = docker
-                .client
-                .info()
-                .await
-                .map_err(|e| format!("docker info failed: {}", e))?;
-
-            let docker_arch = info
-                .architecture
-                .as_deref()
-                .unwrap_or("unknown")
-                .to_string();
-            let binary_arch = if cfg!(target_arch = "x86_64") {
-                "x86_64"
-            } else if cfg!(target_arch = "aarch64") {
-                "aarch64"
-            } else {
-                "unknown"
-            };
-
-            let mismatch = matches!(
-                (binary_arch, docker_arch.as_str()),
-                ("x86_64", "aarch64") | ("aarch64", "x86_64")
-            );
-
-            if mismatch {
-                if cfg!(target_os = "macos") {
-                    Err(format!(
-                        "binary={}, Docker={} (Rosetta detected)",
-                        binary_arch, docker_arch
-                    ))
-                } else {
-                    Err(format!("binary={}, Docker={}", binary_arch, docker_arch))
-                }
-            } else {
-                Ok(Some(docker_arch))
-            }
-        }
+        "arch_mismatch" => check_arch_mismatch().await,
         "coredns_running" => {
             let k8s = init_k8s_client(config).await?;
             let pods = k8s
@@ -1146,8 +927,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
         "flannel_running" => {
             // K3s embeds flannel in the k3s binary — no separate pods.
             // Verify CNI config and flannel subnet exist inside the container.
-            let socket_path = PlatformInfo::find_docker_socket_sync();
-            let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+            let docker = docker_mgr()?;
 
             let cni_check = docker
                 .exec_in_container(
@@ -1874,8 +1654,7 @@ async fn deep_host_http(config: &ClusterConfig) -> Result<Option<String>, String
 
 /// Verify Docker socket is accessible inside the k3s container
 async fn deep_docker_in_container(config: &ClusterConfig) -> Result<Option<String>, String> {
-    let socket_path = PlatformInfo::find_docker_socket_sync();
-    let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+    let docker = docker_mgr()?;
 
     let output = docker
         .exec_in_container(
@@ -1904,8 +1683,7 @@ async fn deep_runtime_socket(config: &ClusterConfig) -> Result<Option<String>, S
         ));
     }
 
-    let socket_path = PlatformInfo::find_docker_socket_sync();
-    let docker = DockerManager::new(socket_path).map_err(|e| e.to_string())?;
+    let docker = docker_mgr()?;
 
     // On macOS (Docker Desktop), k3s uses --container-runtime-endpoint /proc/1/root/run/docker.sock
     // to bypass the proxy socket. Verify this path exists and is a socket.

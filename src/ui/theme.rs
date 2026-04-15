@@ -23,17 +23,6 @@ impl Theme {
             Theme::Nord => ColorPalette::nord(),
         }
     }
-
-    /// Parse theme from string (for config)
-    #[allow(dead_code)]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "fallout" => Some(Theme::Fallout),
-            "cyberpunk" => Some(Theme::Cyberpunk),
-            "nord" => Some(Theme::Nord),
-            _ => None,
-        }
-    }
 }
 
 /// Color palette for theming
@@ -41,9 +30,6 @@ impl Theme {
 pub struct ColorPalette {
     /// Primary accent color (selections, focused borders)
     pub primary: Color,
-    /// Secondary accent color (headers, titles)
-    #[allow(dead_code)]
-    pub secondary: Color,
     /// Success indicator color
     pub success: Color,
     /// Warning indicator color
@@ -53,7 +39,6 @@ pub struct ColorPalette {
     /// Muted/disabled text color
     pub muted: Color,
     /// Background color
-    #[allow(dead_code)]
     pub background: Color,
     /// Border color (unfocused)
     pub border: Color,
@@ -70,7 +55,6 @@ impl ColorPalette {
     pub fn fallout() -> Self {
         Self {
             primary: Color::Rgb(32, 194, 14),     // Bright phosphor green
-            secondary: Color::Rgb(24, 160, 24),   // Medium phosphor green
             success: Color::Rgb(51, 255, 51),     // Bright success green
             warning: Color::Rgb(196, 160, 0),     // Amber phosphor
             error: Color::Rgb(204, 51, 51),       // Red phosphor
@@ -87,7 +71,6 @@ impl ColorPalette {
     pub fn cyberpunk() -> Self {
         Self {
             primary: Color::Rgb(189, 147, 249),   // Neon purple
-            secondary: Color::Rgb(139, 233, 253), // Cyan
             success: Color::Rgb(80, 250, 123),    // Neon green
             warning: Color::Rgb(255, 184, 108),   // Orange
             error: Color::Rgb(255, 85, 85),       // Neon red
@@ -104,7 +87,6 @@ impl ColorPalette {
     pub fn nord() -> Self {
         Self {
             primary: Color::Rgb(136, 192, 208),   // Nord frost blue
-            secondary: Color::Rgb(129, 161, 193), // Nord blue
             success: Color::Rgb(163, 190, 140),   // Nord green
             warning: Color::Rgb(235, 203, 139),   // Nord yellow
             error: Color::Rgb(191, 97, 106),      // Nord red

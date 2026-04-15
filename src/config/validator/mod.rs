@@ -10,61 +10,12 @@ use super::types::Config;
 /// Result of configuration validation
 #[derive(Debug, Default)]
 pub struct ValidationResult {
-    #[allow(dead_code)]
-    pub errors: Vec<ValidationError>,
     pub warnings: Vec<ValidationWarning>,
 }
 
 impl ValidationResult {
-    #[allow(dead_code)]
-    pub fn is_valid(&self) -> bool {
-        self.errors.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub fn has_warnings(&self) -> bool {
-        !self.warnings.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub fn add_error(&mut self, error: ValidationError) {
-        self.errors.push(error);
-    }
-
     pub fn add_warning(&mut self, warning: ValidationWarning) {
         self.warnings.push(warning);
-    }
-}
-
-/// Hard validation errors that should prevent loading
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum ValidationError {
-    MissingRequiredField {
-        path: String,
-        field: String,
-    },
-    InvalidValue {
-        path: String,
-        field: String,
-        reason: String,
-    },
-}
-
-impl std::fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ValidationError::MissingRequiredField { path, field } => {
-                write!(f, "{}: missing required field '{}'", path, field)
-            }
-            ValidationError::InvalidValue {
-                path,
-                field,
-                reason,
-            } => {
-                write!(f, "{}: invalid value for '{}': {}", path, field, reason)
-            }
-        }
     }
 }
 

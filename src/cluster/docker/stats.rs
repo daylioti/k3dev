@@ -5,9 +5,10 @@
 //! - Per-pod stats using cgroups v2
 //! - CPU delta calculation with spike detection
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bollard::query_parameters::InspectContainerOptions;
 use once_cell::sync::Lazy;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
@@ -76,7 +77,6 @@ pub struct ContainerStats {
     pub cpu_limit_millicores: f64,
     pub memory_used_mb: f64,
     pub memory_limit_mb: f64,
-    pub status: String,
 }
 
 impl DockerManager {
@@ -248,7 +248,6 @@ impl DockerManager {
                     cpu_limit_millicores,
                     memory_used_mb,
                     memory_limit_mb,
-                    status: "running".to_string(),
                 });
         }
 
@@ -741,17 +740,24 @@ fn search_cgroup_dir(dir: &std::path::Path, container_id: &str) -> Option<std::p
 // One exec call replaces N Docker API calls + N cgroup reads.
 
 /// Raw container stats from the agent JSON output
+#[derive(Debug, Deserialize)]
 struct AgentContainer {
     id: String,
     pod: String,
     ns: String,
+    #[serde(rename = "cpu")]
     cpu_usec: u64,
+    #[serde(rename = "cq")]
     cpu_quota: i64,
+    #[serde(rename = "cp")]
     cpu_period: u64,
+    #[serde(rename = "mem")]
     mem_current: u64,
+    #[serde(rename = "ml")]
     mem_max: i64,
 }
 
+#[derive(Debug, Deserialize)]
 struct AgentOutput {
     ts: u64,
     containers: Vec<AgentContainer>,
@@ -865,7 +871,6 @@ impl DockerManager {
                     cpu_limit_millicores,
                     memory_used_mb,
                     memory_limit_mb,
-                    status: "running".to_string(),
                 });
         }
 
@@ -907,7 +912,6 @@ impl DockerManager {
 }
 
 /// Parse the JSON output from k3dev-agent.
-/// Minimal parser — no serde, handles the specific agent output format.
 fn parse_agent_output(json: &str) -> Result<AgentOutput> {
     let json = json.trim();
     if json.is_empty() || json.starts_with("{\"error\"") {
@@ -916,75 +920,5 @@ fn parse_agent_output(json: &str) -> Result<AgentOutput> {
             json.chars().take(200).collect::<String>()
         ));
     }
-
-    // Extract timestamp: {"ts":12345,...}
-    let ts = extract_u64_field(json, "\"ts\":")
-        .ok_or_else(|| anyhow::anyhow!("Missing ts field in agent output"))?;
-
-    // Find containers array
-    let arr_start = json
-        .find("\"containers\":[")
-        .ok_or_else(|| anyhow::anyhow!("Missing containers array"))?
-        + 14;
-
-    let mut containers = Vec::new();
-    let mut pos = arr_start;
-
-    // Parse each container object
-    while pos < json.len() {
-        let obj_start = match json[pos..].find('{') {
-            Some(p) => pos + p,
-            None => break,
-        };
-        let obj_end = match json[obj_start..].find('}') {
-            Some(p) => obj_start + p + 1,
-            None => break,
-        };
-        let obj = &json[obj_start..obj_end];
-
-        if let Some(c) = parse_agent_container(obj) {
-            containers.push(c);
-        }
-
-        pos = obj_end;
-    }
-
-    Ok(AgentOutput { ts, containers })
-}
-
-fn parse_agent_container(obj: &str) -> Option<AgentContainer> {
-    Some(AgentContainer {
-        id: extract_str_field(obj, "\"id\":\"")?,
-        pod: extract_str_field(obj, "\"pod\":\"")?,
-        ns: extract_str_field(obj, "\"ns\":\"")?,
-        cpu_usec: extract_u64_field(obj, "\"cpu\":")?,
-        cpu_quota: extract_i64_field(obj, "\"cq\":")?,
-        cpu_period: extract_u64_field(obj, "\"cp\":")?,
-        mem_current: extract_u64_field(obj, "\"mem\":")?,
-        mem_max: extract_i64_field(obj, "\"ml\":")?,
-    })
-}
-
-fn extract_str_field(s: &str, marker: &str) -> Option<String> {
-    let start = s.find(marker)? + marker.len();
-    let end = start + s[start..].find('"')?;
-    Some(s[start..end].to_string())
-}
-
-fn extract_u64_field(s: &str, marker: &str) -> Option<u64> {
-    let start = s.find(marker)? + marker.len();
-    let end = start
-        + s[start..]
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(s.len() - start);
-    s[start..end].parse().ok()
-}
-
-fn extract_i64_field(s: &str, marker: &str) -> Option<i64> {
-    let start = s.find(marker)? + marker.len();
-    let end = start
-        + s[start..]
-            .find(|c: char| !c.is_ascii_digit() && c != '-')
-            .unwrap_or(s.len() - start);
-    s[start..end].parse().ok()
+    serde_json::from_str(json).context("Failed to parse agent JSON output")
 }

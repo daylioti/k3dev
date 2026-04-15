@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Secret, Service};
+use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Secret, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::ByteString;
 use kube::api::{Api, DynamicObject, ListParams, Patch, PatchParams, PostParams};
@@ -11,7 +11,6 @@ use kube::discovery::ApiResource;
 use kube::{Client, Config};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -57,12 +56,6 @@ impl KubeOps {
         self.client.as_ref()
     }
 
-    /// Reset the client (useful after kubeconfig changes)
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        self.client = None;
-    }
-
     // ==================== Deployment Operations ====================
 
     /// Get deployment ready replicas count
@@ -93,129 +86,6 @@ impl KubeOps {
             sleep(Duration::from_secs(2)).await;
         }
         Ok(false)
-    }
-
-    /// Rollout restart a deployment by updating pod template annotation
-    #[allow(dead_code)]
-    pub async fn rollout_restart_deployment(&mut self, name: &str, namespace: &str) -> Result<()> {
-        let client = self.client().await?;
-        let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
-
-        let patch = json!({
-            "spec": {
-                "template": {
-                    "metadata": {
-                        "annotations": {
-                            "kubectl.kubernetes.io/restartedAt": chrono::Utc::now().to_rfc3339()
-                        }
-                    }
-                }
-            }
-        });
-
-        deployments
-            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await?;
-        Ok(())
-    }
-
-    /// Wait for deployment rollout to complete
-    #[allow(dead_code)]
-    pub async fn wait_for_rollout(
-        &mut self,
-        name: &str,
-        namespace: &str,
-        timeout_secs: u64,
-    ) -> Result<bool> {
-        let start = std::time::Instant::now();
-        while start.elapsed().as_secs() < timeout_secs {
-            let client = self.client().await?;
-            let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
-
-            if let Ok(deploy) = deployments.get(name).await {
-                if let Some(status) = deploy.status {
-                    let desired = deploy.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
-                    let ready = status.ready_replicas.unwrap_or(0);
-                    let updated = status.updated_replicas.unwrap_or(0);
-                    let available = status.available_replicas.unwrap_or(0);
-
-                    if ready >= desired && updated >= desired && available >= desired {
-                        return Ok(true);
-                    }
-                }
-            }
-            sleep(Duration::from_secs(2)).await;
-        }
-        Ok(false)
-    }
-
-    // ==================== ConfigMap Operations ====================
-
-    /// Get ConfigMap data field
-    #[allow(dead_code)]
-    pub async fn get_configmap_data(
-        &mut self,
-        name: &str,
-        namespace: &str,
-        key: &str,
-    ) -> Result<Option<String>> {
-        let client = self.client().await?;
-        let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-        let cm = configmaps.get(name).await?;
-        Ok(cm.data.and_then(|d| d.get(key).cloned()))
-    }
-
-    /// Patch ConfigMap data
-    #[allow(dead_code)]
-    pub async fn patch_configmap_data(
-        &mut self,
-        name: &str,
-        namespace: &str,
-        data: BTreeMap<String, String>,
-    ) -> Result<()> {
-        let client = self.client().await?;
-        let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-
-        let patch = json!({
-            "data": data
-        });
-
-        configmaps
-            .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await?;
-        Ok(())
-    }
-
-    /// Remove annotation from a resource
-    #[allow(dead_code)]
-    pub async fn remove_configmap_annotation(
-        &mut self,
-        name: &str,
-        namespace: &str,
-        annotation: &str,
-    ) -> Result<()> {
-        let client = self.client().await?;
-        let configmaps: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
-
-        // First get the current configmap to check if annotation exists
-        if let Ok(cm) = configmaps.get(name).await {
-            if let Some(annotations) = cm.metadata.annotations {
-                if annotations.contains_key(annotation) {
-                    // Use strategic merge patch with null value to remove annotation
-                    let patch = json!({
-                        "metadata": {
-                            "annotations": {
-                                annotation: serde_json::Value::Null
-                            }
-                        }
-                    });
-                    let _ = configmaps
-                        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-                        .await;
-                }
-            }
-        }
-        Ok(())
     }
 
     // ==================== Secret Operations ====================
@@ -250,15 +120,6 @@ impl KubeOps {
         };
 
         secrets.create(&PostParams::default(), &secret).await?;
-        Ok(())
-    }
-
-    /// Delete a secret (ignores if not found)
-    #[allow(dead_code)]
-    pub async fn delete_secret(&mut self, name: &str, namespace: &str) -> Result<()> {
-        let client = self.client().await?;
-        let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
-        let _ = secrets.delete(name, &Default::default()).await;
         Ok(())
     }
 
@@ -604,37 +465,6 @@ impl KubeOps {
             }
             Err(e) => Err(e.into()),
         }
-    }
-
-    /// Delete a custom resource
-    #[allow(dead_code)]
-    pub async fn delete_custom_resource(
-        &mut self,
-        api_version: &str,
-        kind: &str,
-        name: &str,
-        namespace: &str,
-    ) -> Result<()> {
-        let client = self.client().await?;
-
-        let (group, version) = if api_version.contains('/') {
-            let parts: Vec<&str> = api_version.split('/').collect();
-            (parts[0].to_string(), parts[1].to_string())
-        } else {
-            (String::new(), api_version.to_string())
-        };
-
-        let ar = ApiResource {
-            group,
-            version: version.clone(),
-            kind: kind.to_string(),
-            api_version: api_version.to_string(),
-            plural: format!("{}s", kind.to_lowercase()),
-        };
-
-        let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
-        let _ = api.delete(name, &Default::default()).await;
-        Ok(())
     }
 
     // ==================== Cluster Info ====================

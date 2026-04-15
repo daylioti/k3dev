@@ -14,10 +14,6 @@ use super::jiff_to_chrono;
 #[derive(Debug, Clone)]
 pub struct TimelinePhase {
     pub name: String,
-    #[allow(dead_code)]
-    pub start: DateTime<Utc>,
-    #[allow(dead_code)]
-    pub end: DateTime<Utc>,
     pub duration: chrono::Duration,
 }
 
@@ -33,8 +29,6 @@ pub struct TimelineEvent {
 #[derive(Debug, Clone)]
 pub struct PodTimeline {
     pub pod_name: String,
-    #[allow(dead_code)]
-    pub namespace: String,
     pub total_duration: Option<chrono::Duration>,
     pub phases: Vec<TimelinePhase>,
     pub events: Vec<TimelineEvent>,
@@ -153,8 +147,6 @@ pub async fn get_pod_timeline(
         if end >= start {
             phases.push(TimelinePhase {
                 name: "Scheduling".to_string(),
-                start,
-                end,
                 duration: end - start,
             });
         }
@@ -171,8 +163,6 @@ pub async fn get_pod_timeline(
         if end > start {
             phases.push(TimelinePhase {
                 name: "Image Pull".to_string(),
-                start,
-                end,
                 duration: end - start,
             });
         }
@@ -186,8 +176,6 @@ pub async fn get_pod_timeline(
             if end > start {
                 phases.push(TimelinePhase {
                     name: "Init Containers".to_string(),
-                    start,
-                    end,
                     duration: end - start,
                 });
             }
@@ -206,8 +194,6 @@ pub async fn get_pod_timeline(
         if end >= start {
             phases.push(TimelinePhase {
                 name: "Container Start".to_string(),
-                start,
-                end,
                 duration: end - start,
             });
         }
@@ -221,8 +207,6 @@ pub async fn get_pod_timeline(
         if end > start {
             phases.push(TimelinePhase {
                 name: "Readiness".to_string(),
-                start,
-                end,
                 duration: end - start,
             });
         }
@@ -264,7 +248,6 @@ pub async fn get_pod_timeline(
 
     Ok(PodTimeline {
         pod_name: pod_name.to_string(),
-        namespace: namespace.to_string(),
         total_duration,
         phases,
         events,

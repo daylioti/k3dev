@@ -111,7 +111,6 @@ impl ClusterConfig {
     }
 
     /// Get kubeconfig path
-    #[allow(dead_code)]
     pub fn kubeconfig_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))

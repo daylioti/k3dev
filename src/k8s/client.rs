@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use k8s_openapi::api::core::v1::{Namespace, Node, PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::{Namespace, PersistentVolumeClaim, Pod};
 use kube::{
     api::{Api, DeleteParams, ListParams, LogParams},
     config::{KubeConfigOptions, Kubeconfig},
@@ -11,51 +11,22 @@ use std::path::Path;
 use super::jiff_to_chrono;
 use crate::config::expand_home;
 
-/// Node information
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct NodeInfo {
-    pub name: String,
-    pub status: String,
-    pub cpu: String,
-    pub memory: String,
-}
-
-/// Cluster information
-#[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
-pub struct ClusterInfo {
-    pub connected: bool,
-    pub nodes: Vec<NodeInfo>,
-    pub namespaces: Vec<String>,
-    pub pod_counts: HashMap<String, usize>,
-}
-
 /// Pod information
 #[derive(Debug, Clone)]
 pub struct PodInfo {
     pub name: String,
-    #[allow(dead_code)]
     pub namespace: String,
-    #[allow(dead_code)]
     pub status: String,
-    #[allow(dead_code)]
-    pub containers: Vec<String>,
-    #[allow(dead_code)]
     pub ready: bool,
-    #[allow(dead_code)]
     pub ip: Option<String>,
 }
 
 /// Information about a container waiting for image pull or in error state
 #[derive(Debug, Clone)]
 pub struct ContainerWaitingInfo {
-    #[allow(dead_code)]
     pub name: String,
     pub image: String,
     pub reason: String, // "ContainerCreating", "ImagePullBackOff", "ErrImagePull"
-    #[allow(dead_code)]
-    pub message: Option<String>,
 }
 
 /// Information about a pending pod
@@ -74,9 +45,7 @@ pub struct PvcInfo {
     pub namespace: String,
     pub capacity_bytes: u64,
     pub used_bytes: Option<u64>,
-    #[allow(dead_code)]
     pub phase: String,
-    #[allow(dead_code)]
     pub storage_class: String,
     pub pods: Vec<String>,
 }
@@ -118,7 +87,6 @@ impl K8sClient {
     }
 
     /// Check if connected to cluster
-    #[allow(dead_code)]
     pub async fn is_connected(&self) -> bool {
         let namespaces: Api<Namespace> = Api::all(self.client.clone());
         namespaces
@@ -127,83 +95,7 @@ impl K8sClient {
             .is_ok()
     }
 
-    /// Get cluster information
-    #[allow(dead_code)]
-    pub async fn get_cluster_info(&self) -> Result<ClusterInfo> {
-        let mut info = ClusterInfo::default();
-
-        if !self.is_connected().await {
-            return Ok(info);
-        }
-        info.connected = true;
-
-        // Get nodes
-        let nodes: Api<Node> = Api::all(self.client.clone());
-        if let Ok(node_list) = nodes.list(&ListParams::default()).await {
-            for node in node_list.items {
-                let name = node.metadata.name.unwrap_or_default();
-                let status = node
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.conditions.as_ref())
-                    .and_then(|c| c.iter().find(|c| c.type_ == "Ready"))
-                    .map(|c| {
-                        if c.status == "True" {
-                            "Ready"
-                        } else {
-                            "NotReady"
-                        }
-                    })
-                    .unwrap_or("Unknown")
-                    .to_string();
-
-                let cpu = node
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.allocatable.as_ref())
-                    .and_then(|a| a.get("cpu"))
-                    .map(|q| q.0.clone())
-                    .unwrap_or_default();
-
-                let memory = node
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.allocatable.as_ref())
-                    .and_then(|a| a.get("memory"))
-                    .map(|q| q.0.clone())
-                    .unwrap_or_default();
-
-                info.nodes.push(NodeInfo {
-                    name,
-                    status,
-                    cpu,
-                    memory,
-                });
-            }
-        }
-
-        // Get namespaces and pod counts
-        let namespaces: Api<Namespace> = Api::all(self.client.clone());
-        if let Ok(ns_list) = namespaces.list(&ListParams::default()).await {
-            for ns in ns_list.items {
-                if let Some(name) = ns.metadata.name {
-                    let pods: Api<Pod> = Api::namespaced(self.client.clone(), &name);
-                    let count = pods
-                        .list(&ListParams::default())
-                        .await
-                        .map(|p| p.items.len())
-                        .unwrap_or(0);
-                    info.pod_counts.insert(name.clone(), count);
-                    info.namespaces.push(name);
-                }
-            }
-        }
-
-        Ok(info)
-    }
-
     /// List namespaces
-    #[allow(dead_code)]
     pub async fn list_namespaces(&self) -> Result<Vec<String>> {
         let namespaces: Api<Namespace> = Api::all(self.client.clone());
         let list = namespaces.list(&ListParams::default()).await?;
@@ -216,7 +108,6 @@ impl K8sClient {
     }
 
     /// List pods in a namespace with optional label selector
-    #[allow(dead_code)]
     pub async fn list_pods(&self, namespace: &str, selector: Option<&str>) -> Result<Vec<PodInfo>> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let mut params = ListParams::default();
@@ -237,11 +128,6 @@ impl K8sClient {
                     .as_ref()
                     .and_then(|s| s.phase.clone())
                     .unwrap_or_else(|| "Unknown".to_string());
-                let containers = pod
-                    .spec
-                    .as_ref()
-                    .map(|s| s.containers.iter().map(|c| c.name.clone()).collect())
-                    .unwrap_or_default();
                 let ready = pod
                     .status
                     .as_ref()
@@ -255,7 +141,6 @@ impl K8sClient {
                     name,
                     namespace,
                     status,
-                    containers,
                     ready,
                     ip,
                 }
@@ -263,20 +148,7 @@ impl K8sClient {
             .collect())
     }
 
-    /// Find a running pod by selector
-    #[allow(dead_code)]
-    pub async fn find_running_pod(
-        &self,
-        namespace: &str,
-        selector: &str,
-    ) -> Result<Option<PodInfo>> {
-        let pods = self.list_pods(namespace, Some(selector)).await?;
-
-        Ok(pods.into_iter().find(|p| p.status == "Running"))
-    }
-
     /// Get pod by name
-    #[allow(dead_code)]
     pub async fn get_pod(&self, namespace: &str, name: &str) -> Result<PodInfo> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let pod = pods.get(name).await?;
@@ -286,11 +158,6 @@ impl K8sClient {
             .as_ref()
             .and_then(|s| s.phase.clone())
             .unwrap_or_else(|| "Unknown".to_string());
-        let containers = pod
-            .spec
-            .as_ref()
-            .map(|s| s.containers.iter().map(|c| c.name.clone()).collect())
-            .unwrap_or_default();
         let ready = pod
             .status
             .as_ref()
@@ -304,7 +171,6 @@ impl K8sClient {
             name: pod.metadata.name.unwrap_or_default(),
             namespace: pod.metadata.namespace.unwrap_or_default(),
             status,
-            containers,
             ready,
             ip,
         })
@@ -594,7 +460,6 @@ impl K8sClient {
                                     .reason
                                     .clone()
                                     .unwrap_or_else(|| "Unknown".to_string());
-                                let message = waiting.message.clone();
                                 let image = container_images
                                     .get(&cs.name)
                                     .cloned()
@@ -604,7 +469,6 @@ impl K8sClient {
                                     name: cs.name.clone(),
                                     image,
                                     reason,
-                                    message,
                                 });
                             }
                         }
@@ -629,7 +493,6 @@ impl K8sClient {
                                     } else {
                                         "ContainerCreating".to_string()
                                     },
-                                    message: None,
                                 });
                             }
                         }

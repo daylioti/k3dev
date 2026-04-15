@@ -20,6 +20,11 @@ static MANIFEST_SEMAPHORE: once_cell::sync::Lazy<Arc<Semaphore>> =
     once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(5)));
 
 impl App {
+    /// Whether the cluster is fully running (spawn_* helpers guard on this).
+    fn cluster_is_running(&self) -> bool {
+        matches!(self.cluster_status, ClusterStatus::Running)
+    }
+
     pub(super) fn spawn_status_check(&self) {
         let message_tx = self.message_tx.clone();
         let cluster_config = Arc::clone(&self.cluster_config);
@@ -43,7 +48,7 @@ impl App {
     }
 
     pub(super) fn spawn_ingress_refresh(&self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             return;
         }
 
@@ -67,7 +72,7 @@ impl App {
     }
 
     pub(super) fn spawn_ingress_health_check(&self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             return;
         }
 
@@ -93,7 +98,7 @@ impl App {
     }
 
     pub(super) fn spawn_missing_hosts_check(&self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             return;
         }
 
@@ -117,7 +122,7 @@ impl App {
     }
 
     pub(super) fn spawn_resource_stats_check(&self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             let message_tx = self.message_tx.clone();
             tokio::spawn(async move {
                 let _ = message_tx
@@ -133,12 +138,8 @@ impl App {
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let socket_path = crate::cluster::PlatformInfo::find_docker_socket_sync();
-
-                let docker = match DockerManager::new(socket_path) {
-                    Ok(d) => d,
-                    Err(_) => return Err(anyhow::anyhow!("Failed to create DockerManager")),
-                };
+                let docker = DockerManager::from_default_socket()
+                    .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
                 // Try agent first, fall back to direct cgroup reads
                 match docker.get_container_stats_via_agent(&container_name).await {
                     Ok(stats) => Ok(stats),
@@ -160,7 +161,7 @@ impl App {
     }
 
     pub(super) fn spawn_pod_stats_check(&self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             let message_tx = self.message_tx.clone();
             tokio::spawn(async move {
                 let _ = message_tx.send(AppMessage::PodStatsUpdated(vec![])).await;
@@ -174,12 +175,8 @@ impl App {
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let socket_path = crate::cluster::PlatformInfo::find_docker_socket_sync();
-
-                let docker = match DockerManager::new(socket_path) {
-                    Ok(d) => d,
-                    Err(_) => return Err(anyhow::anyhow!("Failed to create DockerManager")),
-                };
+                let docker = DockerManager::from_default_socket()
+                    .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
                 // Try agent first, fall back to direct cgroup reads
                 match docker.get_pod_stats_via_agent(&container_name).await {
                     Ok(stats) => Ok(stats),
@@ -200,7 +197,7 @@ impl App {
     }
 
     pub(super) fn spawn_pending_pods_check(&self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             let message_tx = self.message_tx.clone();
             tokio::spawn(async move {
                 let _ = message_tx
@@ -236,7 +233,7 @@ impl App {
     /// Spawn streaming monitors for images currently being pulled.
     /// Each monitor joins Docker's create_image stream for real-time byte-level progress.
     pub(super) fn spawn_pull_progress_check(&mut self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             return;
         }
 
@@ -288,7 +285,7 @@ impl App {
     }
 
     pub(super) fn spawn_volume_stats_check(&self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             return;
         }
 
@@ -301,9 +298,7 @@ impl App {
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let socket_path = crate::cluster::PlatformInfo::find_docker_socket_sync();
-
-                let docker = DockerManager::new(socket_path)
+                let docker = DockerManager::from_default_socket()
                     .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
 
                 // 1. Get volume stats via docker exec + container mounts (PVC dirs, sizes, pod mapping)
@@ -385,7 +380,7 @@ impl App {
     }
 
     pub(super) fn spawn_port_forwards_check(&self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             let message_tx = self.message_tx.clone();
             tokio::spawn(async move {
                 let _ = message_tx
@@ -396,12 +391,10 @@ impl App {
         }
 
         let message_tx = self.message_tx.clone();
-        let container_name = self.cluster_config.container_name.clone();
-        let static_ports = self.get_static_ports();
         let timeout = self.refresh_config.port_forward_timeout;
 
         tokio::spawn(async move {
-            let mut detector = PortForwardDetector::new(container_name, static_ports);
+            let mut detector = PortForwardDetector::new();
             let result = tokio::time::timeout(timeout, detector.detect()).await;
 
             let forwards = result.unwrap_or_default();
@@ -413,7 +406,7 @@ impl App {
 
     /// Check image architectures for running pods (spawned when new pods appear)
     pub(super) fn spawn_image_arch_check(&self) {
-        if !matches!(self.cluster_status, ClusterStatus::Running) {
+        if !self.cluster_is_running() {
             return;
         }
 
@@ -422,8 +415,7 @@ impl App {
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let socket_path = crate::cluster::PlatformInfo::find_docker_socket_sync();
-                let docker = DockerManager::new(socket_path)
+                let docker = DockerManager::from_default_socket()
                     .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
                 Ok::<_, anyhow::Error>(docker.get_pod_image_architectures().await)
             })
@@ -437,19 +429,5 @@ impl App {
                 }
             }
         });
-    }
-
-    /// Get static port mappings from config
-    pub(super) fn get_static_ports(&self) -> Vec<(u16, u16)> {
-        let mut ports = vec![
-            (self.cluster_config.http_port, self.cluster_config.http_port),
-            (
-                self.cluster_config.https_port,
-                self.cluster_config.https_port,
-            ),
-            (self.cluster_config.api_port, self.cluster_config.api_port),
-        ];
-        ports.extend(self.cluster_config.additional_ports.clone());
-        ports
     }
 }

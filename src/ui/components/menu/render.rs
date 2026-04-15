@@ -126,13 +126,13 @@ impl Menu {
         };
 
         let border_type = if focused {
-            BorderType::Double
+            BorderType::Thick
         } else {
             BorderType::Rounded
         };
 
         let title = if focused {
-            " ● Commands "
+            " ▶ Commands ◀ "
         } else {
             "   Commands "
         };

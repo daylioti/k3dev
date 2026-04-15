@@ -499,7 +499,6 @@ impl App {
                 cpu_limit_millicores: s.cpu_limit_millicores,
                 memory_used_mb: s.memory_used_mb,
                 memory_limit_mb: s.memory_limit_mb,
-                status: s.status.clone(),
                 arch_mismatch: self.is_arch_mismatch(&s.namespace, &s.name),
             });
         }
@@ -545,7 +544,7 @@ impl App {
                     .map(|c| {
                         // Look up progress from cache
                         let progress = self.pull_progress_cache.get(&c.image);
-                        let mut info = ContainerPullInfo::new(&c.name, &c.image);
+                        let mut info = ContainerPullInfo::new();
                         if let Some(p) = progress {
                             if p.tracking_available {
                                 info = info.with_progress(p.downloaded_bytes, p.total_bytes);
@@ -580,7 +579,6 @@ impl App {
                 cpu_limit_millicores: 0.0,
                 memory_used_mb: 0.0,
                 memory_limit_mb: 0.0,
-                status: "Pending".to_string(),
                 arch_mismatch: false, // Pending pods don't have image arch info yet
             });
         }

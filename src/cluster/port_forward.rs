@@ -9,23 +9,24 @@ use crate::ui::components::ActivePortForward;
 
 /// Detector for active port forwards to Kubernetes cluster
 pub struct PortForwardDetector {
-    #[allow(dead_code)]
-    container_name: String,
-    #[allow(dead_code)]
-    static_ports: Vec<(u16, u16)>,
     kube_ops: KubeOps,
 }
 
 impl PortForwardDetector {
-    /// Create a new port forward detector
-    pub fn new(container_name: String, static_ports: Vec<(u16, u16)>) -> Self {
+    pub fn new() -> Self {
         Self {
-            container_name,
-            static_ports,
             kube_ops: KubeOps::new(),
         }
     }
+}
 
+impl Default for PortForwardDetector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PortForwardDetector {
     /// Detect all active port forwards
     pub async fn detect(&mut self) -> Vec<ActivePortForward> {
         let mut forwards = Vec::new();

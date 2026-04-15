@@ -40,12 +40,8 @@ const MILLICORES_PER_CORE: f64 = 1000.0;
 const CPU_PERCENT_TO_MILLICORES: f64 = 10.0;
 
 /// Pull progress for a single container within a pod
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ContainerPullInfo {
-    #[allow(dead_code)]
-    pub container_name: String,
-    #[allow(dead_code)]
-    pub image: String,
     /// Progress percentage (0-100), None if unknown
     pub progress_percent: Option<f64>,
     /// Total bytes to download
@@ -61,17 +57,8 @@ pub struct ContainerPullInfo {
 }
 
 impl ContainerPullInfo {
-    pub fn new(container_name: &str, image: &str) -> Self {
-        Self {
-            container_name: container_name.to_string(),
-            image: image.to_string(),
-            progress_percent: None,
-            total_bytes: 0,
-            downloaded_bytes: 0,
-            phase: PullPhase::Downloading,
-            layers_done: 0,
-            layers_total: 0,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn with_progress(mut self, downloaded: u64, total: u64) -> Self {
@@ -115,8 +102,6 @@ pub struct PodStat {
     pub cpu_limit_millicores: f64,
     pub memory_used_mb: f64,
     pub memory_limit_mb: f64,
-    #[allow(dead_code)]
-    pub status: String,
     /// True if the pod's image architecture doesn't match the host
     pub arch_mismatch: bool,
 }
@@ -159,9 +144,6 @@ pub struct PodStats {
     scroll_offset: usize,
     selected_index: usize,
     styles: Styles,
-    /// Animation tick (currently unused, kept for API compat)
-    #[allow(dead_code)]
-    animation_tick: u8,
     /// Pod names that should be highlighted (e.g., targets of selected menu command)
     highlighted_pods: HashSet<String>,
 }
@@ -177,22 +159,8 @@ impl PodStats {
             scroll_offset: 0,
             selected_index: 0,
             styles: Styles::from_theme(theme),
-            animation_tick: 0,
             highlighted_pods: HashSet::new(),
         }
-    }
-
-    /// Advance the animation tick
-    pub fn tick_animation(&mut self) {
-        self.animation_tick = (self.animation_tick + 1) % 8;
-    }
-
-    /// Check if any pods are in a pulling/waiting state (need animation)
-    #[allow(dead_code)]
-    pub fn has_pending_pods(&self) -> bool {
-        self.pods
-            .iter()
-            .any(|p| matches!(p.state, PodState::Pulling { .. } | PodState::Waiting { .. }))
     }
 
     pub fn set_pods(&mut self, pods: Vec<PodStat>) {
@@ -313,12 +281,16 @@ impl PodStats {
         };
 
         let border_type = if focused {
-            BorderType::Double
+            BorderType::Thick
         } else {
             BorderType::Rounded
         };
 
-        let title = if focused { " ● Pods " } else { "   Pods " };
+        let title = if focused {
+            " ▶ Pods ◀ "
+        } else {
+            "   Pods "
+        };
 
         let title_style = if focused {
             self.styles.title.add_modifier(Modifier::BOLD)
@@ -991,27 +963,6 @@ fn format_elapsed(duration: chrono::Duration) -> String {
     } else {
         format!("{}h", secs / 3600)
     }
-}
-
-/// Extract a short image name from a full image reference
-/// e.g., "docker.io/library/nginx:1.21" -> "nginx:1.21"
-#[allow(dead_code)]
-fn extract_short_image(image: &str) -> String {
-    // Remove registry prefix (everything before the last '/')
-    let short = image.rsplit('/').next().unwrap_or(image);
-
-    // If still too long, truncate the tag
-    if short.len() > 20 {
-        if let Some(colon_pos) = short.find(':') {
-            let name = &short[..colon_pos];
-            let tag = &short[colon_pos + 1..];
-            if tag.len() > 8 {
-                return format!("{}:{}...", name, &tag[..5]);
-            }
-        }
-    }
-
-    short.to_string()
 }
 
 #[cfg(test)]

@@ -170,35 +170,6 @@ impl App {
             return;
         }
 
-        // Handle pod context menu mode (modal)
-        if self.mode == AppMode::PodContextMenu {
-            match code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.mode = AppMode::Normal;
-                    self.pod_context_menu.reset();
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.pod_context_menu.move_up();
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.pod_context_menu.move_down();
-                }
-                KeyCode::Enter => {
-                    if let Some(action) = self.pod_context_menu.selected_action() {
-                        self.execute_pod_context_action(action);
-                    }
-                }
-                KeyCode::Char(c) => {
-                    // Try shortcut keys
-                    if let Some(action) = self.pod_context_menu.select_by_shortcut(c) {
-                        self.execute_pod_context_action(action);
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-
         // Handle diagnostics overlay mode (modal)
         if self.mode == AppMode::Diagnostics {
             match code {
@@ -681,25 +652,11 @@ impl App {
                 }
             }
             FocusArea::PodStats => {
-                // Show pod context menu if a pod is selected
-                if let Some(pod) = self.pod_stats.selected_pod() {
-                    self.pod_context_menu
-                        .set_pod(pod.name.clone(), pod.namespace.clone());
-                    self.mode = AppMode::PodContextMenu;
-                }
+                // Ensure the detail panel is open for the selected pod.
+                // Tab switching is handled by l/d/t/v/e and Left/Right keys.
+                self.ensure_detail_panel_synced();
             }
         }
-    }
-
-    /// Execute a pod context menu action
-    fn execute_pod_context_action(&mut self, action: crate::ui::components::PodAction) {
-        let pod_name = self.pod_context_menu.pod_name().to_string();
-        let namespace = self.pod_context_menu.pod_namespace().to_string();
-
-        self.mode = AppMode::Normal;
-        self.pod_context_menu.reset();
-
-        self.execute_pod_action(action, &pod_name, &namespace);
     }
 
     /// If detail panel is open and pod selection changed, reload content

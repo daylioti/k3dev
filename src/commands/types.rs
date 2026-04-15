@@ -35,29 +35,7 @@ pub enum PaletteCommandId {
     Custom(String),
 }
 
-#[allow(dead_code)]
 impl PaletteCommandId {
-    /// Convert a string ID to a PaletteCommandId
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "cluster:start" => Some(Self::ClusterStart),
-            "cluster:stop" => Some(Self::ClusterStop),
-            "cluster:restart" => Some(Self::ClusterRestart),
-            "cluster:destroy" => Some(Self::ClusterDestroy),
-            "cluster:info" => Some(Self::ClusterInfo),
-            "cluster:delete-snapshots" => Some(Self::ClusterDeleteSnapshots),
-            "cluster:diagnostics" => Some(Self::ClusterDiagnostics),
-            "cluster:preflight-check" => Some(Self::ClusterPreflightCheck),
-            "app:refresh" => Some(Self::AppRefresh),
-            "app:update-hosts" => Some(Self::AppUpdateHosts),
-            "app:help" => Some(Self::AppHelp),
-            "app:quit" => Some(Self::AppQuit),
-            "nav:focus-menu" => Some(Self::NavFocusMenu),
-            "nav:focus-actions" => Some(Self::NavFocusActions),
-            _ => None,
-        }
-    }
-
     /// Convert to a string representation
     pub fn as_str(&self) -> &str {
         match self {
@@ -77,11 +55,6 @@ impl PaletteCommandId {
             Self::NavFocusActions => "nav:focus-actions",
             Self::Custom(path) => path.as_str(),
         }
-    }
-
-    /// Check if this is a custom command
-    pub fn is_custom(&self) -> bool {
-        matches!(self, Self::Custom(_))
     }
 
     /// Get the custom command path if this is a custom command
@@ -106,68 +79,11 @@ impl PaletteCommandId {
             _ => None,
         }
     }
-
-    /// Check if this is a cluster command
-    pub fn is_cluster_command(&self) -> bool {
-        matches!(
-            self,
-            Self::ClusterStart
-                | Self::ClusterStop
-                | Self::ClusterRestart
-                | Self::ClusterDestroy
-                | Self::ClusterInfo
-                | Self::ClusterDeleteSnapshots
-                | Self::ClusterDiagnostics
-                | Self::ClusterPreflightCheck
-        )
-    }
-
-    /// Check if this is an app command
-    pub fn is_app_command(&self) -> bool {
-        matches!(
-            self,
-            Self::AppRefresh | Self::AppUpdateHosts | Self::AppHelp | Self::AppQuit
-        )
-    }
-
-    /// Check if this is a navigation command
-    pub fn is_nav_command(&self) -> bool {
-        matches!(self, Self::NavFocusMenu | Self::NavFocusActions)
-    }
-
-    /// Get all built-in command IDs (excludes Custom commands)
-    pub fn all() -> &'static [PaletteCommandId] {
-        &[
-            Self::ClusterStart,
-            Self::ClusterStop,
-            Self::ClusterRestart,
-            Self::ClusterDestroy,
-            Self::ClusterInfo,
-            Self::ClusterDeleteSnapshots,
-            Self::ClusterDiagnostics,
-            Self::ClusterPreflightCheck,
-            Self::AppRefresh,
-            Self::AppUpdateHosts,
-            Self::AppHelp,
-            Self::AppQuit,
-            Self::NavFocusMenu,
-            Self::NavFocusActions,
-        ]
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse() {
-        assert_eq!(
-            PaletteCommandId::parse("cluster:start"),
-            Some(PaletteCommandId::ClusterStart)
-        );
-        assert_eq!(PaletteCommandId::parse("unknown"), None);
-    }
 
     #[test]
     fn test_as_str() {
