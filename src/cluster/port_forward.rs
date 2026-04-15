@@ -27,7 +27,6 @@ impl Default for PortForwardDetector {
 }
 
 impl PortForwardDetector {
-
     /// Detect all active port forwards
     pub async fn detect(&mut self) -> Vec<ActivePortForward> {
         let mut forwards = Vec::new();

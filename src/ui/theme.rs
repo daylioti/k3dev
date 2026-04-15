@@ -23,7 +23,6 @@ impl Theme {
             Theme::Nord => ColorPalette::nord(),
         }
     }
-
 }
 
 /// Color palette for theming

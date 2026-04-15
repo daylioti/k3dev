@@ -23,9 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use bollard::Docker;
 
-use crate::cluster::{
-    ClusterConfig, ClusterStatus, ContainerPullProgress, ContainerStats,
-};
+use crate::cluster::{ClusterConfig, ClusterStatus, ContainerPullProgress, ContainerStats};
 use crate::config::{
     Config, ConfigLoader, ConfigValidator, RefreshConfig, RefreshScheduler, RefreshTask,
 };

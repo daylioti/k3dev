@@ -232,10 +232,7 @@ impl ActionBar {
 
         // Focus stripe on the left when this panel is active
         if focused {
-            spans.push(Span::styled(
-                "▌ ",
-                self.styles.border_focused,
-            ));
+            spans.push(Span::styled("▌ ", self.styles.border_focused));
         } else {
             spans.push(Span::raw("  "));
         }

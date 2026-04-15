@@ -128,11 +128,7 @@ impl ConfigLoader {
         }
     }
 
-    fn resolve_target(
-        &self,
-        target: &mut ExecutionTarget,
-        placeholders: &HashMap<String, String>,
-    ) {
+    fn resolve_target(&self, target: &mut ExecutionTarget, placeholders: &HashMap<String, String>) {
         match target {
             ExecutionTarget::Host => {}
             ExecutionTarget::Docker { container } => {

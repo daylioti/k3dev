@@ -151,7 +151,6 @@ impl KeybindingResolver {
     pub fn get_binding_display(&self, action: &KeyAction) -> Option<&str> {
         self.binding_display.get(action).map(|s| s.as_str())
     }
-
 }
 
 impl Default for KeybindingResolver {

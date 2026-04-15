@@ -189,7 +189,11 @@ fn build_test_list() -> Vec<DiagnosticResult> {
         ("docker_accessible", CAT_PREREQUISITES, "Docker accessible"),
         ("kubectl_installed", CAT_PREREQUISITES, "kubectl installed"),
         ("apparmor_check", CAT_PREREQUISITES, "AppArmor profile"),
-        ("br_netfilter_loaded", CAT_PREREQUISITES, "br_netfilter module"),
+        (
+            "br_netfilter_loaded",
+            CAT_PREREQUISITES,
+            "br_netfilter module",
+        ),
         // Cluster
         ("container_running", CAT_CLUSTER, "K3s container running"),
         ("k8s_api_reachable", CAT_CLUSTER, "K8s API reachable"),
@@ -198,18 +202,38 @@ fn build_test_list() -> Vec<DiagnosticResult> {
         ("arch_mismatch", CAT_CLUSTER, "Architecture match"),
         // Core Services
         ("coredns_running", CAT_CORE_SERVICES, "CoreDNS running"),
-        ("traefik_service", CAT_CORE_SERVICES, "Traefik service exists"),
+        (
+            "traefik_service",
+            CAT_CORE_SERVICES,
+            "Traefik service exists",
+        ),
         (
             "local_path_provisioner",
             CAT_CORE_SERVICES,
             "local-path-provisioner running",
         ),
-        ("flannel_running", CAT_CORE_SERVICES, "Flannel CNI configured"),
+        (
+            "flannel_running",
+            CAT_CORE_SERVICES,
+            "Flannel CNI configured",
+        ),
         // Networking
-        ("host_ports_reachable", CAT_NETWORKING, "Host ports reachable"),
-        ("ingress_configured", CAT_NETWORKING, "Ingress routes configured"),
+        (
+            "host_ports_reachable",
+            CAT_NETWORKING,
+            "Host ports reachable",
+        ),
+        (
+            "ingress_configured",
+            CAT_NETWORKING,
+            "Ingress routes configured",
+        ),
         ("hosts_uptodate", CAT_NETWORKING, "/etc/hosts up-to-date"),
-        ("ingress_healthy", CAT_NETWORKING, "Ingress endpoints healthy"),
+        (
+            "ingress_healthy",
+            CAT_NETWORKING,
+            "Ingress endpoints healthy",
+        ),
         ("tls_cert_valid", CAT_NETWORKING, "TLS certificate valid"),
         // Pods
         ("no_stuck_pods", CAT_PODS, "No stuck pods"),
@@ -225,7 +249,11 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             "Pod-to-Service connectivity",
         ),
         ("deep_volume", CAT_DEEP_VERIFICATION, "Volume write/read"),
-        ("deep_host_http", CAT_DEEP_VERIFICATION, "Host HTTP to Traefik"),
+        (
+            "deep_host_http",
+            CAT_DEEP_VERIFICATION,
+            "Host HTTP to Traefik",
+        ),
         (
             "deep_docker_in_container",
             CAT_DEEP_VERIFICATION,
@@ -236,7 +264,11 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             CAT_DEEP_VERIFICATION,
             "Container runtime socket",
         ),
-        ("deep_cleanup", CAT_DEEP_VERIFICATION, "Cleanup test resources"),
+        (
+            "deep_cleanup",
+            CAT_DEEP_VERIFICATION,
+            "Cleanup test resources",
+        ),
     ];
     specs
         .iter()
@@ -330,11 +362,23 @@ const CAT_PREFLIGHT_CONFIG: &str = "Configuration";
 fn build_preflight_list(config: &ClusterConfig) -> Vec<DiagnosticResult> {
     let fixed: &[(&'static str, &'static str, &'static str)] = &[
         // System
-        ("pre_docker_accessible", CAT_PREFLIGHT_SYSTEM, "Docker accessible"),
-        ("pre_kubectl_installed", CAT_PREFLIGHT_SYSTEM, "kubectl installed"),
+        (
+            "pre_docker_accessible",
+            CAT_PREFLIGHT_SYSTEM,
+            "Docker accessible",
+        ),
+        (
+            "pre_kubectl_installed",
+            CAT_PREFLIGHT_SYSTEM,
+            "kubectl installed",
+        ),
         ("pre_arch_check", CAT_PREFLIGHT_SYSTEM, "Architecture"),
         // Docker
-        ("pre_docker_info", CAT_PREFLIGHT_DOCKER, "Docker daemon healthy"),
+        (
+            "pre_docker_info",
+            CAT_PREFLIGHT_DOCKER,
+            "Docker daemon healthy",
+        ),
         ("pre_docker_disk", CAT_PREFLIGHT_DOCKER, "Docker disk space"),
         ("pre_k3s_image", CAT_PREFLIGHT_DOCKER, "K3s image available"),
         (

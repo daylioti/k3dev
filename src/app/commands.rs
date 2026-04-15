@@ -8,9 +8,9 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::cluster::diagnostics::{run_all_diagnostics, run_preflight_checks};
+use crate::cluster::DockerManager;
 use crate::cluster::{ClusterManager, HostsUpdateResult, IngressManager};
 use crate::commands::{CommandContext, PaletteCommandId};
-use crate::cluster::DockerManager;
 use crate::config::{get_exec_placeholders, CommandEntry, ExecutionTarget, RefreshTask};
 use crate::k8s::PodExecutor;
 use crate::ui::components::{ClusterAction, DetailTab};
@@ -371,10 +371,8 @@ impl App {
         let (ctx, output_tx) = CommandContext::new(self.message_tx.clone(), timeout_duration);
 
         tokio::spawn(async move {
-            ctx.execute(move |tx| async move {
-                run_host_command(&command, &workdir, tx).await
-            })
-            .await;
+            ctx.execute(move |tx| async move { run_host_command(&command, &workdir, tx).await })
+                .await;
             drop(output_tx);
         });
     }

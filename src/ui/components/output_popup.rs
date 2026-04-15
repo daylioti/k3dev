@@ -174,7 +174,6 @@ impl OutputPopup {
         .centered();
         frame.render_widget(hint, hint_area);
     }
-
 }
 
 impl Default for OutputPopup {

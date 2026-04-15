@@ -330,5 +330,4 @@ impl K3sManager {
 
         Ok(())
     }
-
 }

@@ -72,28 +72,6 @@ impl Default for RefreshConfig {
     }
 }
 
-impl RefreshConfig {
-    /// Create a RefreshConfig with faster intervals for testing
-    #[cfg(test)]
-    pub fn fast() -> Self {
-        Self {
-            ingress_refresh: Duration::from_millis(100),
-            hosts_check: Duration::from_millis(50),
-            blink_toggle: Duration::from_millis(50),
-            stats_refresh: Duration::from_millis(100),
-            status_check_timeout: Duration::from_secs(1),
-            cluster_operation_timeout: Duration::from_secs(10),
-            ingress_timeout: Duration::from_secs(1),
-            ingress_health_timeout: Duration::from_secs(2),
-            docker_stats_timeout: Duration::from_secs(1),
-            port_forward_timeout: Duration::from_secs(1),
-            manual_hosts_timeout: Duration::from_secs(5),
-            volume_refresh: Duration::from_millis(100),
-            volume_timeout: Duration::from_secs(1),
-        }
-    }
-}
-
 /// Types of refresh tasks managed by the scheduler
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RefreshTask {
@@ -230,5 +208,4 @@ mod tests {
         let due = scheduler.tick();
         assert!(due.is_empty());
     }
-
 }

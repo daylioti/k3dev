@@ -562,5 +562,4 @@ spec:
 
         Err(anyhow!("Timeout waiting for Traefik"))
     }
-
 }
