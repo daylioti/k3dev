@@ -11,8 +11,11 @@ use crate::cluster::{
     ClusterManager, ClusterStatus, DockerManager, IngressHealthChecker, IngressManager,
     PortForwardDetector,
 };
+use crate::commands::{capture_exec, check_visible, strip_ansi, trim_output};
+use crate::config::{ExecutionTarget, VisibleCheck};
 use crate::k8s::K8sClient;
 
+use super::messages::{InfoBlockResult, InfoBlockStatus};
 use super::{App, AppMessage};
 
 /// Maximum concurrent manifest fetches across all pull monitors
@@ -428,6 +431,139 @@ impl App {
                         .await;
                 }
             }
+        });
+    }
+
+    /// Check each configured info block; spawn a refresh task if its interval has elapsed.
+    pub(super) fn info_block_tick(&mut self) {
+        let now = std::time::Instant::now();
+        let len = self.info_blocks.len();
+        for i in 0..len {
+            let rt = &self.info_blocks[i];
+            if rt.in_flight {
+                continue;
+            }
+            if now.duration_since(rt.last_run) < rt.cfg.interval {
+                continue;
+            }
+
+            let target_needs_cluster =
+                matches!(rt.cfg.exec.target, ExecutionTarget::Kubernetes { .. });
+            if target_needs_cluster && !matches!(self.cluster_status, ClusterStatus::Running) {
+                // Cluster is not running; emit a Skipped result so the row renders
+                // a placeholder, and back off until the next interval.
+                self.info_blocks[i].last_run = now;
+                let tx = self.message_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(AppMessage::InfoBlockUpdated {
+                            index: i,
+                            result: InfoBlockResult {
+                                output: String::new(),
+                                status: InfoBlockStatus::Skipped,
+                            },
+                        })
+                        .await;
+                });
+                continue;
+            }
+
+            self.info_blocks[i].in_flight = true;
+            self.info_blocks[i].last_run = now;
+            self.spawn_info_block(i);
+        }
+    }
+
+    /// Fire any visibility probes whose interval has elapsed.
+    pub(super) fn visibility_tick(&mut self) {
+        let now = std::time::Instant::now();
+        let len = self.visibility_tasks.len();
+        for i in 0..len {
+            let task = &self.visibility_tasks[i];
+            if task.in_flight {
+                continue;
+            }
+            if now.duration_since(task.last_run) < task.interval {
+                continue;
+            }
+            self.visibility_tasks[i].in_flight = true;
+            self.visibility_tasks[i].last_run = now;
+            self.spawn_visibility_check(i);
+        }
+    }
+
+    fn spawn_visibility_check(&self, id: usize) {
+        let task = &self.visibility_tasks[id];
+        let check = task.check.clone();
+        let interval = task.interval;
+        // Keep the probe bounded well inside the interval so a slow check
+        // doesn't stall the next tick. Clamp to a sane [1s, 30s] window.
+        let timeout = interval
+            .saturating_sub(std::time::Duration::from_millis(250))
+            .max(std::time::Duration::from_secs(1))
+            .min(std::time::Duration::from_secs(30));
+
+        let k8s_client = self.k8s_client.clone();
+        let message_tx = self.message_tx.clone();
+
+        tokio::spawn(async move {
+            // Build a DockerManager on-demand for checks that need it (mirrors
+            // how info-block exec probes handle Docker access).
+            let docker = match &check {
+                VisibleCheck::Container { .. } => DockerManager::from_default_socket().ok(),
+                VisibleCheck::Exec(cfg) if matches!(cfg.target, ExecutionTarget::Docker { .. }) => {
+                    DockerManager::from_default_socket().ok()
+                }
+                _ => None,
+            };
+            let (visible, error) =
+                match check_visible(&check, k8s_client.as_ref(), docker.as_ref(), timeout).await {
+                    Ok(v) => (v, None),
+                    Err(e) => (false, Some(e.to_string())),
+                };
+            let _ = message_tx
+                .send(AppMessage::VisibilityUpdated { id, visible, error })
+                .await;
+        });
+    }
+
+    fn spawn_info_block(&self, index: usize) {
+        let rt = &self.info_blocks[index];
+        let exec = rt.cfg.exec.clone();
+        let interval = rt.cfg.interval;
+        let max_lines = rt.cfg.max_lines;
+        let max_length = rt.cfg.max_length;
+        // Cap per-run timeout so a slow script can't block the next interval indefinitely.
+        let timeout = interval
+            .saturating_sub(std::time::Duration::from_millis(250))
+            .max(std::time::Duration::from_secs(2))
+            .min(std::time::Duration::from_secs(60));
+        let k8s_client = self.k8s_client.clone();
+        let message_tx = self.message_tx.clone();
+
+        tokio::spawn(async move {
+            let docker = match &exec.target {
+                ExecutionTarget::Docker { .. } => DockerManager::from_default_socket().ok(),
+                _ => None,
+            };
+            let result =
+                match capture_exec(&exec, k8s_client.as_ref(), docker.as_ref(), timeout).await {
+                    Ok(raw) => {
+                        let cleaned = strip_ansi(&raw);
+                        let trimmed = trim_output(&cleaned, max_lines, max_length);
+                        InfoBlockResult {
+                            output: trimmed,
+                            status: InfoBlockStatus::Ok,
+                        }
+                    }
+                    Err(e) => InfoBlockResult {
+                        output: String::new(),
+                        status: InfoBlockStatus::Error(e.to_string()),
+                    },
+                };
+            let _ = message_tx
+                .send(AppMessage::InfoBlockUpdated { index, result })
+                .await;
         });
     }
 }

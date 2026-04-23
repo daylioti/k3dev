@@ -7,6 +7,7 @@ mod render;
 
 use std::collections::{HashMap, HashSet};
 
+use crate::app::{InfoBlockResult, InfoBlockStatus};
 use crate::cluster::{IngressEntry, IngressHealthStatus};
 use crate::config::{CommandEntry, CommandGroup, Config};
 use crate::ui::styles::Styles;
@@ -32,6 +33,17 @@ pub struct ActivePortForward {
     pub local_port: u16,
     pub remote_port: u16,
     pub target: String, // e.g., "pod/my-pod", "svc/my-service"
+}
+
+/// Display row for a sidebar info block.
+#[derive(Debug, Clone)]
+pub struct InfoBlockView {
+    pub name: String,
+    pub icon: String,
+    pub output: String,
+    pub status: InfoBlockStatus,
+    /// Whether this block is currently hidden by a `visible` gate.
+    pub hidden: bool,
 }
 
 /// Hierarchical command menu component
@@ -62,6 +74,10 @@ pub struct Menu {
     pub(super) ingress_selected: bool,
     pub(super) selected_ingress_entry: usize, // Index into ingress_entries
     pub(super) selected_ingress_path: usize,  // Index into paths within the entry
+    // Sidebar info blocks (user-configured script outputs)
+    pub(super) info_blocks: Vec<InfoBlockView>,
+    // Command entry paths currently hidden by `visible` gates.
+    pub(super) hidden_command_paths: HashSet<Vec<usize>>,
 }
 
 impl Menu {
@@ -90,6 +106,8 @@ impl Menu {
             ingress_selected: false,
             selected_ingress_entry: 0,
             selected_ingress_path: 0,
+            info_blocks: Vec::new(),
+            hidden_command_paths: HashSet::new(),
         }
     }
 
@@ -123,6 +141,34 @@ impl Menu {
     /// Update active port forwards (from kubectl port-forward, etc.)
     pub fn set_active_port_forwards(&mut self, forwards: Vec<ActivePortForward>) {
         self.active_port_forwards = forwards;
+    }
+
+    /// Seed the info blocks with initial placeholder rows so headers render
+    /// before the first refresh completes.
+    pub fn set_info_blocks(&mut self, blocks: Vec<InfoBlockView>) {
+        self.info_blocks = blocks;
+    }
+
+    /// Update a single info block's cached output + status.
+    pub fn update_info_block(&mut self, index: usize, result: InfoBlockResult) {
+        if let Some(view) = self.info_blocks.get_mut(index) {
+            view.output = result.output;
+            view.status = result.status;
+        }
+    }
+
+    /// Mark a single info block as hidden or visible.
+    pub fn set_info_block_hidden(&mut self, index: usize, hidden: bool) {
+        if let Some(view) = self.info_blocks.get_mut(index) {
+            view.hidden = hidden;
+        }
+    }
+
+    /// Replace the set of command paths hidden by `visible` gates and rebuild
+    /// the flat item list so the sidebar reflects the new filter immediately.
+    pub fn set_hidden_command_paths(&mut self, hidden: HashSet<Vec<usize>>) {
+        self.hidden_command_paths = hidden;
+        self.rebuild_flat_items();
     }
 
     // === Getters ===
@@ -347,6 +393,12 @@ impl Menu {
         for (idx, entry) in entries.into_iter().enumerate() {
             let mut path = parent_path.clone();
             path.push(idx);
+
+            // Skip entries gated by a `visible` probe that hasn't passed.
+            // Descendants are skipped implicitly by not recursing.
+            if self.hidden_command_paths.contains(&path) {
+                continue;
+            }
 
             let has_children = !entry.commands.is_empty();
             let is_expanded = has_children; // Nested items always expanded for simplicity

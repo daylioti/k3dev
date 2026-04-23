@@ -46,6 +46,7 @@ enum CliCommand {
     /// Restart the cluster
     Restart,
     /// Destroy the cluster
+    #[command(alias = "delete")]
     Destroy,
     /// Show cluster info
     Info,

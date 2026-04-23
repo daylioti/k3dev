@@ -139,6 +139,21 @@ impl PodExecutor {
         let cmd_parts = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
         self.exec(namespace, pod_name, container, cmd_parts).await
     }
+
+    /// Run a command and return whether it exited 0. Used by visibility
+    /// probes — stdout/stderr are discarded.
+    pub async fn exec_status(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        container: Option<&str>,
+        command: &str,
+    ) -> Result<bool> {
+        let result = self
+            .exec_simple(namespace, pod_name, container, command)
+            .await?;
+        Ok(result.exit_code == 0)
+    }
 }
 
 fn pod_to_info(pod: &Pod) -> PodInfo {

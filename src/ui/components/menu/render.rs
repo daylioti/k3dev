@@ -13,6 +13,7 @@ use ratatui::{
 };
 
 use super::Menu;
+use crate::app::InfoBlockStatus;
 use crate::cluster::IngressHealthStatus;
 
 impl Menu {
@@ -229,10 +230,29 @@ impl Menu {
             count
         };
 
-        // Available height for commands (leave room for breadcrumb, ingress and ports at bottom)
+        // Calculate how many lines the info blocks section will take
+        let visible_block_count = self.info_blocks.iter().filter(|b| !b.hidden).count();
+        let info_blocks_lines = if visible_block_count == 0 {
+            0
+        } else {
+            // Separator on top + per-block: header (1) + body (at least 1 line).
+            let body: usize = self
+                .info_blocks
+                .iter()
+                .filter(|b| !b.hidden)
+                .map(|b| {
+                    let body_lines = b.output.lines().count();
+                    1 + body_lines.max(1)
+                })
+                .sum();
+            1 + body
+        };
+
+        // Available height for commands (leave room for breadcrumb, ingress, ports, info blocks)
         let commands_height = visible_height
             .saturating_sub(ingress_lines)
             .saturating_sub(ports_lines)
+            .saturating_sub(info_blocks_lines)
             .saturating_sub(1);
 
         // Build command lines
@@ -295,6 +315,9 @@ impl Menu {
 
         // Render forwarded ports section
         self.render_ports_section(&mut lines, &inner);
+
+        // Render info blocks section
+        self.render_info_blocks_section(&mut lines, &inner);
 
         // Render missing hosts help message
         self.render_missing_hosts_help(&mut lines, visible_height);
@@ -449,6 +472,50 @@ impl Menu {
                     port_text,
                     self.styles.success_text,
                 )));
+            }
+        }
+    }
+
+    /// Render user-configured info blocks below the ports section.
+    fn render_info_blocks_section(&self, lines: &mut Vec<Line>, inner: &Rect) {
+        if self.info_blocks.iter().all(|b| b.hidden) {
+            return;
+        }
+
+        lines.push(Line::from(Span::styled(
+            "─".repeat(inner.width as usize),
+            self.styles.muted_text,
+        )));
+
+        for block in self.info_blocks.iter().filter(|b| !b.hidden) {
+            let header_text = if block.icon.is_empty() {
+                block.name.clone()
+            } else {
+                format!("{} {}", block.icon, block.name)
+            };
+            lines.push(Line::from(Span::styled(
+                header_text,
+                self.styles.group_header,
+            )));
+
+            match &block.status {
+                InfoBlockStatus::Error(err) => {
+                    let msg = format!("  ⚠ {}", err);
+                    lines.push(Line::from(Span::styled(msg, self.styles.error_text)));
+                }
+                InfoBlockStatus::Skipped | InfoBlockStatus::Ok
+                    if block.output.trim().is_empty() =>
+                {
+                    lines.push(Line::from(Span::styled("  —", self.styles.muted_text)));
+                }
+                _ => {
+                    for line in block.output.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", line),
+                            self.styles.normal_text,
+                        )));
+                    }
+                }
             }
         }
     }

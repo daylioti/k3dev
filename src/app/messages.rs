@@ -98,6 +98,34 @@ pub enum AppMessage {
 
     /// Error message
     Error(String),
+
+    /// Info block output refreshed
+    InfoBlockUpdated {
+        index: usize,
+        result: InfoBlockResult,
+    },
+
+    /// A visibility probe finished — the target entry's shown-state may have flipped.
+    VisibilityUpdated {
+        id: usize,
+        visible: bool,
+        error: Option<String>,
+    },
+}
+
+/// Status of an info block after a refresh attempt.
+#[derive(Debug, Clone)]
+pub enum InfoBlockStatus {
+    Ok,
+    Error(String),
+    Skipped,
+}
+
+/// Result of executing an info block's script.
+#[derive(Debug, Clone)]
+pub struct InfoBlockResult {
+    pub output: String,
+    pub status: InfoBlockStatus,
 }
 
 impl App {
@@ -455,6 +483,19 @@ impl App {
             AppMessage::Error(msg) => {
                 tracing::error!("{}", msg);
                 self.output.add_error(&msg);
+            }
+            AppMessage::InfoBlockUpdated { index, result } => {
+                if let Some(rt) = self.info_blocks.get_mut(index) {
+                    rt.in_flight = false;
+                    rt.last_output = result.output.clone();
+                }
+                self.menu.update_info_block(index, result);
+            }
+            AppMessage::VisibilityUpdated { id, visible, error } => {
+                if let Some(err) = error {
+                    tracing::debug!(id = id, "visibility probe error: {}", err);
+                }
+                self.apply_visibility_update(id, visible);
             }
         }
     }

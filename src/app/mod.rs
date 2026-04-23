@@ -5,7 +5,7 @@
 
 mod commands;
 mod events;
-mod messages;
+pub(crate) mod messages;
 mod refresh;
 
 use anyhow::Result;
@@ -17,7 +17,7 @@ use ratatui::{
 };
 use std::io::Stdout;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -25,7 +25,8 @@ use bollard::Docker;
 
 use crate::cluster::{ClusterConfig, ClusterStatus, ContainerPullProgress, ContainerStats};
 use crate::config::{
-    Config, ConfigLoader, ConfigValidator, RefreshConfig, RefreshScheduler, RefreshTask,
+    Config, ConfigLoader, ConfigValidator, InfoBlock, RefreshConfig, RefreshScheduler, RefreshTask,
+    VisibleCheck,
 };
 use crate::k8s::PendingPodInfo;
 use crate::k8s::{K8sClient, ShellSessionHandle};
@@ -38,7 +39,34 @@ use crate::ui::components::{
 use crate::ui::{AppLayout, Styles};
 use std::collections::{HashMap, HashSet};
 
-pub use messages::AppMessage;
+pub use messages::{AppMessage, InfoBlockResult, InfoBlockStatus};
+
+/// Per-block runtime state for scheduling info block refreshes.
+pub(super) struct InfoBlockRuntime {
+    pub(super) cfg: InfoBlock,
+    pub(super) last_run: Instant,
+    pub(super) in_flight: bool,
+    pub(super) last_output: String,
+}
+
+/// Which UI entry a visibility task drives.
+#[derive(Debug, Clone)]
+pub(super) enum VisibilityTarget {
+    /// Path into `config.commands`: `[group_idx, entry_idx, (sub_idx, ...)]`.
+    Command { path: Vec<usize> },
+    /// Index into `config.info_blocks`.
+    InfoBlock { index: usize },
+}
+
+/// Runtime state for a single visibility probe.
+pub(super) struct VisibilityTask {
+    pub(super) check: VisibleCheck,
+    pub(super) interval: Duration,
+    pub(super) last_run: Instant,
+    pub(super) in_flight: bool,
+    pub(super) visible: bool,
+    pub(super) target: VisibilityTarget,
+}
 
 /// Focus area in the UI
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -151,6 +179,16 @@ pub struct App {
 
     // Whether auto-preflight has been triggered for stopped screen
     preflight_auto_triggered: bool,
+
+    // Runtime state for user-configured sidebar info blocks
+    pub(super) info_blocks: Vec<InfoBlockRuntime>,
+
+    // Runtime state for `visible` probes attached to commands / info blocks.
+    pub(super) visibility_tasks: Vec<VisibilityTask>,
+    // Command paths currently hidden (mirror of `!task.visible`).
+    pub(super) hidden_command_paths: HashSet<Vec<usize>>,
+    // Info-block indices currently hidden.
+    pub(super) hidden_info_blocks: HashSet<usize>,
 }
 
 impl App {
@@ -195,6 +233,71 @@ impl App {
         let mut menu = Menu::with_theme(theme);
         menu.build_from_config(&config);
 
+        // Seed info block runtime + placeholder views so headers render before
+        // the first refresh completes.
+        let now = Instant::now();
+        let info_blocks: Vec<InfoBlockRuntime> = config
+            .info_blocks
+            .iter()
+            .map(|cfg| InfoBlockRuntime {
+                cfg: cfg.clone(),
+                // Make the first tick fire immediately by back-dating `last_run`.
+                last_run: now.checked_sub(cfg.interval).unwrap_or(now),
+                in_flight: false,
+                last_output: String::new(),
+            })
+            .collect();
+        let info_block_views: Vec<crate::ui::components::InfoBlockView> = config
+            .info_blocks
+            .iter()
+            .map(|cfg| crate::ui::components::InfoBlockView {
+                name: cfg.name.clone(),
+                icon: cfg.icon.clone(),
+                output: String::new(),
+                status: InfoBlockStatus::Skipped,
+                hidden: false,
+            })
+            .collect();
+        menu.set_info_blocks(info_block_views);
+
+        // Walk the config for any `visible` gates — every gated entry starts
+        // hidden until its first probe succeeds.
+        let mut visibility_tasks: Vec<VisibilityTask> = Vec::new();
+        let mut hidden_command_paths: HashSet<Vec<usize>> = HashSet::new();
+        let mut hidden_info_blocks: HashSet<usize> = HashSet::new();
+
+        for (group_idx, group) in config.commands.iter().enumerate() {
+            for (entry_idx, entry) in group.commands.iter().enumerate() {
+                let base_path = vec![group_idx, entry_idx];
+                seed_command_visibility(
+                    entry,
+                    base_path,
+                    now,
+                    &mut visibility_tasks,
+                    &mut hidden_command_paths,
+                );
+            }
+        }
+        for (idx, block) in config.info_blocks.iter().enumerate() {
+            if let Some(v) = &block.visible {
+                visibility_tasks.push(VisibilityTask {
+                    check: v.check.clone(),
+                    interval: v.interval,
+                    last_run: now.checked_sub(v.interval).unwrap_or(now),
+                    in_flight: false,
+                    visible: false,
+                    target: VisibilityTarget::InfoBlock { index: idx },
+                });
+                hidden_info_blocks.insert(idx);
+            }
+        }
+
+        // Propagate initial hidden sets to the UI so the first render filters.
+        menu.set_hidden_command_paths(hidden_command_paths.clone());
+        for idx in &hidden_info_blocks {
+            menu.set_info_block_hidden(*idx, true);
+        }
+
         let refresh_config = RefreshConfig::default();
         let scheduler = RefreshScheduler::new(&refresh_config);
         let keybinding_resolver = KeybindingResolver::from_config(config.keybindings.as_ref());
@@ -208,7 +311,7 @@ impl App {
         help_overlay.update_from_resolver(&keybinding_resolver);
 
         let mut command_palette = CommandPalette::with_theme(theme);
-        command_palette.load_custom_commands(&config.commands);
+        command_palette.load_custom_commands(&config.commands, &hidden_command_paths);
 
         let mut action_bar = ActionBar::with_theme(theme);
         let cluster_name = context
@@ -263,7 +366,46 @@ impl App {
             current_layout: None,
             menu_width_offset: 0,
             preflight_auto_triggered: false,
+            info_blocks,
+            visibility_tasks,
+            hidden_command_paths,
+            hidden_info_blocks,
         })
+    }
+
+    /// Merge a fresh probe result into the task list and, if the flag changed,
+    /// reflect it in the UI.
+    pub(super) fn apply_visibility_update(&mut self, id: usize, visible: bool) {
+        let Some(task) = self.visibility_tasks.get_mut(id) else {
+            return;
+        };
+        task.in_flight = false;
+        if task.visible == visible {
+            return;
+        }
+        task.visible = visible;
+
+        match task.target.clone() {
+            VisibilityTarget::Command { path } => {
+                if visible {
+                    self.hidden_command_paths.remove(&path);
+                } else {
+                    self.hidden_command_paths.insert(path);
+                }
+                self.menu
+                    .set_hidden_command_paths(self.hidden_command_paths.clone());
+                self.command_palette
+                    .load_custom_commands(&self.config.commands, &self.hidden_command_paths);
+            }
+            VisibilityTarget::InfoBlock { index } => {
+                if visible {
+                    self.hidden_info_blocks.remove(&index);
+                } else {
+                    self.hidden_info_blocks.insert(index);
+                }
+                self.menu.set_info_block_hidden(index, !visible);
+            }
+        }
     }
 
     /// Run the application event loop
@@ -339,6 +481,12 @@ impl App {
                     }
                 }
             }
+
+            // Process per-block info block schedules
+            self.info_block_tick();
+
+            // Re-evaluate `visible` probes on their own cadence.
+            self.visibility_tick();
 
             // Handle shell area resize
             if self.pod_detail_panel.is_open()
@@ -619,5 +767,33 @@ impl App {
             FocusArea::ActionBar => None,
         };
         self.status_bar.set_selected_item(selected_item);
+    }
+}
+
+/// Recursively walk a `CommandEntry`, pushing a `VisibilityTask` for any
+/// `visible` gate found (on the entry itself and on nested children).
+fn seed_command_visibility(
+    entry: &crate::config::CommandEntry,
+    path: Vec<usize>,
+    now: Instant,
+    tasks: &mut Vec<VisibilityTask>,
+    hidden: &mut HashSet<Vec<usize>>,
+) {
+    if let Some(v) = &entry.visible {
+        tasks.push(VisibilityTask {
+            check: v.check.clone(),
+            interval: v.interval,
+            last_run: now.checked_sub(v.interval).unwrap_or(now),
+            in_flight: false,
+            visible: false,
+            target: VisibilityTarget::Command { path: path.clone() },
+        });
+        hidden.insert(path.clone());
+    }
+
+    for (child_idx, child) in entry.commands.iter().enumerate() {
+        let mut child_path = path.clone();
+        child_path.push(child_idx);
+        seed_command_visibility(child, child_path, now, tasks, hidden);
     }
 }

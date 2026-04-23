@@ -313,6 +313,44 @@ impl DockerManager {
         Ok(result)
     }
 
+    /// Execute a command and return whether it exited 0. Errors propagate only
+    /// when the exec itself couldn't be created/started — a non-zero exit is
+    /// reported as `Ok(false)`.
+    pub async fn exec_status(&self, container: &str, command: &[&str]) -> Result<bool> {
+        let exec = self
+            .client
+            .create_exec(
+                container,
+                CreateExecOptions {
+                    cmd: Some(command.to_vec()),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("Failed to create exec")?;
+
+        let exec_id = exec.id.clone();
+
+        let output = self
+            .client
+            .start_exec(&exec_id, Some(StartExecOptions::default()))
+            .await
+            .context("Failed to start exec")?;
+
+        // Drain the output stream so the exec actually runs to completion;
+        // otherwise bollard may report `exit_code: None`.
+        if let StartExecResults::Attached { mut output, .. } = output {
+            while let Some(msg) = output.next().await {
+                let _ = msg;
+            }
+        }
+
+        let inspect = self.client.inspect_exec(&exec_id).await?;
+        Ok(inspect.exit_code == Some(0))
+    }
+
     /// Copy a file into a container at the specified directory path.
     /// The file will be created with mode 0755 (executable).
     pub async fn copy_to_container(

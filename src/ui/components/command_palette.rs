@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -192,39 +192,63 @@ impl CommandPalette {
         }
     }
 
-    /// Load custom commands from config command groups
-    pub fn load_custom_commands(&mut self, command_groups: &[crate::config::CommandGroup]) {
-        for group in command_groups {
-            self.add_commands_from_group(&group.name, &group.commands);
+    /// Load custom commands from config command groups, skipping any whose
+    /// numeric path is in `hidden`.
+    ///
+    /// Safe to call repeatedly: previously-loaded custom entries are cleared
+    /// before re-registration so that visibility changes take effect without
+    /// leaving stale rows behind.
+    pub fn load_custom_commands(
+        &mut self,
+        command_groups: &[crate::config::CommandGroup],
+        hidden: &HashSet<Vec<usize>>,
+    ) {
+        // Strip any existing custom entries so repeated calls don't duplicate.
+        self.commands
+            .retain(|c| !matches!(c.id, PaletteCommandId::Custom(_)));
+
+        for (group_idx, group) in command_groups.iter().enumerate() {
+            for (entry_idx, entry) in group.commands.iter().enumerate() {
+                let path = vec![group_idx, entry_idx];
+                self.add_command_entry(&group.name, &group.name, entry, path, hidden);
+            }
         }
-        // Update filtered to include new commands
+        // Update filtered to include the refreshed command list
         self.filtered = (0..self.commands.len()).collect();
+        if self.selected_index >= self.filtered.len() {
+            self.selected_index = self.filtered.len().saturating_sub(1);
+        }
     }
 
-    /// Recursively add commands from a group/subgroup
-    fn add_commands_from_group(
+    /// Recursively register one command entry, respecting `visible` hides.
+    fn add_command_entry(
         &mut self,
-        parent_path: &str,
-        entries: &[crate::config::CommandEntry],
+        parent_display_path: &str,
+        category: &str,
+        entry: &crate::config::CommandEntry,
+        path: Vec<usize>,
+        hidden: &HashSet<Vec<usize>>,
     ) {
-        for entry in entries {
-            let path = format!("{}/{}", parent_path, entry.name);
+        if hidden.contains(&path) {
+            return;
+        }
 
-            if entry.exec.is_some() {
-                // This is an executable command
-                self.commands.push(PaletteCommand {
-                    id: PaletteCommandId::Custom(path.clone()),
-                    name: entry.name.clone(),
-                    shortcut: None,
-                    category: CommandCategory::Custom(parent_path.to_string()),
-                    description: entry.description.clone(),
-                });
-            }
+        let display_path = format!("{}/{}", parent_display_path, entry.name);
 
-            // Recursively add nested commands
-            if !entry.commands.is_empty() {
-                self.add_commands_from_group(&path, &entry.commands);
-            }
+        if entry.exec.is_some() {
+            self.commands.push(PaletteCommand {
+                id: PaletteCommandId::Custom(display_path.clone()),
+                name: entry.name.clone(),
+                shortcut: None,
+                category: CommandCategory::Custom(category.to_string()),
+                description: entry.description.clone(),
+            });
+        }
+
+        for (child_idx, child) in entry.commands.iter().enumerate() {
+            let mut child_path = path.clone();
+            child_path.push(child_idx);
+            self.add_command_entry(&display_path, category, child, child_path, hidden);
         }
     }
 

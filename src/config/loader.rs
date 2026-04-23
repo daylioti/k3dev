@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::types::{CommandEntry, CommandGroup, Config, ExecConfig, ExecutionTarget};
+use super::types::{
+    CommandEntry, CommandGroup, Config, ExecConfig, ExecutionTarget, Visible, VisibleCheck,
+};
 
 /// Lazy-compiled regex for matching @placeholder patterns (without capture)
 static PLACEHOLDER_CHECK_REGEX: Lazy<Regex> =
@@ -95,6 +97,36 @@ impl ConfigLoader {
         for group in &mut config.commands {
             self.resolve_command_group(group, &placeholders);
         }
+
+        for block in &mut config.info_blocks {
+            block.name = self.replace_placeholders(&block.name, &placeholders);
+            self.resolve_target(&mut block.exec.target, &placeholders);
+            block.exec.workdir = self.replace_placeholders(&block.exec.workdir, &placeholders);
+            block.exec.cmd = self.replace_placeholders(&block.exec.cmd, &placeholders);
+            if let Some(v) = &mut block.visible {
+                self.resolve_visible(v, &placeholders);
+            }
+        }
+    }
+
+    fn resolve_visible(&self, v: &mut Visible, placeholders: &HashMap<String, String>) {
+        match &mut v.check {
+            VisibleCheck::Pod {
+                namespace,
+                selector,
+            } => {
+                *namespace = self.replace_placeholders(namespace, placeholders);
+                *selector = self.replace_placeholders(selector, placeholders);
+            }
+            VisibleCheck::Container { container } => {
+                *container = self.replace_placeholders(container, placeholders);
+            }
+            VisibleCheck::Exec(exec) => {
+                self.resolve_target(&mut exec.target, placeholders);
+                exec.workdir = self.replace_placeholders(&exec.workdir, placeholders);
+                exec.cmd = self.replace_placeholders(&exec.cmd, placeholders);
+            }
+        }
     }
 
     fn resolve_command_group(
@@ -120,6 +152,10 @@ impl ConfigLoader {
             self.resolve_target(&mut exec.target, placeholders);
             exec.workdir = self.replace_placeholders(&exec.workdir, placeholders);
             exec.cmd = self.replace_placeholders(&exec.cmd, placeholders);
+        }
+
+        if let Some(v) = &mut entry.visible {
+            self.resolve_visible(v, placeholders);
         }
 
         // Recurse into nested commands

@@ -1,402 +1,173 @@
 # Configuration Reference
 
-This document provides a complete reference for all k3dev configuration options.
+A complete, annotated example of every config section. Every field below is optional — omit anything you don't need and defaults apply.
 
-## Configuration File Locations
+## File lookup
 
-k3dev searches for configuration files in the following order:
+k3dev loads the first file it finds, in order:
 
-1. `./k3dev.yml` - Current working directory
-2. `~/.config/k3dev/config.yml` - User configuration (recommended)
-3. `/etc/k3dev/config.yml` - System-wide configuration
+1. `--config <path>` (CLI flag, if given)
+2. `./k3dev.yml`
+3. `~/.config/k3dev/config.yml`
+4. `/etc/k3dev/config.yml`
 
-The first file found is used. Configuration files are in YAML format.
+If none exist, built-in defaults are used. Format is YAML.
 
-## Configuration Sections
-
-### cluster
-
-Kubernetes cluster connection settings.
+## Full example
 
 ```yaml
+# ---- Kubernetes client -----------------------------------------------------
 cluster:
-  kubeconfig: ""   # Path to kubeconfig file
-  context: ""      # Kubernetes context to use
-```
+  kubeconfig: ""               # path to kubeconfig; empty = ~/.kube/config
+  context: ""                  # context name;       empty = current-context
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `kubeconfig` | string | `~/.kube/config` | Path to kubeconfig file |
-| `context` | string | current context | Kubernetes context to use |
-
-### infrastructure
-
-K3s cluster infrastructure settings.
-
-```yaml
+# ---- K3s infrastructure (the cluster this tool manages) --------------------
 infrastructure:
-  cluster_name: "k3dev"
-  domain: "myapp.local"
-  k3s_version: "v1.35.2-k3s1"
+  cluster_name: "k3dev"        # used for container ({name}-server) + network ({name}-net)
+  domain: "local.k8s.dev"      # default domain for ingresses
+  k3s_version: "v1.35.2-k3s1"  # k3s image tag
   api_port: 6443
   http_port: 80
   https_port: 443
-  additional_ports:
+  additional_ports:            # extra host:container port mappings
     - "2345:2345"
     - "8080:8080"
-  speedup:
-    use_snapshot: true
-    snapshot_auto_cleanup: true
-```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `cluster_name` | string | `k3dev` | Cluster name (derives container name: `{cluster_name}-server`, network name: `{cluster_name}-net`) |
-| `domain` | string | `local.k8s.dev` | Domain for local cluster ingress |
-| `k3s_version` | string | `v1.35.2-k3s1` | K3s container image version |
-| `api_port` | integer | `6443` | Kubernetes API port |
-| `http_port` | integer | `80` | HTTP ingress port |
-| `https_port` | integer | `443` | HTTPS ingress port |
-| `additional_ports` | list | `[]` | Additional port mappings (host:container) |
-| `speedup` | object | see below | Speedup optimization settings |
+  speedup:                     # snapshot-based fast startup (see note below)
+    use_snapshot: true         # first start ~30-60s (creates snapshot); later ~5-10s
+    snapshot_auto_cleanup: true  # delete old snapshots when config changes
 
-#### infrastructure.speedup
-
-Cluster startup speedup optimizations. **Snapshots are enabled by default** for optimal performance.
-
-```yaml
-speedup:
-  use_snapshot: true           # DEFAULT: true (enabled)
-  snapshot_auto_cleanup: true  # DEFAULT: true (enabled)
-```
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `use_snapshot` | boolean | `true` | Enable snapshot-based startup. First start creates a snapshot (~30-60s), subsequent starts use the snapshot (~5-10s). Snapshots are automatically invalidated when config changes. Set to `false` to disable. |
-| `snapshot_auto_cleanup` | boolean | `true` | Automatically delete old snapshots when creating new ones. Only the current snapshot is kept. |
-
-**Snapshot Behavior:**
-- **First start**: Normal initialization time (~30-60s). A snapshot is created after successful startup.
-- **Subsequent starts**: Much faster (~5-10s) by using the pre-initialized snapshot.
-- **Config changes**: If k3s version, domain, ports, or other critical settings change, the old snapshot is invalidated and a new one is created.
-- **Disk space**: Each snapshot is approximately 500MB. Old snapshots are automatically cleaned up when `snapshot_auto_cleanup` is enabled.
-- **Snapshot naming**: Snapshots are named `k3dev-snapshot-{version}-{config-hash}` (e.g., `k3dev-snapshot-v1-33-4-k3s1-a7b3c2d1`)
-
-### ui
-
-User interface settings.
-
-```yaml
+# ---- UI --------------------------------------------------------------------
 ui:
-  menu_width: "30%"
-```
+  menu_width: "auto"           # "auto" | percentage e.g. "30%" | fixed int e.g. 40
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `menu_width` | string | `auto` | Menu width: `auto`, percentage (`30%`), or fixed pixels |
+theme: fallout                 # fallout | cyberpunk | nord
 
-### theme
-
-UI theme selection.
-
-```yaml
-theme: fallout
-```
-
-Available themes:
-- `fallout` - Green phosphor CRT aesthetic (default)
-- `cyberpunk` - Neon purple and cyan
-- `nord` - Calm arctic blue-gray palette
-
-### logging
-
-Application logging configuration. Logs are written to a file with timestamps including milliseconds.
-
-```yaml
+# ---- Logging ---------------------------------------------------------------
 logging:
   enabled: true
-  file: "/tmp/k3dev-{cluster_name}.log"
-  level: "info"
-```
+  file: "/tmp/k3dev-{cluster_name}.log"   # {cluster_name} is substituted at runtime
+  level: "info"                # trace | debug | info | warn | error
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enabled` | boolean | `true` | Enable file logging |
-| `file` | string | `<temp_dir>/k3dev-{cluster_name}.log` | Log file path (supports `{cluster_name}` placeholder). Default uses the OS temp directory (`/tmp` on Linux, `$TMPDIR` on macOS) |
-| `level` | string | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-
-**Log Format:**
-
-Each log entry includes:
-- Timestamp with milliseconds (format: `2026-02-01 12:34:56.789`)
-- Log level (INFO, WARN, ERROR, DEBUG, TRACE)
-- Message content
-
-**Example log entries:**
-```
-2026-02-01 12:34:56.123 INFO Logging initialized cluster_name="k3dev" log_file="/tmp/k3dev-k3dev.log" level=INFO
-2026-02-01 12:34:57.456 INFO Cluster status changed old_status=Stopped new_status=Running
-2026-02-01 12:35:00.789 INFO Command completed exit_code=0
-2026-02-01 12:35:15.234 ERROR Failed to connect to cluster
-```
-
-**Placeholder Substitution:**
-
-The `{cluster_name}` placeholder in the log file path is automatically replaced with the actual cluster name from your configuration. This allows running multiple k3dev instances with different cluster names, each with its own log file.
-
-Example:
-- Configuration: `cluster_name: "myapp"`
-- Log file: `/tmp/k3dev-{cluster_name}.log`
-- Actual file: `/tmp/k3dev-myapp.log`
-
-### placeholders
-
-Define reusable values that can be referenced in commands using `@placeholder_name` syntax.
-
-```yaml
+# ---- Placeholders ----------------------------------------------------------
+# Reusable @name values — expanded at load time inside commands/info_blocks.
 placeholders:
-  default_namespace: "default"
-  drupal_selector: "app.kubernetes.io/name=drupal"
-  mysql_selector: "app.kubernetes.io/name=mysql"
-```
+  ns: "default"
+  app_selector: "app.kubernetes.io/name=myapp"
 
-Placeholders are resolved at configuration load time. Use them in command definitions:
-
-```yaml
+# ---- Custom commands (menu tree) -------------------------------------------
 commands:
-  - name: "My Command"
-    exec:
-      target:
-        namespace: "@default_namespace"
-        selector: "@drupal_selector"
-```
-
-### commands
-
-Define custom commands organized in a hierarchical menu structure.
-
-```yaml
-commands:
-  - name: "Group Name"
-    icon: "web"
+  - name: "App"
+    icon: "web"                # free-form string; no enum
     commands:
-      - name: "Command Name"
+
+      # Kubernetes target (default when `type:` is omitted)
+      - name: "Shell"
+        description: "Open /bin/sh in the app pod"  # shown in command palette
         exec:
           target:
-            namespace: "default"
-            selector: "app=myapp"
-            container: "main"
-            pod_name: ""
-          workdir: "/app"
-          cmd: "my-command"
+            type: kubernetes   # optional — kubernetes is the implicit default
+            namespace: "@ns"
+            selector: "@app_selector"
+            container: ""      # optional; empty = first container
+            pod_name: ""       # optional; overrides selector if set
+          cmd: "/bin/sh"
+
+      # Host target — runs on your machine
+      - name: "Git Status"
+        exec:
+          target: { type: host }
+          workdir: "."
+          cmd: "git status"
+
+      # Docker target — `docker exec` into a container on the host daemon
+      - name: "K3s Processes"
+        exec:
+          target: { type: docker, container: "k3dev-server" }
+          cmd: "ps -ef"
+
+      # Interactive input — @name tokens in `cmd` get filled by user prompts
+      - name: "Run drush"
+        exec:
+          target: { type: kubernetes, namespace: "@ns", selector: "@app_selector" }
+          cmd: "drush @command"
           input:
-            variable_name: "Prompt text:"
-```
+            command: "Enter drush command:"
 
-#### Command Group
+      # Hide entry unless a check passes (see "Visibility" below)
+      - name: "Mailhog UI"
+        visible: { type: pod, namespace: "@ns", selector: "app=mailhog" }
+        exec:
+          target: { type: host }
+          cmd: "xdg-open http://mailhog.local"
 
-| Option | Type | Description |
-|--------|------|-------------|
-| `name` | string | Display name for the group |
-| `icon` | string | Icon identifier (web, database, lightning, wrench) |
-| `commands` | list | Nested commands or subgroups |
+# ---- Info blocks (sidebar widgets) -----------------------------------------
+# Each block runs its `exec` on its own interval and shows the output.
+info_blocks:
+  - name: "Pods"
+    icon: "box"
+    exec:
+      target: { type: host }
+      cmd: "kubectl get pods -A --no-headers | wc -l"
+    interval: "10s"            # duration; min 1s; formats: Nms | Ns | Nm | Nh
+    max_lines: 5               # keep only last N lines of output (applied first)
+    max_length: 200            # UTF-8 safe char cap (applied after max_lines)
+    visible: "test -f ~/.kube/config"   # shorthand string → host shell check
 
-#### Command Definition
-
-| Option | Type | Description |
-|--------|------|-------------|
-| `name` | string | Display name for the command |
-| `exec` | object | Execution configuration |
-
-#### exec Object
-
-| Option | Type | Description |
-|--------|------|-------------|
-| `target` | object | Pod targeting configuration |
-| `workdir` | string | Working directory inside the container |
-| `cmd` | string | Command to execute (supports `@variable` placeholders) |
-| `input` | object | Interactive input prompts (key: variable name, value: prompt text) |
-
-#### target Object
-
-| Option | Type | Description |
-|--------|------|-------------|
-| `namespace` | string | Kubernetes namespace |
-| `selector` | string | Label selector to find the pod |
-| `container` | string | Container name within the pod (optional) |
-| `pod_name` | string | Direct pod name (alternative to selector) |
-
-#### Input Variables
-
-Commands can prompt for user input using the `input` object. Variables are substituted in the `cmd` using `@variable_name` syntax:
-
-```yaml
-- name: "Custom Command"
-  exec:
-    target:
-      namespace: "default"
-      selector: "app=drupal"
-    cmd: "drush @command"
-    input:
-      command: "Enter drush command:"
-```
-
-### keybindings
-
-Customize keyboard shortcuts.
-
-```yaml
+# ---- Keybindings -----------------------------------------------------------
+# Full list of remappable actions + key-format rules: docs/KEYBINDINGS.md
 keybindings:
-  # Built-in actions
-  quit: "q"
-  help: "?"
-  refresh: "r"
-  command_palette: ":"
-  update_hosts: "H"
-  cancel: "Ctrl+c"
-
-  # Navigation
-  move_up: "k"
-  move_down: "j"
-  move_left: "h"
-  move_right: "l"
-  toggle_focus: "Tab"
-  execute: "Enter"
-
-  # Custom command shortcuts
+  quit: "Ctrl+q"
+  refresh: "F5"
+  command_palette: "Ctrl+p"
   custom:
-    "Ctrl+d": "Drupal Operations/Clear Cache"
-    "Ctrl+b": "Database Operations/MySQL/Backup Database"
-```
+    "Ctrl+d": "App/Shell"      # value = "Group Name/Command Name"
 
-#### Key Format
-
-Keys are specified as strings with optional modifiers:
-
-- Single characters: `q`, `j`, `k`, `?`
-- Special keys: `Enter`, `Esc`, `Tab`, `Space`, `Up`, `Down`, `Left`, `Right`
-- Function keys: `F1` through `F12`
-- With modifiers: `Ctrl+c`, `Alt+x`, `Shift+Tab`
-- Multiple modifiers: `Ctrl+Shift+p`
-
-#### Built-in Actions
-
-| Action | Default | Description |
-|--------|---------|-------------|
-| `quit` | `q`, `Esc` | Exit the application |
-| `help` | `?` | Show help overlay |
-| `refresh` | `r` | Refresh data |
-| `command_palette` | `:` | Open command palette |
-| `update_hosts` | `H` | Update /etc/hosts |
-| `cancel` | `Ctrl+c` | Cancel current operation |
-| `move_up` | `k`, `Up` | Navigate up |
-| `move_down` | `j`, `Down` | Navigate down |
-| `move_left` | `h`, `Left` | Navigate left / go back |
-| `move_right` | `l`, `Right` | Navigate right / enter |
-| `toggle_focus` | `Tab` | Toggle focus between panels |
-| `execute` | `Enter` | Execute selected command |
-
-#### Custom Command Shortcuts
-
-Map keys directly to commands using the `custom` object. The value is the command path using `/` as separator:
-
-```yaml
-custom:
-  "Ctrl+d": "Drupal Operations/Clear Cache"
-```
-
-### hooks
-
-Execute commands at cluster lifecycle events.
-
-```yaml
+# ---- Lifecycle hooks -------------------------------------------------------
 hooks:
-  env:
-    CLUSTER_NAME: "my-cluster"
-    KUBECONFIG: "/path/to/kubeconfig"
+  env:                         # env vars exported to every hook command
+    KUBECONFIG: "~/.kube/config"
 
-  on_cluster_available:
-    - name: "Setup helm repos"
-      command: "helm repo update"
-      workdir: "~"
-      timeout: 300
-      continue_on_error: false
+  on_cluster_available:        # after k3s API responds
+    - name: "Wait for nodes"
+      command: "kubectl wait --for=condition=ready node --all --timeout=60s"
+      workdir: "~"             # supports ~ expansion; default ~
+      timeout: 120             # seconds; default 300
+      continue_on_error: false # default false
+      env:                     # per-hook overrides; merged on top of hooks.env
+        EXTRA: "1"
 
-  on_services_deployed:
-    - name: "Deploy application"
-      command: "helm install myapp ./charts/myapp"
+  on_services_deployed:        # after Traefik is deployed
+    - name: "Install app chart"
+      command: "helm upgrade --install myapp ./charts/myapp"
       workdir: "~/projects/myapp"
-      timeout: 600
       continue_on_error: true
 ```
 
-#### env
+## Command target types
 
-Environment variables passed to all hook commands.
+- **`host`** — runs in your local shell; use `workdir` to set the directory.
+- **`docker`** — `docker exec` into a running container on the host daemon; requires `container`.
+- **`kubernetes`** — `kubectl exec` style; pod is located by `selector` OR `pod_name` (one required). Optional `namespace` (defaults to current) and `container` (defaults to first). This is the implicit default when `type:` is omitted.
 
-#### Hook Events
+## Placeholders and @name
 
-| Event | When Triggered |
-|-------|----------------|
-| `on_cluster_available` | After K3s container is running and API is accessible |
-| `on_services_deployed` | After Traefik is deployed (if enabled) |
+Any `@name` token inside a command's `name`, `workdir`, `cmd`, or `target.*` string is replaced at load time with the value from the top-level `placeholders:` map. Tokens from `input:` prompts are filled at execution time instead, and use the same `@name` form inside `cmd`.
 
-#### Hook Definition
+## Visibility (`visible:`)
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `name` | string | - | Display name for the hook |
-| `command` | string | - | Shell command to execute |
-| `workdir` | string | `~` | Working directory (supports `~` expansion) |
-| `timeout` | integer | `300` | Timeout in seconds |
-| `continue_on_error` | boolean | `false` | Continue with next hook if this one fails |
-
-## Complete Example
-
-See `configs/k3dev.example.yml` for a complete configuration example with a Drupal development environment setup.
+Hides a command or info block until a check returns true, re-evaluated on `interval` (default `5s`). Supported shapes:
 
 ```yaml
-cluster:
-  kubeconfig: ""
-  context: ""
-
-infrastructure:
-  cluster_name: "k3dev"
-  domain: "myapp.local"
-  k3s_version: "v1.35.2-k3s1"
-  api_port: 6443
-  http_port: 80
-  https_port: 443
-  additional_ports:
-    - "2345:2345"
-
-ui:
-  menu_width: "30%"
-
-theme: fallout
-
-placeholders:
-  default_namespace: "default"
-  app_selector: "app.kubernetes.io/name=myapp"
-
-commands:
-  - name: "Application"
-    icon: "web"
-    commands:
-      - name: "Shell"
-        exec:
-          target:
-            namespace: "@default_namespace"
-            selector: "@app_selector"
-          cmd: "/bin/bash"
-
-keybindings:
-  custom:
-    "Ctrl+s": "Application/Shell"
-
-hooks:
-  on_cluster_available:
-    - name: "Wait for ready"
-      command: "kubectl wait --for=condition=ready node --all --timeout=60s"
-      timeout: 120
+visible: "test -f /etc/hosts"                               # shorthand — host shell, exit 0 = visible
+visible: { type: pod, namespace: default, selector: app=x } # ≥1 matching pod exists
+visible: { type: container, container: k3dev-server }       # docker container exists
+visible: { type: exec, target: {...}, cmd: "..." }          # full ExecConfig; exit 0 = visible
+visible: { type: pod, ..., interval: "10s" }                # override re-check cadence
 ```
+
+## Links
+
+- Keybindings reference & key-format rules — [docs/KEYBINDINGS.md](KEYBINDINGS.md)
+- CLI flags and headless subcommands — [docs/CLI.md](CLI.md)
+- Starter example config — [configs/k3dev.example.yml](../configs/k3dev.example.yml)

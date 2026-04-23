@@ -18,7 +18,7 @@ pub use confirm_popup::ConfirmPopup;
 pub use diagnostics_overlay::DiagnosticsOverlay;
 pub use help_overlay::HelpOverlay;
 pub use input_form::InputForm;
-pub use menu::{ActivePortForward, Menu};
+pub use menu::{ActivePortForward, InfoBlockView, Menu};
 pub use output::{Output, OutputLine, OutputType};
 pub use output_popup::OutputPopup;
 pub use pod_detail_panel::{DetailTab, PodDetailPanel};
