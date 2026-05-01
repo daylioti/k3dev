@@ -181,10 +181,8 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.diagnostics_overlay.scroll_down();
                 }
-                KeyCode::Char('r') => {
-                    if self.diagnostics_overlay.is_finished() {
-                        self.run_diagnostics();
-                    }
+                KeyCode::Char('r') if self.diagnostics_overlay.is_finished() => {
+                    self.run_diagnostics();
                 }
                 _ => {}
             }

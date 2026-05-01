@@ -108,14 +108,8 @@ impl PodExecutor {
         let status = attached.take_status();
         let exit_code = if let Some(status_future) = status {
             match status_future.await {
-                Some(status) => {
-                    if status.status.as_deref() == Some("Success") {
-                        0
-                    } else {
-                        1
-                    }
-                }
-                None => 1,
+                Some(status) if status.status.as_deref() == Some("Success") => 0,
+                _ => 1,
             }
         } else {
             0

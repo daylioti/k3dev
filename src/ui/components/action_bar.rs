@@ -260,11 +260,7 @@ impl ActionBar {
             spans.push(Span::styled(format!("[{}] ", name), badge_style));
         }
 
-        let last_visible = self
-            .actions
-            .iter()
-            .rposition(|a| a.enabled)
-            .unwrap_or(0);
+        let last_visible = self.actions.iter().rposition(|a| a.enabled).unwrap_or(0);
 
         for (i, action) in self.actions.iter().enumerate() {
             if !action.enabled {
