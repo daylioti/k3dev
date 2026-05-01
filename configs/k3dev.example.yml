@@ -106,7 +106,34 @@ commands:
             selector: "@app_selector"
           cmd: "@command"
           input:
+            # Shorthand: bare string is a plain text prompt
             command: "Enter command:"
+
+      # Demonstrate richer input definitions: text/select/multi-select.
+      - name: "Run with options"
+        exec:
+          target:
+            type: kubernetes
+            namespace: "@ns"
+            selector: "@app_selector"
+          cmd: "myapp --env @env --features @features -- @msg"
+          input:
+            env:
+              type: select
+              prompt: "Pick environment:"
+              options: [dev, staging, prod]
+              default: staging
+            features:
+              type: multi-select
+              prompt: "Pick features (Space to toggle):"
+              options: [auth, logging, metrics, tracing]
+              default: [auth]
+              required: true
+            msg:
+              type: text
+              prompt: "Notes:"
+              default: "manual run"
+              required: true
 
   - name: "Local"
     commands:

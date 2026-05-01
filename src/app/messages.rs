@@ -5,7 +5,6 @@
 use crate::cluster::diagnostics::DiagnosticsReport;
 use crate::cluster::{
     ClusterStatus, ContainerPullProgress, ContainerStats, IngressEntry, IngressHealthStatus,
-    ResourceStats,
 };
 use crate::config::RefreshTask;
 use crate::k8s::{PendingPodInfo, PodTimeline, PvcInfo, ShellSessionHandle};
@@ -35,9 +34,6 @@ pub enum AppMessage {
 
     /// Missing hosts from /etc/hosts
     MissingHostsUpdated(HashSet<String>),
-
-    /// Resource stats updated
-    ResourceStatsUpdated(Option<ResourceStats>),
 
     /// Pod stats updated (per-container stats)
     PodStatsUpdated(Vec<ContainerStats>),
@@ -96,6 +92,22 @@ pub enum AppMessage {
     /// Hosts update requires sudo — contains the file content to write
     NeedsSudoHostsWrite { content: String, count: usize },
 
+    /// Capture status line (tcpdump stderr or orchestrator-emitted info).
+    CaptureStatus(String),
+
+    /// Capture progress update (throttled).
+    CaptureProgress { bytes: u64, packets: Option<u64> },
+
+    /// Capture finished cleanly.
+    CaptureComplete {
+        path: std::path::PathBuf,
+        bytes: u64,
+        packets: Option<u64>,
+    },
+
+    /// Capture failed (orchestrator/Docker error).
+    CaptureFailed(String),
+
     /// Error message
     Error(String),
 
@@ -149,7 +161,6 @@ impl App {
                 tracing::info!(exit_code = %exit_code, "Command completed");
 
                 self.is_executing = false;
-                self.status_bar.set_executing(false);
                 self.cancel_token = None;
 
                 if exit_code == 0 {
@@ -188,7 +199,6 @@ impl App {
                 }
 
                 self.cluster_status = status;
-                self.status_bar.update_connection_state(is_running);
 
                 // Toggle action bar: diagnostics only when running, preflight when not
                 self.action_bar
@@ -254,7 +264,6 @@ impl App {
                         .set_ingress_health(std::collections::HashMap::new());
                     self.menu
                         .set_missing_hosts(std::collections::HashSet::new());
-                    self.status_bar.set_resource_stats(None);
                     self.pod_stats.set_pods(Vec::new());
                     self.volume_entries_cache.clear();
                 }
@@ -269,9 +278,6 @@ impl App {
             }
             AppMessage::MissingHostsUpdated(missing) => {
                 self.menu.set_missing_hosts(missing);
-            }
-            AppMessage::ResourceStatsUpdated(stats) => {
-                self.status_bar.set_resource_stats(stats);
             }
             AppMessage::PodStatsUpdated(stats) => {
                 // Cache the running pods and merge with pending
@@ -496,6 +502,34 @@ impl App {
                     tracing::debug!(id = id, "visibility probe error: {}", err);
                 }
                 self.apply_visibility_update(id, visible);
+            }
+            AppMessage::CaptureStatus(line) => {
+                tracing::info!(target: "capture", "{}", line);
+                self.pod_detail_panel.push_capture_status(line);
+            }
+            AppMessage::CaptureProgress { bytes, packets } => {
+                self.pod_detail_panel.set_capture_progress(bytes, packets);
+            }
+            AppMessage::CaptureComplete {
+                path,
+                bytes,
+                packets,
+            } => {
+                tracing::info!(
+                    target: "capture",
+                    "Capture complete: {} ({} bytes, {:?} packets)",
+                    path.display(),
+                    bytes,
+                    packets
+                );
+                self.pod_detail_panel
+                    .set_capture_complete(path, bytes, packets);
+                self.cancel_token = None;
+            }
+            AppMessage::CaptureFailed(err) => {
+                tracing::error!(target: "capture", "Capture failed: {}", err);
+                self.pod_detail_panel.set_capture_failed(err);
+                self.cancel_token = None;
             }
         }
     }

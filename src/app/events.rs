@@ -49,7 +49,6 @@ impl App {
                 token.cancel();
                 self.output.add_warning("Cancelling...");
                 self.is_executing = false;
-                self.status_bar.set_executing(false);
             } else {
                 self.should_quit = true;
             }
@@ -279,15 +278,11 @@ impl App {
                 '+' | '=' => {
                     // Increase menu width (clamp to reasonable range)
                     self.menu_width_offset = (self.menu_width_offset + 2).min(40);
-                    self.status_bar
-                        .set_resize_hint(Some(self.menu_width_offset));
                     return;
                 }
                 '-' | '_' => {
                     // Decrease menu width (clamp to reasonable range)
                     self.menu_width_offset = (self.menu_width_offset - 2).max(-20);
-                    self.status_bar
-                        .set_resize_hint(Some(self.menu_width_offset));
                     return;
                 }
                 _ => {}
@@ -327,8 +322,6 @@ impl App {
                 // Otherwise, only allow 4-9, 0 (1-3 are quick focus)
                 if !self.pending_count.is_empty() || !matches!(c, '1' | '2' | '3') {
                     self.pending_count.push(c);
-                    self.status_bar
-                        .set_pending_count(Some(self.pending_count.clone()));
                     return;
                 }
             }
@@ -337,19 +330,43 @@ impl App {
         // Get the movement count (default to 1)
         let count = self.pending_count.parse::<usize>().unwrap_or(1).max(1);
         self.pending_count.clear();
-        self.status_bar.set_pending_count(None);
 
         // Handle pod detail panel shortcuts when PodStats is focused
         if self.focus == FocusArea::PodStats {
+            // Capture-tab–specific actions take priority over the
+            // open-tab keys when the Capture tab is the active one.
+            if self.pod_detail_panel.is_open()
+                && self.pod_detail_panel.active_tab() == DetailTab::Capture
+            {
+                if let KeyCode::Char(c) = code {
+                    match c {
+                        's' => {
+                            self.start_pod_capture();
+                            return;
+                        }
+                        'x' => {
+                            self.stop_pod_capture();
+                            return;
+                        }
+                        'o' => {
+                            self.open_capture_in_wireshark();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             if let KeyCode::Char(c) = code {
                 match c {
-                    'l' | 'd' | 't' | 'v' | 'e' => {
+                    'l' | 'd' | 't' | 'v' | 'e' | 'c' => {
                         let tab = match c {
                             'l' => DetailTab::Logs,
                             'd' => DetailTab::Describe,
                             't' => DetailTab::Timeline,
                             'v' => DetailTab::Volumes,
-                            _ => DetailTab::Shell,
+                            'e' => DetailTab::Shell,
+                            _ => DetailTab::Capture,
                         };
                         self.open_or_switch_detail_tab(tab);
                         return;
@@ -505,14 +522,33 @@ impl App {
             }
             KeyCode::Tab => self.input_form.focus_next(),
             KeyCode::BackTab => self.input_form.focus_prev(),
-            KeyCode::Up => self.input_form.focus_prev(),
-            KeyCode::Down => self.input_form.focus_next(),
+            KeyCode::Up => {
+                if self.input_form.focused_field_uses_vertical_keys() {
+                    self.input_form.move_option_up();
+                } else {
+                    self.input_form.focus_prev();
+                }
+            }
+            KeyCode::Down => {
+                if self.input_form.focused_field_uses_vertical_keys() {
+                    self.input_form.move_option_down();
+                } else {
+                    self.input_form.focus_next();
+                }
+            }
             KeyCode::Left => self.input_form.move_cursor_left(),
             KeyCode::Right => self.input_form.move_cursor_right(),
             KeyCode::Backspace => self.input_form.handle_backspace(),
+            KeyCode::Char(' ') if self.input_form.focused_field_is_multi_select() => {
+                self.input_form.toggle_multi_select();
+            }
             KeyCode::Enter => {
                 if self.input_form.is_submit_focused() {
-                    self.submit_input();
+                    if self.input_form.validate() {
+                        self.submit_input();
+                    } else {
+                        self.output.add_warning("Please fill required fields");
+                    }
                 } else {
                     self.input_form.focus_next();
                 }

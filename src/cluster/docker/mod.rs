@@ -13,7 +13,7 @@ mod stats;
 mod volumes;
 
 pub use pull_progress::{ContainerPullProgress, PullPhase};
-pub use stats::{ContainerStats, ResourceStats};
+pub use stats::ContainerStats;
 
 use anyhow::{anyhow, Context, Result};
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
@@ -262,6 +262,79 @@ impl DockerManager {
             )
             .await
             .with_context(|| format!("Failed to remove container {}", name))
+    }
+
+    /// Send a signal to a running container.
+    /// `signal` is a name like "SIGTERM" / "SIGKILL".
+    pub async fn kill_container(&self, name: &str, signal: &str) -> Result<()> {
+        use bollard::query_parameters::KillContainerOptions;
+        self.client
+            .kill_container(
+                name,
+                Some(KillContainerOptions {
+                    signal: signal.to_string(),
+                }),
+            )
+            .await
+            .with_context(|| format!("Failed to send {} to container {}", signal, name))
+    }
+
+    /// Attach to a running container's multiplexed stdout/stderr stream.
+    /// Returns the bollard `AttachContainerResults` whose `output` is a
+    /// `Stream<LogOutput>` of stdout/stderr chunks. `input` is unused for
+    /// capture but exposed for completeness.
+    pub async fn attach_container_stream(
+        &self,
+        name: &str,
+    ) -> Result<bollard::container::AttachContainerResults> {
+        use bollard::query_parameters::AttachContainerOptions;
+        self.client
+            .attach_container(
+                name,
+                Some(AttachContainerOptions {
+                    stream: true,
+                    stdout: true,
+                    stderr: true,
+                    logs: false,
+                    stdin: false,
+                    detach_keys: None,
+                }),
+            )
+            .await
+            .with_context(|| format!("Failed to attach to container {}", name))
+    }
+
+    /// Inspect a container and return its `network_mode` string (e.g. "host",
+    /// "bridge", "container:<id>"). Returns `None` if not set.
+    pub async fn inspect_network_mode(&self, name: &str) -> Result<Option<String>> {
+        let info = self
+            .client
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+            .with_context(|| format!("Failed to inspect container {}", name))?;
+        Ok(info.host_config.and_then(|h| h.network_mode))
+    }
+
+    /// Find the pause container for a pod managed by k3s `--docker`.
+    ///
+    /// k3s names pause containers as `k8s_POD_<pod>_<namespace>_<uid>_<attempt>`;
+    /// the pause container owns the pod's network namespace and outlives any
+    /// individual workload container, making it the canonical target for
+    /// network-namespace-shared sidecars (e.g. tcpdump capture).
+    pub async fn find_pod_pause_container(&self, pod: &str, namespace: &str) -> Result<String> {
+        let prefix = format!("k8s_POD_{}_{}_", pod, namespace);
+        let names = self.list_containers_by_prefix(&prefix).await?;
+        names
+            .into_iter()
+            .find(|n| n.starts_with(&prefix))
+            .ok_or_else(|| {
+                anyhow!(
+                    "No pause container found for pod {}/{} (looked for prefix {})",
+                    namespace,
+                    pod,
+                    prefix
+                )
+            })
     }
 
     /// Execute a command in a running container
@@ -899,6 +972,7 @@ impl DockerManager {
             } else {
                 Some(config.security_opt.clone())
             },
+            auto_remove: if config.auto_remove { Some(true) } else { None },
             ..Default::default()
         };
 
@@ -920,6 +994,11 @@ impl DockerManager {
                 }
             }),
             cmd: config.command.clone(),
+            labels: if config.labels.is_empty() {
+                None
+            } else {
+                Some(config.labels.clone())
+            },
             ..Default::default()
         };
 
@@ -1028,4 +1107,8 @@ pub struct ContainerRunConfig {
     pub command: Option<Vec<String>>,
     /// Security options (e.g., "apparmor=unconfined", "seccomp=unconfined")
     pub security_opt: Vec<String>,
+    /// Container labels (used for filtering/cleanup)
+    pub labels: HashMap<String, String>,
+    /// Auto-remove the container when it exits
+    pub auto_remove: bool,
 }

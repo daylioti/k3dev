@@ -11,7 +11,7 @@ mod traefik;
 pub use config::ClusterConfig;
 #[allow(unused_imports)]
 pub use docker::ContainerRunConfig;
-pub use docker::{ContainerPullProgress, ContainerStats, DockerManager, PullPhase, ResourceStats};
+pub use docker::{ContainerPullProgress, ContainerStats, DockerManager, PullPhase};
 pub use ingress::{
     HostsUpdateResult, IngressEntry, IngressHealthChecker, IngressHealthStatus, IngressManager,
 };

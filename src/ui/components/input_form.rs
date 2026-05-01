@@ -7,49 +7,149 @@ use ratatui::{
 };
 use std::collections::HashMap;
 
+use crate::config::{InputDefinition, InputSpec};
 use crate::ui::styles::Styles;
 use crate::ui::theme::Theme;
 
-/// A single input field
+const MULTI_SELECT_JOIN: &str = " ";
+
+/// One input field — kind plus shared metadata.
 #[derive(Debug, Clone)]
 pub struct InputField {
     pub name: String,
     pub prompt: String,
-    pub value: String,
-    pub cursor_position: usize,
+    pub kind: FieldKind,
+    pub required: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum FieldKind {
+    Text {
+        value: String,
+        cursor_position: usize,
+    },
+    Select {
+        options: Vec<String>,
+        selected: usize,
+    },
+    MultiSelect {
+        options: Vec<String>,
+        checked: Vec<bool>,
+        cursor: usize,
+    },
 }
 
 impl InputField {
-    pub fn new(name: impl Into<String>, prompt: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            prompt: prompt.into(),
-            value: String::new(),
-            cursor_position: 0,
+    fn from_definition(name: String, def: &InputDefinition) -> Self {
+        match def {
+            InputDefinition::Prompt(prompt) => Self {
+                name,
+                prompt: prompt.clone(),
+                kind: FieldKind::Text {
+                    value: String::new(),
+                    cursor_position: 0,
+                },
+                required: false,
+                error: None,
+            },
+            InputDefinition::Detailed(InputSpec::Text {
+                prompt,
+                default,
+                required,
+            }) => {
+                let value = default.clone();
+                let cursor_position = value.chars().count();
+                Self {
+                    name,
+                    prompt: prompt.clone(),
+                    kind: FieldKind::Text {
+                        value,
+                        cursor_position,
+                    },
+                    required: *required,
+                    error: None,
+                }
+            }
+            InputDefinition::Detailed(InputSpec::Select {
+                prompt,
+                options,
+                default,
+            }) => {
+                let selected = default
+                    .as_ref()
+                    .and_then(|d| options.iter().position(|o| o == d))
+                    .unwrap_or(0);
+                Self {
+                    name,
+                    prompt: prompt.clone(),
+                    kind: FieldKind::Select {
+                        options: options.clone(),
+                        selected,
+                    },
+                    // A select always has a value (empty options is rejected by validation,
+                    // but we still treat select as not-required since there's nothing to enforce).
+                    required: false,
+                    error: None,
+                }
+            }
+            InputDefinition::Detailed(InputSpec::MultiSelect {
+                prompt,
+                options,
+                default,
+                required,
+            }) => {
+                let checked: Vec<bool> = options.iter().map(|o| default.contains(o)).collect();
+                Self {
+                    name,
+                    prompt: prompt.clone(),
+                    kind: FieldKind::MultiSelect {
+                        options: options.clone(),
+                        checked,
+                        cursor: 0,
+                    },
+                    required: *required,
+                    error: None,
+                }
+            }
         }
     }
 
-    pub fn insert_char(&mut self, c: char) {
-        self.value.insert(self.cursor_position, c);
-        self.cursor_position += 1;
+    /// Lines this field occupies in the modal (prompt + content + optional error).
+    fn line_count(&self) -> usize {
+        let body = match &self.kind {
+            FieldKind::Text { .. } => 1,
+            FieldKind::Select { options, .. } => options.len().max(1),
+            FieldKind::MultiSelect { options, .. } => options.len().max(1),
+        };
+        // prompt + body + error line (always reserved when set)
+        1 + body + if self.error.is_some() { 1 } else { 0 }
     }
 
-    pub fn delete_char(&mut self) {
-        if self.cursor_position > 0 {
-            self.cursor_position -= 1;
-            self.value.remove(self.cursor_position);
+    /// Collapsed string value for substitution.
+    fn collected_value(&self) -> String {
+        match &self.kind {
+            FieldKind::Text { value, .. } => value.clone(),
+            FieldKind::Select { options, selected } => {
+                options.get(*selected).cloned().unwrap_or_default()
+            }
+            FieldKind::MultiSelect {
+                options, checked, ..
+            } => options
+                .iter()
+                .zip(checked.iter())
+                .filter(|(_, c)| **c)
+                .map(|(o, _)| o.as_str())
+                .collect::<Vec<_>>()
+                .join(MULTI_SELECT_JOIN),
         }
     }
 
-    pub fn move_cursor_left(&mut self) {
-        if self.cursor_position > 0 {
-            self.cursor_position -= 1;
-        }
-    }
-
-    pub fn move_cursor_right(&mut self) {
-        if self.cursor_position < self.value.len() {
-            self.cursor_position += 1;
+    fn is_empty(&self) -> bool {
+        match &self.kind {
+            FieldKind::Text { value, .. } => value.is_empty(),
+            FieldKind::Select { .. } => false,
+            FieldKind::MultiSelect { checked, .. } => !checked.iter().any(|c| *c),
         }
     }
 }
@@ -78,13 +178,29 @@ impl InputForm {
         }
     }
 
-    /// Setup the form with fields from input prompts
-    pub fn setup(&mut self, title: impl Into<String>, inputs: &HashMap<String, String>) {
+    /// Setup the form with fields built from input definitions.
+    /// `order` controls field display order — names not in `order` are appended in iteration order.
+    pub fn setup(
+        &mut self,
+        title: impl Into<String>,
+        inputs: &HashMap<String, InputDefinition>,
+        order: &[String],
+    ) {
         self.title = title.into();
-        self.fields = inputs
-            .iter()
-            .map(|(name, prompt)| InputField::new(name.clone(), prompt.clone()))
-            .collect();
+        let mut fields: Vec<InputField> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for name in order {
+            if let Some(def) = inputs.get(name) {
+                fields.push(InputField::from_definition(name.clone(), def));
+                seen.insert(name.clone());
+            }
+        }
+        for (name, def) in inputs {
+            if !seen.contains(name) {
+                fields.push(InputField::from_definition(name.clone(), def));
+            }
+        }
+        self.fields = fields;
         self.focused_field = 0;
         self.submit_focused = false;
     }
@@ -95,42 +211,159 @@ impl InputForm {
         self.submit_focused = false;
     }
 
-    /// Get all field values as a map
+    /// Get all field values as a map (string-collapsed per kind).
     pub fn get_values(&self) -> HashMap<String, String> {
         self.fields
             .iter()
-            .map(|f| (f.name.clone(), f.value.clone()))
+            .map(|f| (f.name.clone(), f.collected_value()))
             .collect()
     }
 
+    fn focused_kind(&self) -> Option<&FieldKind> {
+        if self.submit_focused {
+            return None;
+        }
+        self.fields.get(self.focused_field).map(|f| &f.kind)
+    }
+
+    /// True when up/down should move *within* the focused field's options
+    /// rather than between fields.
+    pub fn focused_field_uses_vertical_keys(&self) -> bool {
+        matches!(
+            self.focused_kind(),
+            Some(FieldKind::Select { .. } | FieldKind::MultiSelect { .. })
+        )
+    }
+
+    pub fn focused_field_is_multi_select(&self) -> bool {
+        matches!(self.focused_kind(), Some(FieldKind::MultiSelect { .. }))
+    }
+
+    fn clear_errors(&mut self) {
+        for f in &mut self.fields {
+            f.error = None;
+        }
+    }
+
     pub fn handle_char(&mut self, c: char) {
-        if !self.submit_focused {
-            if let Some(field) = self.fields.get_mut(self.focused_field) {
-                field.insert_char(c);
+        self.clear_errors();
+        if self.submit_focused {
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.focused_field) {
+            if let FieldKind::Text {
+                value,
+                cursor_position,
+            } = &mut field.kind
+            {
+                let byte_idx = char_byte_index(value, *cursor_position);
+                value.insert(byte_idx, c);
+                *cursor_position += 1;
             }
         }
     }
 
     pub fn handle_backspace(&mut self) {
-        if !self.submit_focused {
-            if let Some(field) = self.fields.get_mut(self.focused_field) {
-                field.delete_char();
+        self.clear_errors();
+        if self.submit_focused {
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.focused_field) {
+            if let FieldKind::Text {
+                value,
+                cursor_position,
+            } = &mut field.kind
+            {
+                if *cursor_position > 0 {
+                    *cursor_position -= 1;
+                    let byte_idx = char_byte_index(value, *cursor_position);
+                    value.remove(byte_idx);
+                }
             }
         }
     }
 
     pub fn move_cursor_left(&mut self) {
-        if !self.submit_focused {
-            if let Some(field) = self.fields.get_mut(self.focused_field) {
-                field.move_cursor_left();
+        if self.submit_focused {
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.focused_field) {
+            if let FieldKind::Text {
+                cursor_position, ..
+            } = &mut field.kind
+            {
+                if *cursor_position > 0 {
+                    *cursor_position -= 1;
+                }
             }
         }
     }
 
     pub fn move_cursor_right(&mut self) {
-        if !self.submit_focused {
-            if let Some(field) = self.fields.get_mut(self.focused_field) {
-                field.move_cursor_right();
+        if self.submit_focused {
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.focused_field) {
+            if let FieldKind::Text {
+                value,
+                cursor_position,
+            } = &mut field.kind
+            {
+                let max = value.chars().count();
+                if *cursor_position < max {
+                    *cursor_position += 1;
+                }
+            }
+        }
+    }
+
+    /// Move option cursor up inside Select / MultiSelect.
+    pub fn move_option_up(&mut self) {
+        if self.submit_focused {
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.focused_field) {
+            match &mut field.kind {
+                FieldKind::Select { selected, .. } => *selected = selected.saturating_sub(1),
+                FieldKind::MultiSelect { cursor, .. } => *cursor = cursor.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn move_option_down(&mut self) {
+        if self.submit_focused {
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.focused_field) {
+            match &mut field.kind {
+                FieldKind::Select { options, selected } => {
+                    *selected = (*selected + 1).min(options.len().saturating_sub(1));
+                }
+                FieldKind::MultiSelect {
+                    options, cursor, ..
+                } => {
+                    *cursor = (*cursor + 1).min(options.len().saturating_sub(1));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Toggle current option in a MultiSelect.
+    pub fn toggle_multi_select(&mut self) {
+        self.clear_errors();
+        if self.submit_focused {
+            return;
+        }
+        if let Some(field) = self.fields.get_mut(self.focused_field) {
+            if let FieldKind::MultiSelect {
+                checked, cursor, ..
+            } = &mut field.kind
+            {
+                if let Some(c) = checked.get_mut(*cursor) {
+                    *c = !*c;
+                }
             }
         }
     }
@@ -159,6 +392,21 @@ impl InputForm {
         self.submit_focused
     }
 
+    /// Validate required fields. Returns true if all required fields are filled.
+    /// Sets per-field `error` for any required-but-empty field.
+    pub fn validate(&mut self) -> bool {
+        let mut ok = true;
+        for f in &mut self.fields {
+            if f.required && f.is_empty() {
+                f.error = Some("Required".to_string());
+                ok = false;
+            } else {
+                f.error = None;
+            }
+        }
+        ok
+    }
+
     /// Create a centered rectangle for the popup
     fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         let popup_layout = Layout::default()
@@ -181,12 +429,13 @@ impl InputForm {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect) {
-        // Calculate popup size based on number of fields
+        // Total content rows: sum of fields (each field knows its own line count) + submit row + spacer
+        let field_rows: usize = self.fields.iter().map(|f| f.line_count() + 1).sum(); // +1 spacer between fields
+        let total_rows = field_rows + 2; // submit + hint
         let height_percent =
-            ((self.fields.len() * 2 + 4) * 100 / area.height as usize).clamp(30, 60) as u16;
+            ((total_rows + 4) * 100 / area.height.max(1) as usize).clamp(30, 80) as u16;
         let popup_area = Self::centered_rect(50, height_percent, area);
 
-        // Clear the background
         frame.render_widget(Clear, popup_area);
 
         let block = Block::default()
@@ -202,91 +451,357 @@ impl InputForm {
             return;
         }
 
-        // Calculate layout: each field takes 2 lines (prompt + input) + submit button
-        let field_count = self.fields.len();
-        let constraints: Vec<Constraint> = self
-            .fields
-            .iter()
-            .flat_map(|_| vec![Constraint::Length(1), Constraint::Length(1)])
-            .chain(std::iter::once(Constraint::Length(2))) // Submit button
-            .chain(std::iter::once(Constraint::Min(0))) // Remaining space
-            .collect();
+        // Build per-row constraints.
+        let mut constraints: Vec<Constraint> = Vec::new();
+        for f in &self.fields {
+            for _ in 0..f.line_count() {
+                constraints.push(Constraint::Length(1));
+            }
+            constraints.push(Constraint::Length(1)); // spacer
+        }
+        constraints.push(Constraint::Length(1)); // submit
+        constraints.push(Constraint::Min(0));
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(inner);
 
-        // Render each field
+        let mut row = 0usize;
         for (i, field) in self.fields.iter().enumerate() {
-            let prompt_area = chunks[i * 2];
-            let input_area = chunks[i * 2 + 1];
-
             let is_focused = !self.submit_focused && i == self.focused_field;
 
-            // Prompt
+            // Prompt row
             let prompt_style = if is_focused {
                 self.styles.title
             } else {
                 self.styles.muted_text
             };
-            let prompt = Paragraph::new(Line::from(Span::styled(&field.prompt, prompt_style)));
-            frame.render_widget(prompt, prompt_area);
-
-            // Input field
-            let input_style = if is_focused {
-                self.styles.normal_text.add_modifier(Modifier::UNDERLINED)
-            } else {
-                self.styles.normal_text
-            };
-
-            let display_value = if field.value.is_empty() && !is_focused {
-                "(empty)".to_string()
-            } else {
-                field.value.clone()
-            };
-
-            let input = Paragraph::new(Line::from(Span::styled(display_value, input_style)));
-            frame.render_widget(input, input_area);
-
-            // Show cursor position if focused
-            if is_focused {
-                frame.set_cursor_position((
-                    input_area.x + field.cursor_position as u16,
-                    input_area.y,
-                ));
+            let mut prompt_text = field.prompt.clone();
+            if field.required {
+                prompt_text.push_str(" *");
             }
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(prompt_text, prompt_style))),
+                chunks[row],
+            );
+            row += 1;
+
+            // Body
+            match &field.kind {
+                FieldKind::Text {
+                    value,
+                    cursor_position,
+                } => {
+                    let input_style = if is_focused {
+                        self.styles.normal_text.add_modifier(Modifier::UNDERLINED)
+                    } else {
+                        self.styles.normal_text
+                    };
+                    let display_value = if value.is_empty() && !is_focused {
+                        "(empty)".to_string()
+                    } else {
+                        value.clone()
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Line::from(Span::styled(display_value, input_style))),
+                        chunks[row],
+                    );
+                    if is_focused {
+                        frame.set_cursor_position((
+                            chunks[row].x + *cursor_position as u16,
+                            chunks[row].y,
+                        ));
+                    }
+                    row += 1;
+                }
+                FieldKind::Select { options, selected } => {
+                    if options.is_empty() {
+                        frame.render_widget(
+                            Paragraph::new(Line::from(Span::styled(
+                                "(no options)",
+                                self.styles.muted_text,
+                            ))),
+                            chunks[row],
+                        );
+                        row += 1;
+                    } else {
+                        for (idx, opt) in options.iter().enumerate() {
+                            let is_sel = idx == *selected;
+                            let marker = if is_sel { "▶ " } else { "  " };
+                            let style = if is_sel && is_focused {
+                                self.styles.action_selected
+                            } else if is_sel {
+                                self.styles.title
+                            } else {
+                                self.styles.normal_text
+                            };
+                            frame.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    format!("{}{}", marker, opt),
+                                    style,
+                                ))),
+                                chunks[row],
+                            );
+                            row += 1;
+                        }
+                    }
+                }
+                FieldKind::MultiSelect {
+                    options,
+                    checked,
+                    cursor,
+                } => {
+                    if options.is_empty() {
+                        frame.render_widget(
+                            Paragraph::new(Line::from(Span::styled(
+                                "(no options)",
+                                self.styles.muted_text,
+                            ))),
+                            chunks[row],
+                        );
+                        row += 1;
+                    } else {
+                        for (idx, opt) in options.iter().enumerate() {
+                            let is_cursor = idx == *cursor;
+                            let mark = if checked.get(idx).copied().unwrap_or(false) {
+                                "[x]"
+                            } else {
+                                "[ ]"
+                            };
+                            let arrow = if is_cursor && is_focused {
+                                "▶ "
+                            } else {
+                                "  "
+                            };
+                            let style = if is_cursor && is_focused {
+                                self.styles.action_selected
+                            } else {
+                                self.styles.normal_text
+                            };
+                            frame.render_widget(
+                                Paragraph::new(Line::from(Span::styled(
+                                    format!("{}{} {}", arrow, mark, opt),
+                                    style,
+                                ))),
+                                chunks[row],
+                            );
+                            row += 1;
+                        }
+                    }
+                }
+            }
+
+            // Error row (if present)
+            if let Some(err) = &field.error {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("  ! {}", err),
+                        self.styles.error_text,
+                    ))),
+                    chunks[row],
+                );
+                row += 1;
+            }
+
+            // Spacer
+            row += 1;
         }
 
         // Submit button
-        let submit_area = chunks[field_count * 2];
+        let submit_area = chunks[row];
         let submit_style = if self.submit_focused {
             self.styles.action_selected
         } else {
             self.styles.action_normal
         };
-        let submit =
-            Paragraph::new(Line::from(Span::styled("[ Submit ]", submit_style))).centered();
-        frame.render_widget(submit, submit_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("[ Submit ]", submit_style))).centered(),
+            submit_area,
+        );
 
-        // Render hint at bottom of popup
+        // Hint at bottom of popup
         let hint_area = Rect::new(
             inner.x,
             popup_area.y + popup_area.height.saturating_sub(2),
             inner.width,
             1,
         );
-        let hint = Paragraph::new(Line::from(Span::styled(
-            "[Tab] Next  [Enter] Submit  [Esc] Cancel",
-            self.styles.muted_text,
-        )))
-        .centered();
-        frame.render_widget(hint, hint_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "[Tab] Next  [Space] Toggle  [Enter] Submit  [Esc] Cancel",
+                self.styles.muted_text,
+            )))
+            .centered(),
+            hint_area,
+        );
     }
 }
 
 impl Default for InputForm {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn char_byte_index(s: &str, char_pos: usize) -> usize {
+    s.char_indices()
+        .nth(char_pos)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn defs(pairs: Vec<(&str, InputDefinition)>) -> HashMap<String, InputDefinition> {
+        pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    #[test]
+    fn text_default_pre_fill() {
+        let mut form = InputForm::new();
+        let inputs = defs(vec![(
+            "msg",
+            InputDefinition::Detailed(InputSpec::Text {
+                prompt: "Msg:".into(),
+                default: "hello".into(),
+                required: false,
+            }),
+        )]);
+        form.setup("t", &inputs, &["msg".to_string()]);
+        let v = form.get_values();
+        assert_eq!(v.get("msg"), Some(&"hello".to_string()));
+    }
+
+    #[test]
+    fn select_default_selection() {
+        let mut form = InputForm::new();
+        let inputs = defs(vec![(
+            "env",
+            InputDefinition::Detailed(InputSpec::Select {
+                prompt: "Env:".into(),
+                options: vec!["dev".into(), "staging".into(), "prod".into()],
+                default: Some("staging".into()),
+            }),
+        )]);
+        form.setup("t", &inputs, &["env".to_string()]);
+        assert_eq!(form.get_values().get("env"), Some(&"staging".to_string()));
+    }
+
+    #[test]
+    fn select_default_falls_back_to_first() {
+        let mut form = InputForm::new();
+        let inputs = defs(vec![(
+            "env",
+            InputDefinition::Detailed(InputSpec::Select {
+                prompt: "Env:".into(),
+                options: vec!["a".into(), "b".into()],
+                default: None,
+            }),
+        )]);
+        form.setup("t", &inputs, &["env".to_string()]);
+        assert_eq!(form.get_values().get("env"), Some(&"a".to_string()));
+    }
+
+    #[test]
+    fn multi_select_joins_with_space() {
+        let mut form = InputForm::new();
+        let inputs = defs(vec![(
+            "feats",
+            InputDefinition::Detailed(InputSpec::MultiSelect {
+                prompt: "Features:".into(),
+                options: vec!["auth".into(), "logging".into(), "metrics".into()],
+                default: vec!["auth".into(), "metrics".into()],
+                required: false,
+            }),
+        )]);
+        form.setup("t", &inputs, &["feats".to_string()]);
+        assert_eq!(
+            form.get_values().get("feats"),
+            Some(&"auth metrics".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_required_text() {
+        let mut form = InputForm::new();
+        let inputs = defs(vec![(
+            "msg",
+            InputDefinition::Detailed(InputSpec::Text {
+                prompt: "Msg:".into(),
+                default: "".into(),
+                required: true,
+            }),
+        )]);
+        form.setup("t", &inputs, &["msg".to_string()]);
+        assert!(!form.validate());
+    }
+
+    #[test]
+    fn validate_rejects_empty_required_multi_select() {
+        let mut form = InputForm::new();
+        let inputs = defs(vec![(
+            "f",
+            InputDefinition::Detailed(InputSpec::MultiSelect {
+                prompt: "F:".into(),
+                options: vec!["a".into(), "b".into()],
+                default: vec![],
+                required: true,
+            }),
+        )]);
+        form.setup("t", &inputs, &["f".to_string()]);
+        assert!(!form.validate());
+    }
+
+    #[test]
+    fn shorthand_string_is_text_input() {
+        let mut form = InputForm::new();
+        let inputs = defs(vec![("x", InputDefinition::Prompt("Enter x:".into()))]);
+        form.setup("t", &inputs, &["x".to_string()]);
+        form.handle_char('a');
+        form.handle_char('b');
+        assert_eq!(form.get_values().get("x"), Some(&"ab".to_string()));
+    }
+
+    #[test]
+    fn move_option_navigates_select() {
+        let mut form = InputForm::new();
+        let inputs = defs(vec![(
+            "e",
+            InputDefinition::Detailed(InputSpec::Select {
+                prompt: "E:".into(),
+                options: vec!["a".into(), "b".into(), "c".into()],
+                default: None,
+            }),
+        )]);
+        form.setup("t", &inputs, &["e".to_string()]);
+        form.move_option_down();
+        form.move_option_down();
+        assert_eq!(form.get_values().get("e"), Some(&"c".to_string()));
+        form.move_option_up();
+        assert_eq!(form.get_values().get("e"), Some(&"b".to_string()));
+    }
+
+    #[test]
+    fn toggle_multi_select_works() {
+        let mut form = InputForm::new();
+        let inputs = defs(vec![(
+            "f",
+            InputDefinition::Detailed(InputSpec::MultiSelect {
+                prompt: "F:".into(),
+                options: vec!["a".into(), "b".into(), "c".into()],
+                default: vec![],
+                required: false,
+            }),
+        )]);
+        form.setup("t", &inputs, &["f".to_string()]);
+        form.toggle_multi_select(); // toggle 'a'
+        form.move_option_down();
+        form.move_option_down();
+        form.toggle_multi_select(); // toggle 'c'
+        assert_eq!(form.get_values().get("f"), Some(&"a c".to_string()));
     }
 }

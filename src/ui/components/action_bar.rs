@@ -183,6 +183,16 @@ impl ActionBar {
         if let Some(action) = self.actions.iter_mut().find(|a| a.id == id) {
             action.enabled = enabled;
         }
+        // If the currently selected action just became disabled, advance to the
+        // next enabled one so navigation/Enter behavior stays sensible.
+        if self
+            .actions
+            .get(self.selected_index)
+            .map(|a| !a.enabled)
+            .unwrap_or(false)
+        {
+            self.skip_disabled_right();
+        }
     }
 
     /// Get the currently selected action
@@ -210,6 +220,9 @@ impl ActionBar {
         // Approximate: "▶ Start │ " = ~10 chars per action
         let mut pos = 3; // Start after focus-stripe prefix ("▌ " or "  ")
         for (i, action) in self.actions.iter().enumerate() {
+            if !action.enabled {
+                continue;
+            }
             let action_width = action.icon.chars().count() + 1 + action.label.len();
             if x >= pos && x < pos + action_width {
                 return Some(i);
@@ -247,13 +260,20 @@ impl ActionBar {
             spans.push(Span::styled(format!("[{}] ", name), badge_style));
         }
 
+        let last_visible = self
+            .actions
+            .iter()
+            .rposition(|a| a.enabled)
+            .unwrap_or(0);
+
         for (i, action) in self.actions.iter().enumerate() {
+            if !action.enabled {
+                continue;
+            }
             let is_selected = i == self.selected_index && focused;
 
             let base_style = if is_selected {
                 self.styles.action_selected
-            } else if !action.enabled {
-                self.styles.action_disabled
             } else {
                 self.styles.action_normal
             };
@@ -281,8 +301,8 @@ impl ActionBar {
                 spans.push(Span::styled(&action.label, base_style));
             }
 
-            // Add separator (except for last item)
-            if i < self.actions.len() - 1 {
+            // Add separator between visible items
+            if i < last_visible {
                 spans.push(Span::styled(" │ ", self.styles.muted_text));
             }
         }

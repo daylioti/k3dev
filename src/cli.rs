@@ -685,6 +685,181 @@ pub async fn run_cli_exec(
     Ok(status.code().unwrap_or(1))
 }
 
+/// Run a tcpdump capture headlessly and write a .pcap file.
+///
+/// Returns the process exit code. Streams tcpdump status to stderr; the
+/// final output path is printed on stdout so it can be piped.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cli_capture(
+    config_path: Option<&str>,
+    pod: Option<&str>,
+    namespace: &str,
+    container: Option<&str>,
+    iface: String,
+    filter: Option<&str>,
+    duration: Option<&str>,
+    max_bytes: Option<&str>,
+    out: Option<&str>,
+    out_dir: Option<&str>,
+    image: Option<&str>,
+    open: bool,
+) -> Result<i32> {
+    use crate::app::AppMessage;
+    use crate::capture;
+
+    let (config, _cluster_config) = load_cluster_config(config_path);
+    let _ = crate::logging::init_logging(&config.logging, &config.infrastructure.cluster_name);
+
+    // Resolve target.
+    let target = if let Some(p) = pod {
+        capture::CaptureTarget::Pod {
+            pod: p.to_string(),
+            namespace: namespace.to_string(),
+        }
+    } else if let Some(c) = container {
+        capture::CaptureTarget::Container(c.to_string())
+    } else {
+        // clap's ArgGroup should prevent this, but guard for misuse.
+        eprintln!("\x1b[31mEither --pod or --container is required\x1b[0m");
+        return Ok(2);
+    };
+
+    // Resolve output path.
+    let dir: std::path::PathBuf = out_dir
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| config.capture.output_dir.clone());
+    let output_path: std::path::PathBuf = if let Some(o) = out {
+        std::path::PathBuf::from(o)
+    } else {
+        capture::default_output_path(&dir, &target)
+    };
+
+    // Optional duration/max_bytes parsing.
+    let duration_parsed = match duration.and_then(capture::parse_duration) {
+        Some(d) => Some(d),
+        None if duration.is_some() => {
+            eprintln!("\x1b[31mInvalid --duration value (try '30s', '5m', '1h')\x1b[0m");
+            return Ok(2);
+        }
+        None => None,
+    };
+    let max_bytes_parsed = match max_bytes.and_then(capture::parse_bytes) {
+        Some(b) => Some(b),
+        None if max_bytes.is_some() => {
+            eprintln!("\x1b[31mInvalid --max-bytes value (try '100M', '1G')\x1b[0m");
+            return Ok(2);
+        }
+        None => None,
+    };
+
+    let spec = capture::CaptureSpec {
+        target,
+        output_path: output_path.clone(),
+        image: image
+            .map(String::from)
+            .unwrap_or_else(|| config.capture.image.clone()),
+        iface,
+        filter: filter.map(String::from),
+        duration: duration_parsed,
+        max_bytes: max_bytes_parsed,
+    };
+
+    // Connect to Docker.
+    let docker = match crate::cluster::DockerManager::from_default_socket() {
+        Ok(d) => Arc::new(d),
+        Err(e) => {
+            eprintln!("\x1b[31mFailed to connect to Docker: {}\x1b[0m", e);
+            return Ok(1);
+        }
+    };
+
+    // Drive the capture, listening for events on a local channel.
+    let (msg_tx, mut msg_rx) = mpsc::channel::<AppMessage>(100);
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    if let Err(e) = capture::start_capture(spec, docker, msg_tx, cancel.clone()).await {
+        eprintln!("\x1b[31mFailed to start capture: {}\x1b[0m", e);
+        return Ok(1);
+    }
+
+    eprintln!(
+        "\x1b[1mCapturing → {}\x1b[0m  (Ctrl-C to stop)",
+        output_path.display()
+    );
+
+    let cancel_for_signal = cancel.clone();
+    let signal_task = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        cancel_for_signal.cancel();
+    });
+
+    let mut final_path: Option<std::path::PathBuf> = None;
+    let mut final_bytes: u64 = 0;
+    let mut final_packets: Option<u64> = None;
+    let mut failure: Option<String> = None;
+
+    while let Some(msg) = msg_rx.recv().await {
+        match msg {
+            AppMessage::CaptureStatus(line) => {
+                eprintln!("\x1b[90m{}\x1b[0m", line);
+            }
+            AppMessage::CaptureProgress { bytes, packets } => {
+                let pkt = packets
+                    .map(|p| format!("{} packets", p))
+                    .unwrap_or_else(|| "packets: --".to_string());
+                eprintln!("  \x1b[36m{} bytes  {}\x1b[0m", bytes, pkt);
+            }
+            AppMessage::CaptureComplete {
+                path,
+                bytes,
+                packets,
+            } => {
+                final_path = Some(path);
+                final_bytes = bytes;
+                final_packets = packets;
+                break;
+            }
+            AppMessage::CaptureFailed(err) => {
+                failure = Some(err);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Cancel the signal listener so it doesn't keep the runtime alive.
+    signal_task.abort();
+
+    if let Some(err) = failure {
+        eprintln!("\x1b[31mCapture failed: {}\x1b[0m", err);
+        return Ok(1);
+    }
+
+    let path = final_path.unwrap_or(output_path);
+    eprintln!(
+        "\x1b[32m✓ Capture saved\x1b[0m  {} ({} bytes{})",
+        path.display(),
+        final_bytes,
+        final_packets
+            .map(|p| format!(", {} packets", p))
+            .unwrap_or_default()
+    );
+    println!("{}", path.display());
+
+    if open {
+        let tool = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        if let Err(e) = std::process::Command::new(tool).arg(&path).spawn() {
+            eprintln!("\x1b[33mWarning: failed to launch {}: {}\x1b[0m", tool, e);
+        }
+    }
+
+    Ok(0)
+}
+
 /// Print an OutputLine to stdout with ANSI colors
 fn print_output_line(line: &OutputLine) {
     let timestamp = line.timestamp.format("[%H:%M:%S]");

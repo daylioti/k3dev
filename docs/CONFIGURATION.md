@@ -92,7 +92,30 @@ commands:
           target: { type: kubernetes, namespace: "@ns", selector: "@app_selector" }
           cmd: "drush @command"
           input:
-            command: "Enter drush command:"
+            command: "Enter drush command:"      # bare string = text prompt
+
+      # Richer input forms: text / select / multi-select
+      - name: "Deploy with options"
+        exec:
+          target: { type: kubernetes, namespace: "@ns", selector: "@app_selector" }
+          cmd: "deploy.sh --env @env --features @features --note @msg"
+          input:
+            env:
+              type: select
+              prompt: "Pick environment:"
+              options: [dev, staging, prod]
+              default: staging                   # must match one option
+            features:
+              type: multi-select
+              prompt: "Pick features (Space to toggle):"
+              options: [auth, logging, metrics]
+              default: [auth]                    # values pre-checked
+              required: true                     # must select ≥1
+            msg:
+              type: text
+              prompt: "Note:"
+              default: "manual"                  # pre-fills the field
+              required: true                     # must be non-empty
 
       # Hide entry unless a check passes (see "Visibility" below)
       - name: "Mailhog UI"
@@ -153,6 +176,21 @@ hooks:
 ## Placeholders and @name
 
 Any `@name` token inside a command's `name`, `workdir`, `cmd`, or `target.*` string is replaced at load time with the value from the top-level `placeholders:` map. Tokens from `input:` prompts are filled at execution time instead, and use the same `@name` form inside `cmd`.
+
+## Input prompts (`input:`)
+
+Each entry under `input:` defines one prompt, keyed by the `@name` placeholder it fills. Two YAML shapes are accepted:
+
+- **Shorthand** — bare string is a plain text prompt: `command: "Enter command:"`.
+- **Detailed** — map with `type:` of `text`, `select`, or `multi-select`.
+
+| `type:`        | Fields                                            | Substituted value                                        |
+| -------------- | ------------------------------------------------- | -------------------------------------------------------- |
+| `text`         | `prompt`, `default?`, `required?` (default false) | The text the user typed                                  |
+| `select`       | `prompt`, `options`, `default?`                   | The selected option (always exactly one)                 |
+| `multi-select` | `prompt`, `options`, `default?`, `required?`      | Selected options joined by a single space (e.g. `a c`)   |
+
+Form keys: `Tab`/`Shift+Tab` move between fields, `Up`/`Down` move within a select / multi-select, `Space` toggles in a multi-select, `Enter` on **Submit** confirms (with required-field validation), `Esc` cancels.
 
 ## Visibility (`visible:`)
 

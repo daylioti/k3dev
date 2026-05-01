@@ -52,6 +52,15 @@ pub enum ValidationWarning {
         ports: Vec<u16>,
         description: String,
     },
+    EmptyInputOptions {
+        path: String,
+        input: String,
+    },
+    InvalidInputDefault {
+        path: String,
+        input: String,
+        default: String,
+    },
 }
 
 impl std::fmt::Display for ValidationWarning {
@@ -86,6 +95,20 @@ impl std::fmt::Display for ValidationWarning {
             ValidationWarning::PortConflict { ports, description } => {
                 write!(f, "Port conflict {:?}: {}", ports, description)
             }
+            ValidationWarning::EmptyInputOptions { path, input } => {
+                write!(f, "{}: input '{}' has no options", path, input)
+            }
+            ValidationWarning::InvalidInputDefault {
+                path,
+                input,
+                default,
+            } => {
+                write!(
+                    f,
+                    "{}: input '{}' default '{}' is not one of its options",
+                    path, input, default
+                )
+            }
         }
     }
 }
@@ -113,6 +136,7 @@ impl<'a> ConfigValidator<'a> {
         self.check_empty_command_groups();
         self.check_suspicious_ports();
         self.check_keybinding_conflicts();
+        self.check_input_options();
         self.result
     }
 }

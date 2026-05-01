@@ -124,45 +124,6 @@ impl App {
         });
     }
 
-    pub(super) fn spawn_resource_stats_check(&self) {
-        if !self.cluster_is_running() {
-            let message_tx = self.message_tx.clone();
-            tokio::spawn(async move {
-                let _ = message_tx
-                    .send(AppMessage::ResourceStatsUpdated(None))
-                    .await;
-            });
-            return;
-        }
-
-        let message_tx = self.message_tx.clone();
-        let container_name = self.cluster_config.container_name.clone();
-        let timeout = self.refresh_config.docker_stats_timeout;
-
-        tokio::spawn(async move {
-            let result = tokio::time::timeout(timeout, async {
-                let docker = DockerManager::from_default_socket()
-                    .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
-                // Try agent first, fall back to direct cgroup reads
-                match docker.get_container_stats_via_agent(&container_name).await {
-                    Ok(stats) => Ok(stats),
-                    Err(_) => docker.get_container_stats(&container_name).await,
-                }
-            })
-            .await;
-
-            let stats_option = match result {
-                Ok(Ok(stats)) if stats.cpu_percent > 0.0 || stats.memory_used_mb > 0.0 => {
-                    Some(stats)
-                }
-                _ => None,
-            };
-            let _ = message_tx
-                .send(AppMessage::ResourceStatsUpdated(stats_option))
-                .await;
-        });
-    }
-
     pub(super) fn spawn_pod_stats_check(&self) {
         if !self.cluster_is_running() {
             let message_tx = self.message_tx.clone();

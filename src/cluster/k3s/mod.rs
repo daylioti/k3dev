@@ -416,6 +416,8 @@ impl K3sManager {
             entrypoint: Some(String::new()),
             command: Some(k3s_command),
             security_opt: vec!["apparmor=unconfined".to_string()],
+            labels: Default::default(),
+            auto_remove: false,
         };
 
         self.docker.run_container(&run_config).await?;

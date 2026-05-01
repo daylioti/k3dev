@@ -32,9 +32,8 @@ use crate::k8s::PendingPodInfo;
 use crate::k8s::{K8sClient, ShellSessionHandle};
 use crate::keybindings::KeybindingResolver;
 use crate::ui::components::{
-    ActionBar, ClusterAction, ClusterStatus as UiClusterStatus, CommandPalette, ConfirmPopup,
-    DetailTab, DiagnosticsOverlay, HelpOverlay, InputForm, Menu, Output, OutputPopup,
-    PodDetailPanel, PodStats, StatusBar,
+    ActionBar, ClusterAction, CommandPalette, ConfirmPopup, DetailTab, DiagnosticsOverlay,
+    HelpOverlay, InputForm, Menu, Output, OutputPopup, PodDetailPanel, PodStats,
 };
 use crate::ui::{AppLayout, Styles};
 use std::collections::{HashMap, HashSet};
@@ -105,7 +104,6 @@ pub struct App {
     output: Output,
     output_popup: OutputPopup,
     pod_stats: PodStats,
-    status_bar: StatusBar,
     input_form: InputForm,
     help_overlay: HelpOverlay,
     command_palette: CommandPalette,
@@ -142,6 +140,9 @@ pub struct App {
     active_pull_monitors: HashSet<String>,
     /// Bollard Docker client for spawning pull monitors
     docker_client: Option<Docker>,
+
+    /// Shared DockerManager for capture sidecars (lazily created on first use).
+    docker_manager: Option<Arc<crate::cluster::DockerManager>>,
 
     /// Cache of volume/PVC entries (all volumes, filtered per pod when needed)
     volume_entries_cache: Vec<crate::k8s::PvcInfo>,
@@ -330,7 +331,6 @@ impl App {
             output,
             output_popup: OutputPopup::with_theme(theme),
             pod_stats: PodStats::with_theme(theme),
-            status_bar: StatusBar::with_theme(theme),
             input_form: InputForm::with_theme(theme),
             help_overlay,
             command_palette,
@@ -352,6 +352,7 @@ impl App {
             pull_progress_cache: HashMap::new(),
             active_pull_monitors: HashSet::new(),
             docker_client: crate::cluster::PlatformInfo::connect_docker().ok(),
+            docker_manager: None,
             volume_entries_cache: Vec::new(),
             image_arch_cache: HashMap::new(),
             image_arch_check_pending: false,
@@ -445,9 +446,6 @@ impl App {
                 self.run_interactive_sudo_hosts_update(terminal, &content, count);
             }
 
-            // Tick spinner animation
-            self.status_bar.tick_spinner();
-
             // Process scheduled refresh tasks
             for task in self.scheduler.tick() {
                 match task {
@@ -463,7 +461,6 @@ impl App {
                         self.spawn_missing_hosts_check();
                     }
                     RefreshTask::StatsRefresh => {
-                        self.spawn_resource_stats_check();
                         self.spawn_pod_stats_check();
                         self.spawn_pending_pods_check();
                         self.spawn_pull_progress_check();
@@ -637,14 +634,6 @@ impl App {
             self.render_running_screen(frame, &layout);
         }
 
-        // Render status bar (always visible)
-        let ui_status = match self.cluster_status {
-            ClusterStatus::Running => UiClusterStatus::Connected,
-            ClusterStatus::Stopped | ClusterStatus::NotCreated => UiClusterStatus::Disconnected,
-            _ => UiClusterStatus::Unknown,
-        };
-        self.status_bar.render(frame, layout.status_bar, &ui_status);
-
         // Render modal overlays
         if self.mode == AppMode::Help {
             self.help_overlay.render(frame, frame.area());
@@ -686,9 +675,6 @@ impl App {
 
         // Right: inline preflight results
         self.diagnostics_overlay.render_inline(frame, columns[1]);
-
-        // Clear selected item in status bar
-        self.status_bar.set_selected_item(None);
     }
 
     /// Render the normal running screen: menu (left) + pods (right)
@@ -750,23 +736,6 @@ impl App {
         } else {
             self.pod_stats.render(frame, layout.pod_stats, focused);
         }
-
-        // Update selected item in status bar
-        let selected_item = match self.focus {
-            FocusArea::PodStats => self
-                .pod_stats
-                .selected_pod()
-                .map(|p| format!("{} ({})", p.name, p.namespace)),
-            FocusArea::Content => {
-                if let Some((host, path)) = self.menu.selected_ingress_info() {
-                    Some(format!("http://{}{}", host, path))
-                } else {
-                    self.menu.selected_item().map(|i| i.name.clone())
-                }
-            }
-            FocusArea::ActionBar => None,
-        };
-        self.status_bar.set_selected_item(selected_item);
     }
 }
 

@@ -315,16 +315,6 @@ impl Menu {
         Some(format!("http://{}{}", entry.host, path))
     }
 
-    /// Get the selected ingress host and path (for status bar display)
-    pub fn selected_ingress_info(&self) -> Option<(String, String)> {
-        if !self.ingress_selected {
-            return None;
-        }
-        let entry = self.ingress_entries.get(self.selected_ingress_entry)?;
-        let path = entry.paths.get(self.selected_ingress_path)?;
-        Some((entry.host.clone(), path.clone()))
-    }
-
     // === Config Building ===
 
     /// Build menu from config

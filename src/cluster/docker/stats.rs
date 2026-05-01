@@ -48,26 +48,6 @@ struct CachedCpuStats {
 static CPU_CACHE: Lazy<RwLock<HashMap<String, CachedCpuStats>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-/// Aggregated resource statistics from Docker containers
-#[derive(Debug, Clone, Default)]
-pub struct ResourceStats {
-    pub cpu_percent: f64,
-    pub memory_used_mb: f64,
-    pub memory_total_mb: f64,
-    pub net_rx_mb: f64,
-    pub net_tx_mb: f64,
-}
-
-impl ResourceStats {
-    pub fn memory_percent(&self) -> f64 {
-        if self.memory_total_mb > 0.0 {
-            (self.memory_used_mb / self.memory_total_mb) * 100.0
-        } else {
-            0.0
-        }
-    }
-}
-
 /// Stats for a single container
 #[derive(Debug, Clone, Default)]
 pub struct ContainerStats {
@@ -80,73 +60,6 @@ pub struct ContainerStats {
 }
 
 impl DockerManager {
-    /// Get aggregated resource stats from all cluster containers (main k3s container + k8s workloads)
-    /// Uses cgroups v2 for fast stats reading
-    pub async fn get_container_stats(&self, prefix: &str) -> Result<ResourceStats> {
-        use crate::cluster::platform::PlatformInfo;
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // Remote Docker: local cgroups don't reflect remote containers — use agent instead
-        if PlatformInfo::is_docker_remote() {
-            anyhow::bail!("Host-side cgroup stats unavailable with remote Docker");
-        }
-
-        // Get the main k3s container
-        let mut containers = self.list_containers_by_prefix(prefix).await?;
-
-        // Also get all k8s workload containers
-        let k8s_containers = self.list_containers_by_prefix("k8s_").await?;
-        containers.extend(k8s_containers);
-
-        // Deduplicate
-        let containers: Vec<String> = containers
-            .into_iter()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        if containers.is_empty() {
-            return Ok(ResourceStats::default());
-        }
-
-        let now_usec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
-        let num_cpus = num_cpus::get() as f64;
-
-        let mut stats = ResourceStats::default();
-        let mut memory_total_set = false;
-
-        for container in &containers {
-            // Get full container ID
-            let full_id = match self.get_container_id(container).await {
-                Some(id) => id,
-                None => continue,
-            };
-
-            // Find cgroup path
-            let cgroup_path = match find_container_cgroup(&full_id) {
-                Some(p) => p,
-                None => continue,
-            };
-
-            // Read stats from cgroups (ignore cpu_limit for aggregate stats)
-            let (cpu, _cpu_limit, mem_used, mem_limit) =
-                read_cgroup_stats(&cgroup_path, &full_id, now_usec, num_cpus);
-
-            stats.cpu_percent += cpu;
-            stats.memory_used_mb += mem_used;
-            if !memory_total_set && mem_limit > 0.0 {
-                stats.memory_total_mb = mem_limit;
-                memory_total_set = true;
-            }
-            // Note: Network stats not available via cgroups, would need /proc/net or docker API
-        }
-
-        Ok(stats)
-    }
-
     /// Get per-pod stats using cgroups v2 (much faster than Docker API)
     /// Reads directly from /sys/fs/cgroup/kubepods for resource stats
     pub async fn get_pod_stats(&self, prefix: &str) -> Result<Vec<ContainerStats>> {
@@ -885,29 +798,6 @@ impl DockerManager {
         stats_list.sort_by(|a, b| a.name.cmp(&b.name));
 
         Ok(stats_list)
-    }
-
-    /// Get aggregated resource stats via the agent.
-    pub async fn get_container_stats_via_agent(
-        &self,
-        k3s_container: &str,
-    ) -> Result<ResourceStats> {
-        let pod_stats = self.get_pod_stats_via_agent(k3s_container).await?;
-
-        let mut stats = ResourceStats::default();
-        for pod in &pod_stats {
-            stats.cpu_percent += pod.cpu_percent;
-            stats.memory_used_mb += pod.memory_used_mb;
-        }
-        // Use first non-zero memory limit as total (same heuristic as original)
-        for pod in &pod_stats {
-            if pod.memory_limit_mb > 0.0 {
-                stats.memory_total_mb = pod.memory_limit_mb;
-                break;
-            }
-        }
-
-        Ok(stats)
     }
 }
 

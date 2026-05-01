@@ -7,7 +7,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
 use super::{ConfigValidator, ValidationWarning};
-use crate::config::types::{CommandEntry, ExecutionTarget};
+use crate::config::types::{CommandEntry, ExecutionTarget, InputDefinition, InputSpec};
 
 /// Lazy-compiled regex for extracting @placeholder names
 static PLACEHOLDER_REGEX: Lazy<Regex> =
@@ -376,6 +376,74 @@ impl<'a> ConfigValidator<'a> {
                         reason,
                     });
             }
+        }
+    }
+
+    /// Validate select / multi-select input definitions: warn on empty options
+    /// and on `default` values that aren't part of `options`.
+    pub(super) fn check_input_options(&mut self) {
+        for group in &self.config.commands {
+            self.check_input_options_in_entries(&group.commands, &group.name);
+        }
+    }
+
+    fn check_input_options_in_entries(&mut self, entries: &[CommandEntry], path: &str) {
+        for entry in entries {
+            let entry_path = format!("{}/{}", path, entry.name);
+            if let Some(exec) = &entry.exec {
+                for (name, def) in &exec.input {
+                    if let InputDefinition::Detailed(spec) = def {
+                        match spec {
+                            InputSpec::Select {
+                                options, default, ..
+                            } => {
+                                if options.is_empty() {
+                                    self.result
+                                        .add_warning(ValidationWarning::EmptyInputOptions {
+                                            path: entry_path.clone(),
+                                            input: name.clone(),
+                                        });
+                                }
+                                if let Some(d) = default {
+                                    if !options.contains(d) {
+                                        self.result.add_warning(
+                                            ValidationWarning::InvalidInputDefault {
+                                                path: entry_path.clone(),
+                                                input: name.clone(),
+                                                default: d.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            InputSpec::MultiSelect {
+                                options, default, ..
+                            } => {
+                                if options.is_empty() {
+                                    self.result
+                                        .add_warning(ValidationWarning::EmptyInputOptions {
+                                            path: entry_path.clone(),
+                                            input: name.clone(),
+                                        });
+                                }
+                                for d in default {
+                                    if !options.contains(d) {
+                                        self.result.add_warning(
+                                            ValidationWarning::InvalidInputDefault {
+                                                path: entry_path.clone(),
+                                                input: name.clone(),
+                                                default: d.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            InputSpec::Text { .. } => {}
+                        }
+                    }
+                }
+            }
+            self.check_input_options_in_entries(&entry.commands, &entry_path);
         }
     }
 }

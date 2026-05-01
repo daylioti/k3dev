@@ -41,6 +41,10 @@ pub struct Config {
     /// Logging configuration
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// Packet-capture (tcpdump → pcap) settings
+    #[serde(default)]
+    pub capture: CaptureConfig,
 }
 
 /// Menu width configuration
@@ -116,8 +120,9 @@ impl MenuWidth {
     pub fn calculate(&self, total_width: u16, longest_item: u16) -> u16 {
         match self {
             MenuWidth::Auto => {
-                // Auto-expand based on longest item, with padding for border + scrollbar
-                (longest_item + 4).max(25).min(total_width * 35 / 100)
+                // Auto-expand based on longest item, with padding for borders only.
+                // The scrollbar overlays the inner content area, so no extra column is needed.
+                (longest_item + 2).max(22).min(total_width * 28 / 100)
             }
             MenuWidth::Percent(percent) => {
                 (total_width * percent / 100).max(25).min(total_width / 2)
@@ -420,7 +425,45 @@ pub struct ExecConfig {
     pub cmd: String,
 
     #[serde(default)]
-    pub input: HashMap<String, String>,
+    pub input: HashMap<String, InputDefinition>,
+}
+
+/// Definition for one runtime input prompt.
+///
+/// Two YAML shapes are accepted:
+/// - bare string — shorthand for a plain text prompt
+/// - tagged map — `{ type: text|select|multi-select, prompt, options, default, required }`
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum InputDefinition {
+    Prompt(String),
+    Detailed(InputSpec),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum InputSpec {
+    Text {
+        prompt: String,
+        #[serde(default)]
+        default: String,
+        #[serde(default)]
+        required: bool,
+    },
+    Select {
+        prompt: String,
+        options: Vec<String>,
+        #[serde(default)]
+        default: Option<String>,
+    },
+    MultiSelect {
+        prompt: String,
+        options: Vec<String>,
+        #[serde(default)]
+        default: Vec<String>,
+        #[serde(default)]
+        required: bool,
+    },
 }
 
 /// Where a command runs.
@@ -785,6 +828,48 @@ impl Default for LoggingConfig {
 
 fn default_logging_enabled() -> bool {
     true
+}
+
+/// Packet-capture settings (tcpdump sidecar → .pcap files).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CaptureConfig {
+    /// Directory where captured .pcap files are written.
+    /// Default: `<XDG_DATA_HOME>/k3dev/captures` (or platform equivalent).
+    #[serde(default = "default_capture_output_dir")]
+    pub output_dir: std::path::PathBuf,
+
+    /// Sidecar Docker image used to run tcpdump.
+    /// Default: `nicolaka/netshoot`.
+    #[serde(default = "default_capture_image")]
+    pub image: String,
+
+    /// Default network interface for tcpdump (`-i`).
+    #[serde(default = "default_capture_iface")]
+    pub iface: String,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            output_dir: default_capture_output_dir(),
+            image: default_capture_image(),
+            iface: default_capture_iface(),
+        }
+    }
+}
+
+fn default_capture_output_dir() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .map(|d| d.join("k3dev").join("captures"))
+        .unwrap_or_else(|| std::env::temp_dir().join("k3dev-captures"))
+}
+
+fn default_capture_image() -> String {
+    "nicolaka/netshoot".to_string()
+}
+
+fn default_capture_iface() -> String {
+    "any".to_string()
 }
 
 fn default_log_file() -> String {

@@ -4,6 +4,7 @@
 //! pod commands, and palette command handling.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -11,7 +12,9 @@ use crate::cluster::diagnostics::{run_all_diagnostics, run_preflight_checks};
 use crate::cluster::DockerManager;
 use crate::cluster::{ClusterManager, HostsUpdateResult, IngressManager};
 use crate::commands::{CommandContext, PaletteCommandId};
-use crate::config::{get_exec_placeholders, CommandEntry, ExecutionTarget, RefreshTask};
+use crate::config::{
+    get_exec_placeholders, CommandEntry, ExecutionTarget, InputDefinition, RefreshTask,
+};
 use crate::k8s::PodExecutor;
 use crate::ui::components::{ClusterAction, DetailTab};
 
@@ -167,7 +170,6 @@ impl App {
         self.output_popup
             .set_title(format!("Cluster {}", action.as_str()));
         self.is_executing = true;
-        self.status_bar.set_executing(true);
         // Show output popup immediately when command starts
         self.mode = super::AppMode::OutputPopup;
 
@@ -213,19 +215,19 @@ impl App {
         // Check for input placeholders
         let placeholders = get_exec_placeholders(exec);
         if !placeholders.is_empty() {
-            let inputs: HashMap<String, String> = placeholders
+            let inputs: HashMap<String, InputDefinition> = placeholders
                 .iter()
                 .map(|p| {
-                    let prompt = exec
+                    let def = exec
                         .input
                         .get(p)
                         .cloned()
-                        .unwrap_or_else(|| format!("Enter {}:", p));
-                    (p.clone(), prompt)
+                        .unwrap_or_else(|| InputDefinition::Prompt(format!("Enter {}:", p)));
+                    (p.clone(), def)
                 })
                 .collect();
 
-            self.input_form.setup(&cmd.name, &inputs);
+            self.input_form.setup(&cmd.name, &inputs, &placeholders);
             self.pending_command = Some(cmd);
             self.mode = AppMode::Input;
             return;
@@ -410,7 +412,6 @@ impl App {
         self.output_popup.clear();
         self.output_popup.set_title(title);
         self.is_executing = true;
-        self.status_bar.set_executing(true);
         self.mode = super::AppMode::OutputPopup;
 
         let cancel_token = CancellationToken::new();
@@ -424,7 +425,6 @@ impl App {
         self.output_popup
             .set_title("Updating /etc/hosts".to_string());
         self.is_executing = true;
-        self.status_bar.set_executing(true);
         self.mode = super::AppMode::OutputPopup;
 
         let timeout = self.refresh_config.manual_hosts_timeout;
@@ -536,6 +536,120 @@ impl App {
             DetailTab::Timeline => self.load_detail_timeline(&pod_name, &namespace),
             DetailTab::Volumes => self.update_detail_panel_volumes(),
             DetailTab::Shell => self.activate_shell_tab(),
+            // Capture tab is non-loading: it shows live state owned by
+            // pod_detail_panel.capture_state(). User explicitly starts a
+            // capture with 's' from inside the tab.
+            DetailTab::Capture => {}
+        }
+    }
+
+    /// Lazily build a shared DockerManager for capture sidecars.
+    fn capture_docker(&mut self) -> Option<Arc<crate::cluster::DockerManager>> {
+        if self.docker_manager.is_none() {
+            match crate::cluster::DockerManager::from_default_socket() {
+                Ok(m) => self.docker_manager = Some(Arc::new(m)),
+                Err(e) => {
+                    self.output
+                        .add_error(format!("Capture: Docker connect failed: {}", e));
+                    return None;
+                }
+            }
+        }
+        self.docker_manager.clone()
+    }
+
+    /// Start a tcpdump capture for the pod currently displayed in the
+    /// detail panel. Output goes to the configured capture directory.
+    pub(super) fn start_pod_capture(&mut self) {
+        if !self.pod_detail_panel.is_open() {
+            return;
+        }
+        if self.pod_detail_panel.capture_state().running {
+            return;
+        }
+        let pod = self.pod_detail_panel.pod_name().to_string();
+        let namespace = self.pod_detail_panel.namespace().to_string();
+        if pod.is_empty() {
+            return;
+        }
+
+        let docker = match self.capture_docker() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let target = crate::capture::CaptureTarget::Pod {
+            pod: pod.clone(),
+            namespace: namespace.clone(),
+        };
+        let output_path =
+            crate::capture::default_output_path(&self.config.capture.output_dir, &target);
+        let spec = crate::capture::CaptureSpec {
+            target,
+            output_path: output_path.clone(),
+            image: self.config.capture.image.clone(),
+            iface: self.config.capture.iface.clone(),
+            filter: None,
+            duration: None,
+            max_bytes: None,
+        };
+
+        self.pod_detail_panel.capture_started(output_path.clone());
+        let cancel = CancellationToken::new();
+        self.cancel_token = Some(cancel.clone());
+        let msg_tx = self.message_tx.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::capture::start_capture(spec, docker, msg_tx.clone(), cancel).await
+            {
+                let _ = msg_tx
+                    .send(AppMessage::CaptureFailed(format!(
+                        "Failed to start capture: {}",
+                        e
+                    )))
+                    .await;
+            }
+        });
+
+        self.output
+            .add_info(format!("Capture started → {}", output_path.display()));
+    }
+
+    /// Stop the in-progress capture for the displayed pod.
+    pub(super) fn stop_pod_capture(&mut self) {
+        if !self.pod_detail_panel.capture_state().running {
+            return;
+        }
+        if let Some(token) = self.cancel_token.take() {
+            token.cancel();
+        }
+        self.output.add_info("Stopping capture…");
+    }
+
+    /// Open the most recent capture file in Wireshark via xdg-open / open.
+    pub(super) fn open_capture_in_wireshark(&mut self) {
+        let path = match self.pod_detail_panel.capture_state().output_path.clone() {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Prefer wireshark if installed; fall back to xdg-open / open.
+        let tool = if which_in_path("wireshark") {
+            "wireshark"
+        } else if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+
+        match std::process::Command::new(tool).arg(&path).spawn() {
+            Ok(_) => self
+                .output
+                .add_info(format!("Opening {} in {}", path.display(), tool)),
+            Err(e) => self
+                .output
+                .add_error(format!("Failed to launch {}: {}", tool, e)),
         }
     }
 
@@ -807,6 +921,21 @@ fn collect_targets_recursive(
 }
 
 /// Check if a Kubernetes target matches a pod
+/// Return true if `bin` is found in any directory listed in $PATH.
+fn which_in_path(bin: &str) -> bool {
+    let path = match std::env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+    for dir in std::env::split_paths(&path) {
+        let candidate: PathBuf = dir.join(bin);
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
 fn matches_target(target: &KubernetesTargetOwned, pod: &crate::ui::components::PodStat) -> bool {
     // Check namespace if specified
     if !target.namespace.is_empty() && target.namespace != pod.namespace {

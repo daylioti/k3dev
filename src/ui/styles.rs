@@ -30,12 +30,6 @@ pub struct Styles {
     // Action bar
     pub action_normal: Style,
     pub action_selected: Style,
-    pub action_disabled: Style,
-
-    // Status indicators
-    pub status_connected: Style,
-    pub status_disconnected: Style,
-    pub status_unknown: Style,
 }
 
 impl Styles {
@@ -81,11 +75,6 @@ impl Styles {
                 .fg(palette.highlight)
                 .add_modifier(Modifier::BOLD)
                 .bg(palette.selection_bg),
-            action_disabled: Style::default().fg(palette.muted),
-
-            status_connected: Style::default().fg(palette.success),
-            status_disconnected: Style::default().fg(palette.error),
-            status_unknown: Style::default().fg(palette.warning),
 
             palette,
         }

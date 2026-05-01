@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use std::panic;
 
 mod app;
+mod capture;
 mod cli;
 mod cluster;
 mod commands;
@@ -126,6 +127,49 @@ enum CliCommand {
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Capture network traffic to a .pcap file (Wireshark-compatible).
+    ///
+    /// Either `--pod` or `--container` must be given.
+    #[command(group(
+        clap::ArgGroup::new("capture-target")
+            .required(true)
+            .args(["pod", "container"]),
+    ))]
+    Capture {
+        /// Pod name to capture from (joins the pod's pause container netns).
+        #[arg(long)]
+        pod: Option<String>,
+        /// Namespace for `--pod`.
+        #[arg(short, long, default_value = "default")]
+        namespace: String,
+        /// Docker container name to capture from directly.
+        #[arg(long)]
+        container: Option<String>,
+        /// Network interface to capture on (`-i` flag of tcpdump).
+        #[arg(long, default_value = "any")]
+        iface: String,
+        /// BPF filter, e.g. "port 80 or icmp".
+        #[arg(short, long)]
+        filter: Option<String>,
+        /// Stop after this duration (e.g. "30s", "5m", "1h").
+        #[arg(short, long)]
+        duration: Option<String>,
+        /// Stop after this many bytes (e.g. "100M", "1G").
+        #[arg(long)]
+        max_bytes: Option<String>,
+        /// Explicit output path (overrides `--out-dir`).
+        #[arg(long)]
+        out: Option<String>,
+        /// Directory to write the .pcap file (overrides config).
+        #[arg(long)]
+        out_dir: Option<String>,
+        /// Sidecar Docker image (overrides config).
+        #[arg(long)]
+        image: Option<String>,
+        /// Open the resulting .pcap in Wireshark on stop.
+        #[arg(long)]
+        open: bool,
+    },
 }
 
 impl CliCommand {
@@ -219,6 +263,35 @@ async fn main() -> Result<()> {
             } => {
                 cli::run_cli_exec(config_path, pod, namespace, container.as_deref(), shell_cmd)
                     .await?
+            }
+            CliCommand::Capture {
+                pod,
+                namespace,
+                container,
+                iface,
+                filter,
+                duration,
+                max_bytes,
+                out,
+                out_dir,
+                image,
+                open,
+            } => {
+                cli::run_cli_capture(
+                    config_path,
+                    pod.as_deref(),
+                    namespace,
+                    container.as_deref(),
+                    iface.clone(),
+                    filter.as_deref(),
+                    duration.as_deref(),
+                    max_bytes.as_deref(),
+                    out.as_deref(),
+                    out_dir.as_deref(),
+                    image.as_deref(),
+                    *open,
+                )
+                .await?
             }
             _ => {
                 if let Some(action) = cmd.as_cluster_action() {

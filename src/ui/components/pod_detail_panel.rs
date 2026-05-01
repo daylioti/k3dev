@@ -21,6 +21,7 @@ pub enum DetailTab {
     Timeline,
     Volumes,
     Shell,
+    Capture,
 }
 
 impl DetailTab {
@@ -31,6 +32,7 @@ impl DetailTab {
             DetailTab::Timeline => 2,
             DetailTab::Volumes => 3,
             DetailTab::Shell => 4,
+            DetailTab::Capture => 5,
         }
     }
 
@@ -40,16 +42,48 @@ impl DetailTab {
             1 => DetailTab::Describe,
             2 => DetailTab::Timeline,
             3 => DetailTab::Volumes,
-            _ => DetailTab::Shell,
+            4 => DetailTab::Shell,
+            _ => DetailTab::Capture,
         }
     }
 
     fn count() -> usize {
-        5
+        6
     }
 }
 
-/// Tabbed detail panel for pod inspection (Logs, Describe, Timeline, Volumes, Shell)
+/// Per-tab capture state for the Capture tab.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureTabState {
+    /// Whether a capture is currently running for this pod.
+    pub running: bool,
+    /// Where the .pcap file is being written (set when a capture starts).
+    pub output_path: Option<std::path::PathBuf>,
+    /// Bytes written so far (live).
+    pub bytes: u64,
+    /// Packets captured so far (parsed from tcpdump stderr; may be `None`).
+    pub packets: Option<u64>,
+    /// Last few status lines from tcpdump / orchestrator.
+    pub status_lines: Vec<String>,
+    /// Error message if the capture failed.
+    pub error: Option<String>,
+    /// True once the capture has completed (file exists, ready to open).
+    pub completed: bool,
+}
+
+impl CaptureTabState {
+    const MAX_STATUS_LINES: usize = 50;
+
+    fn push_status(&mut self, line: String) {
+        self.status_lines.push(line);
+        if self.status_lines.len() > Self::MAX_STATUS_LINES {
+            let drop = self.status_lines.len() - Self::MAX_STATUS_LINES;
+            self.status_lines.drain(..drop);
+        }
+    }
+}
+
+/// Tabbed detail panel for pod inspection (Logs, Describe, Timeline, Volumes, Shell, Capture)
 pub struct PodDetailPanel {
     styles: Styles,
     is_open: bool,
@@ -62,10 +96,11 @@ pub struct PodDetailPanel {
     timeline: Option<PodTimeline>,
     volume_entries: Vec<PvcInfo>,
     shell_view: Option<ShellView>,
+    capture: CaptureTabState,
     // Per-tab scroll offset (indexed by DetailTab::index)
-    scroll_offsets: [usize; 5],
+    scroll_offsets: [usize; 6],
     // Loading state per tab
-    loading: [bool; 5],
+    loading: [bool; 6],
     // Whether shell mode is active (keyboard input goes to shell)
     shell_interactive: bool,
 }
@@ -83,8 +118,9 @@ impl PodDetailPanel {
             timeline: None,
             volume_entries: Vec::new(),
             shell_view: None,
-            scroll_offsets: [0; 5],
-            loading: [false; 5],
+            capture: CaptureTabState::default(),
+            scroll_offsets: [0; 6],
+            loading: [false; 6],
             shell_interactive: false,
         }
     }
@@ -100,8 +136,13 @@ impl PodDetailPanel {
         self.timeline = None;
         // Keep volume_entries — they are updated externally and shared across pods
         self.shell_view = None;
-        self.scroll_offsets = [0; 5];
-        self.loading = [false; 5];
+        // Preserve capture state when switching to a different tab on the same pod;
+        // a capture is per-pod and survives tab switches.
+        if !self.capture.running {
+            self.capture = CaptureTabState::default();
+        }
+        self.scroll_offsets = [0; 6];
+        self.loading = [false; 6];
         self.shell_interactive = false;
     }
 
@@ -115,8 +156,9 @@ impl PodDetailPanel {
         self.timeline = None;
         self.volume_entries.clear();
         self.shell_view = None;
-        self.scroll_offsets = [0; 5];
-        self.loading = [false; 5];
+        self.capture = CaptureTabState::default();
+        self.scroll_offsets = [0; 6];
+        self.loading = [false; 6];
         self.shell_interactive = false;
     }
 
@@ -181,6 +223,64 @@ impl PodDetailPanel {
     /// Update volume entries (filtered for this pod by the caller)
     pub fn set_volume_entries(&mut self, entries: Vec<PvcInfo>) {
         self.volume_entries = entries;
+    }
+
+    /// Read-only access to capture tab state.
+    pub fn capture_state(&self) -> &CaptureTabState {
+        &self.capture
+    }
+
+    /// Mark a new capture as starting for the currently-open pod.
+    pub fn capture_started(&mut self, output_path: std::path::PathBuf) {
+        self.capture = CaptureTabState {
+            running: true,
+            output_path: Some(output_path),
+            bytes: 0,
+            packets: None,
+            status_lines: Vec::new(),
+            error: None,
+            completed: false,
+        };
+    }
+
+    /// Append a tcpdump status line to the capture tab.
+    pub fn push_capture_status(&mut self, line: String) {
+        self.capture.push_status(line);
+    }
+
+    /// Update live capture progress (bytes/packets).
+    pub fn set_capture_progress(&mut self, bytes: u64, packets: Option<u64>) {
+        if bytes >= self.capture.bytes {
+            self.capture.bytes = bytes;
+        }
+        if let Some(p) = packets {
+            self.capture.packets = Some(p);
+        }
+    }
+
+    /// Finalise capture state on success.
+    pub fn set_capture_complete(
+        &mut self,
+        path: std::path::PathBuf,
+        bytes: u64,
+        packets: Option<u64>,
+    ) {
+        self.capture.running = false;
+        self.capture.completed = true;
+        self.capture.output_path = Some(path);
+        if bytes >= self.capture.bytes {
+            self.capture.bytes = bytes;
+        }
+        if packets.is_some() {
+            self.capture.packets = packets;
+        }
+    }
+
+    /// Mark capture as failed.
+    pub fn set_capture_failed(&mut self, err: String) {
+        self.capture.running = false;
+        self.capture.completed = false;
+        self.capture.error = Some(err);
     }
 
     /// Mark a tab as loading
@@ -268,6 +368,7 @@ impl PodDetailPanel {
                     3 // placeholder lines
                 }
             }
+            DetailTab::Capture => self.build_capture_lines().len(),
         }
     }
 
@@ -278,6 +379,7 @@ impl PodDetailPanel {
             DetailTab::Timeline => self.build_timeline_lines(),
             DetailTab::Volumes => self.build_volumes_lines(),
             DetailTab::Shell => self.build_shell_lines(),
+            DetailTab::Capture => self.build_capture_lines(),
         }
     }
 
@@ -546,6 +648,80 @@ impl PodDetailPanel {
         ]
     }
 
+    fn build_capture_lines(&self) -> Vec<Line<'_>> {
+        let cap = &self.capture;
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(""));
+
+        let status_text = if let Some(err) = &cap.error {
+            format!("Failed: {}", err)
+        } else if cap.running {
+            format!(
+                "Capturing… {} ({})",
+                format_bytes(cap.bytes),
+                cap.packets
+                    .map(|p| format!("{} packets", p))
+                    .unwrap_or_else(|| "packets: --".to_string())
+            )
+        } else if cap.completed {
+            format!(
+                "Done — {} ({})",
+                format_bytes(cap.bytes),
+                cap.packets
+                    .map(|p| format!("{} packets", p))
+                    .unwrap_or_else(|| "packets: --".to_string())
+            )
+        } else {
+            "Idle — press 's' to start".to_string()
+        };
+        let status_style = if cap.error.is_some() {
+            self.styles.error_text
+        } else if cap.running {
+            self.styles.info_text
+        } else if cap.completed {
+            self.styles.success_text
+        } else {
+            self.styles.muted_text
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Status: ", self.styles.muted_text),
+            Span::styled(status_text, status_style),
+        ]));
+
+        if let Some(path) = &cap.output_path {
+            lines.push(Line::from(vec![
+                Span::styled("  Output: ", self.styles.muted_text),
+                Span::styled(path.display().to_string(), self.styles.normal_text),
+            ]));
+        }
+
+        let actions = if cap.running {
+            "  [x] stop   [Esc] cancel".to_string()
+        } else if cap.completed {
+            "  [s] new   [o] open in Wireshark".to_string()
+        } else {
+            "  [s] start".to_string()
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(actions, self.styles.title)));
+
+        if !cap.status_lines.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  tcpdump:",
+                self.styles.muted_text,
+            )));
+            for line in &cap.status_lines {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", line),
+                    self.styles.normal_text,
+                )));
+            }
+        }
+
+        lines
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         // Tab bar labels — shell tab shows context-sensitive hint
         let shell_label = if self.shell_interactive {
@@ -555,12 +731,20 @@ impl PodDetailPanel {
         } else {
             "Shell(e)"
         };
+        let capture_label = if self.capture.running {
+            "Capture(x)"
+        } else if self.capture.completed {
+            "Capture(o)"
+        } else {
+            "Capture(c)"
+        };
         let tab_titles: Vec<Line> = vec![
             Line::from("Logs(l)"),
             Line::from("Describe(d)"),
             Line::from("Timeline(t)"),
             Line::from("Volumes(v)"),
             Line::from(shell_label),
+            Line::from(capture_label),
         ];
 
         let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
