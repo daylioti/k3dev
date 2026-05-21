@@ -235,6 +235,10 @@ impl App {
                     self.spawn_missing_hosts_check();
                     self.spawn_port_forwards_check();
                     self.spawn_volume_stats_check();
+                    // Fetch pods eagerly instead of waiting for the first
+                    // StatsRefresh tick (~2s of dead time on startup).
+                    self.spawn_pod_stats_check();
+                    self.spawn_pending_pods_check();
                     // Lazily init K8s client now that cluster is running
                     if self.k8s_client.is_none() {
                         let tx = self.message_tx.clone();
@@ -252,6 +256,7 @@ impl App {
                         RefreshTask::IngressRefresh,
                         RefreshTask::HostsCheck,
                         RefreshTask::VolumeRefresh,
+                        RefreshTask::StatsRefresh,
                     ]);
                 }
 

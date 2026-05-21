@@ -1,4 +1,5 @@
 pub mod app;
+pub mod bench;
 pub mod capture;
 pub mod cli;
 pub mod cluster;

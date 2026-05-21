@@ -369,6 +369,27 @@ pub async fn run_cli_preflight(config_path: Option<&str>) -> Result<i32> {
     }
 }
 
+/// Benchmark application startup performance + data-path functionality.
+///
+/// Measures the real code paths the TUI uses on launch and attributes
+/// wall-clock time per phase. Exit code is 0 when every measured phase is
+/// within budget, 1 otherwise. With no running cluster it reports the
+/// cluster-independent phases and exits 0 (nothing to fail).
+pub async fn run_cli_bench(config_path: Option<&str>, json: bool) -> Result<i32> {
+    let (config, _cluster_config) = load_cluster_config(config_path);
+    let _ = crate::logging::init_logging(&config.logging, &config.infrastructure.cluster_name);
+
+    let report = crate::bench::run_bench(config_path).await;
+
+    if json {
+        println!("{}", report.to_json());
+    } else {
+        report.print();
+    }
+
+    Ok(if report.passed { 0 } else { 1 })
+}
+
 /// Update /etc/hosts with ingress entries
 pub async fn run_cli_update_hosts(config_path: Option<&str>) -> Result<i32> {
     use crate::cluster::HostsUpdateResult;

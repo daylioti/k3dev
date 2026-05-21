@@ -29,8 +29,18 @@ Config resolution (when `--config` is not provided) follows the same order as th
 |---------|-------------|
 | `k3dev preflight` | Verify the host is ready to start a cluster (Docker, ports, cgroups, etc.). Non-zero exit on failure. |
 | `k3dev diagnostics` | Run the full diagnostics suite against a running cluster. Non-zero exit if any check fails. |
+| `k3dev bench` | Benchmark k3dev's own startup performance + data-path functionality. Non-zero exit if a phase is over budget. Add `--json` for machine-readable output. |
 
 Output is streamed as each check runs, with a pass/fail summary at the end.
+
+`k3dev bench` times the real code paths the TUI uses on launch — config load,
+`App::new()`, cluster status check, K8s client init, pod listing, Docker pod
+stats — and the end-to-end time until pods become visible after opening k3dev
+(scheduler gating included). Per-phase budgets are overridable via
+`K3DEV_BENCH_<PHASE>_MS` (e.g. `K3DEV_BENCH_TIME_TO_PODS_E2E_MS=4000`). With no
+running cluster, cluster-dependent phases are skipped (exit 0). The
+`test/perf.sh` script and `tests/perf.rs` (run with `K3DEV_PERF=1`) wrap this
+as the one-command automatic trigger.
 
 ## Networking
 

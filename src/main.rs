@@ -11,6 +11,7 @@ use std::io::{self, Write};
 use std::panic;
 
 mod app;
+mod bench;
 mod capture;
 mod cli;
 mod cluster;
@@ -57,6 +58,12 @@ enum CliCommand {
     Diagnostics,
     /// Run preflight checks (verify cluster can start)
     Preflight,
+    /// Benchmark app startup performance (config load, status, time-to-pods)
+    Bench {
+        /// Emit the report as JSON instead of a colored table
+        #[arg(long)]
+        json: bool,
+    },
     /// Update /etc/hosts with ingress entries
     UpdateHosts,
     /// List pods with status
@@ -225,6 +232,7 @@ async fn main() -> Result<()> {
             CliCommand::Docker { args } => run_docker_passthrough(args, config_path).await?,
             CliCommand::Diagnostics => cli::run_cli_diagnostics(config_path).await?,
             CliCommand::Preflight => cli::run_cli_preflight(config_path).await?,
+            CliCommand::Bench { json } => cli::run_cli_bench(config_path, *json).await?,
             CliCommand::UpdateHosts => cli::run_cli_update_hosts(config_path).await?,
             CliCommand::Pods { namespace } => {
                 cli::run_cli_pods(config_path, namespace.as_deref()).await?

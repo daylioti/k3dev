@@ -40,6 +40,19 @@ use std::collections::{HashMap, HashSet};
 
 pub use messages::{AppMessage, InfoBlockResult, InfoBlockStatus};
 
+/// Timing breakdown produced by [`App::bench_time_to_pods`] for `k3dev bench`.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchPodsTiming {
+    /// Total wall-clock time from app start until pods are visible (ms).
+    pub total_ms: f64,
+    /// Time until the first `ClusterStatusUpdate` was handled (ms).
+    pub status_ms: f64,
+    /// Time from status known until both pod stats + pending pods arrived (ms).
+    pub pods_ms: f64,
+    pub running: usize,
+    pub pending: usize,
+}
+
 /// Per-block runtime state for scheduling info block refreshes.
 pub(super) struct InfoBlockRuntime {
     pub(super) cfg: InfoBlock,
@@ -506,6 +519,87 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Headless reproduction of the TUI's startup → "pods visible" sequence,
+    /// used by `k3dev bench`. Drives the *real* status check, message handling
+    /// and `RefreshScheduler` exactly like [`Self::run`] (minus rendering and
+    /// input), so the measured `time_to_pods_e2e` reflects the actual code
+    /// path instead of a hand-coded model that could silently drift from it.
+    pub async fn bench_time_to_pods(&mut self) -> BenchPodsTiming {
+        let clock = Instant::now();
+        let safety_deadline = clock + Duration::from_secs(15);
+
+        // Initial data load — identical to `run()`.
+        self.spawn_status_check();
+
+        let mut status_ms: Option<f64> = None;
+        let mut running = 0usize;
+        let mut pending = 0usize;
+        let mut got_pod_stats = false;
+        let mut got_pending = false;
+
+        loop {
+            // Process async messages — same drain as the `run()` loop.
+            while let Ok(msg) = self.message_rx.try_recv() {
+                match &msg {
+                    AppMessage::ClusterStatusUpdate(s) => {
+                        if status_ms.is_none() {
+                            status_ms = Some(clock.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        if !matches!(s, ClusterStatus::Running) {
+                            self.handle_message(msg);
+                            return BenchPodsTiming {
+                                total_ms: clock.elapsed().as_secs_f64() * 1000.0,
+                                status_ms: status_ms.unwrap_or(0.0),
+                                pods_ms: 0.0,
+                                running: 0,
+                                pending: 0,
+                            };
+                        }
+                    }
+                    AppMessage::PodStatsUpdated(s) => {
+                        got_pod_stats = true;
+                        running = s.len();
+                    }
+                    AppMessage::PendingPodsUpdated(p) => {
+                        got_pending = true;
+                        pending = p.len();
+                    }
+                    _ => {}
+                }
+                self.handle_message(msg);
+            }
+
+            if got_pod_stats && got_pending {
+                break;
+            }
+            if Instant::now() >= safety_deadline {
+                break;
+            }
+
+            // Scheduled refresh tasks — same dispatch as `run()` (only the
+            // pod-relevant task matters for this measurement).
+            for task in self.scheduler.tick() {
+                if task == RefreshTask::StatsRefresh {
+                    self.spawn_pod_stats_check();
+                    self.spawn_pending_pods_check();
+                }
+            }
+
+            // Mirror `run()`'s ~100ms poll cadence.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let total_ms = clock.elapsed().as_secs_f64() * 1000.0;
+        let status_ms = status_ms.unwrap_or(0.0);
+        BenchPodsTiming {
+            total_ms,
+            status_ms,
+            pods_ms: (total_ms - status_ms).max(0.0),
+            running,
+            pending,
+        }
     }
 
     /// Run sudo interactively by temporarily exiting TUI raw mode.
