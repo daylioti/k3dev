@@ -88,7 +88,8 @@ fn skipped(name: &'static str, budget_ms: u64, reason: impl Into<String>) -> Pha
 
 /// Build the shared `ClusterConfig` exactly like the CLI / TUI entry points do.
 fn build_cluster_config(config: &Config) -> Arc<ClusterConfig> {
-    let kubeconfig = (!config.cluster.kubeconfig.is_empty()).then(|| config.cluster.kubeconfig.clone());
+    let kubeconfig =
+        (!config.cluster.kubeconfig.is_empty()).then(|| config.cluster.kubeconfig.clone());
     let context = (!config.cluster.context.is_empty()).then(|| config.cluster.context.clone());
     Arc::new(
         ClusterConfig::from(config.infrastructure.clone())
@@ -216,11 +217,7 @@ pub async fn run_bench(config_path: Option<&str>) -> BenchReport {
             detail,
         });
     } else {
-        phases.push(skipped(
-            "list_pods",
-            b_list,
-            "k8s client unavailable",
-        ));
+        phases.push(skipped("list_pods", b_list, "k8s client unavailable"));
     }
 
     // ---- Phase: docker_pod_stats ------------------------------------------
@@ -233,11 +230,7 @@ pub async fn run_bench(config_path: Option<&str>) -> BenchReport {
             .await
         {
             Ok(s) => Ok(s),
-            Err(_) => {
-                docker
-                    .get_pod_stats(&cluster_config.container_name)
-                    .await
-            }
+            Err(_) => docker.get_pod_stats(&cluster_config.container_name).await,
         }
     }
     .await;
@@ -327,9 +320,7 @@ impl BenchReport {
         println!();
 
         if !self.cluster_running {
-            println!(
-                "\x1b[33m⚠ Cluster not running — cluster-dependent phases skipped.\x1b[0m"
-            );
+            println!("\x1b[33m⚠ Cluster not running — cluster-dependent phases skipped.\x1b[0m");
             println!("\x1b[90m  Start it with `k3dev start`, then re-run `k3dev bench`.\x1b[0m");
         }
 
