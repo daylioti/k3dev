@@ -234,10 +234,21 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history + tags so the release-notes script can diff the range
+          # between the previous tag and this one.
+          fetch-depth: 0
+
+      - name: Generate CodeRabbit release notes
+        run: scripts/coderabbit-release-notes.sh "${GITHUB_REF_NAME}" > release_notes.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -261,6 +272,9 @@ jobs:
         with:
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+          # CodeRabbit PR summaries are prepended; GitHub's auto-generated
+          # "What's Changed" notes are appended below them.
+          body_path: release_notes.md
           generate_release_notes: true
           files: |
             release/*
