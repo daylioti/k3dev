@@ -22,7 +22,10 @@ pub struct FlatMenuItem {
     pub is_group: bool,
     pub is_expanded: bool,
     pub has_children: bool,
-    pub command: Option<CommandEntry>,
+    /// True for an executable leaf (has an `exec`). The actual `CommandEntry`
+    /// is looked up on demand from `Menu::items` via [`Menu::command_at_path`]
+    /// rather than deep-cloned into every flat item.
+    pub is_command: bool,
     pub group_index: usize,
     pub item_path: Vec<usize>,
 }
@@ -78,6 +81,9 @@ pub struct Menu {
     pub(super) info_blocks: Vec<InfoBlockView>,
     // Command entry paths currently hidden by `visible` gates.
     pub(super) hidden_command_paths: HashSet<Vec<usize>>,
+    // Bumped on every `rebuild_flat_items` so callers can detect structural
+    // changes (used to invalidate the pod-highlight cache).
+    revision: u64,
 }
 
 impl Menu {
@@ -108,6 +114,7 @@ impl Menu {
             selected_ingress_path: 0,
             info_blocks: Vec::new(),
             hidden_command_paths: HashSet::new(),
+            revision: 0,
         }
     }
 
@@ -167,6 +174,9 @@ impl Menu {
     /// Replace the set of command paths hidden by `visible` gates and rebuild
     /// the flat item list so the sidebar reflects the new filter immediately.
     pub fn set_hidden_command_paths(&mut self, hidden: HashSet<Vec<usize>>) {
+        if self.hidden_command_paths == hidden {
+            return;
+        }
         self.hidden_command_paths = hidden;
         self.rebuild_flat_items();
     }
@@ -194,6 +204,25 @@ impl Menu {
             .get(group_index)
             .map(|g| g.commands.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Resolve the original `CommandEntry` for an item path
+    /// (`[group_idx, entry_idx, sub_idx, ...]`). Returns `None` for group
+    /// headers (path length 1) or invalid paths.
+    pub fn command_at_path(&self, path: &[usize]) -> Option<&CommandEntry> {
+        let (group_idx, rest) = path.split_first()?;
+        let group = self.items.get(*group_idx)?;
+        let (first, rest) = rest.split_first()?;
+        let mut entry = group.commands.get(*first)?;
+        for &idx in rest {
+            entry = entry.commands.get(idx)?;
+        }
+        Some(entry)
+    }
+
+    /// Monotonic counter bumped whenever the flat item list is rebuilt.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     // === Search Mode ===
@@ -331,39 +360,33 @@ impl Menu {
     fn rebuild_flat_items(&mut self) {
         self.flat_items.clear();
 
-        // Collect data first to avoid borrow issues
-        let items_data: Vec<(String, String, Vec<CommandEntry>, bool)> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(idx, group)| {
-                let is_expanded = self.expanded.get(idx).copied().unwrap_or(true);
-                (
-                    group.name.clone(),
-                    group.icon.clone(),
-                    group.commands.clone(),
-                    is_expanded,
-                )
-            })
-            .collect();
+        // Disjoint field borrows let us read the command tree while pushing into
+        // flat_items, so no cloning of `CommandEntry` is needed (each flat item
+        // keeps only its `item_path` and looks the entry up on demand).
+        let items = &self.items;
+        let expanded = &self.expanded;
+        let hidden = &self.hidden_command_paths;
+        let flat = &mut self.flat_items;
 
-        for (group_idx, (name, icon, commands, is_expanded)) in items_data.into_iter().enumerate() {
+        for (group_idx, group) in items.iter().enumerate() {
+            let is_expanded = expanded.get(group_idx).copied().unwrap_or(true);
+
             // Add group header
-            self.flat_items.push(FlatMenuItem {
-                name,
-                icon,
+            flat.push(FlatMenuItem {
+                name: group.name.clone(),
+                icon: group.icon.clone(),
                 level: 0,
                 is_group: true,
                 is_expanded,
-                has_children: !commands.is_empty(),
-                command: None,
+                has_children: !group.commands.is_empty(),
+                is_command: false,
                 group_index: group_idx,
                 item_path: vec![group_idx],
             });
 
             // If group is expanded, add its children
             if is_expanded {
-                self.flatten_entries(commands, 1, group_idx, vec![group_idx]);
+                flatten_entries(&group.commands, 1, group_idx, &[group_idx], hidden, flat);
             }
         }
 
@@ -371,50 +394,14 @@ impl Menu {
         if self.selected_index >= self.flat_items.len() {
             self.selected_index = self.flat_items.len().saturating_sub(1);
         }
-    }
 
-    fn flatten_entries(
-        &mut self,
-        entries: Vec<CommandEntry>,
-        level: usize,
-        group_idx: usize,
-        parent_path: Vec<usize>,
-    ) {
-        for (idx, entry) in entries.into_iter().enumerate() {
-            let mut path = parent_path.clone();
-            path.push(idx);
-
-            // Skip entries gated by a `visible` probe that hasn't passed.
-            // Descendants are skipped implicitly by not recursing.
-            if self.hidden_command_paths.contains(&path) {
-                continue;
-            }
-
-            let has_children = !entry.commands.is_empty();
-            let is_expanded = has_children; // Nested items always expanded for simplicity
-            let children = entry.commands.clone();
-
-            self.flat_items.push(FlatMenuItem {
-                name: entry.name.clone(),
-                icon: String::new(),
-                level,
-                is_group: false,
-                is_expanded,
-                has_children,
-                command: if entry.exec.is_some() {
-                    Some(entry)
-                } else {
-                    None
-                },
-                group_index: group_idx,
-                item_path: path.clone(),
-            });
-
-            // Recurse if has children
-            if has_children && is_expanded {
-                self.flatten_entries(children, level + 1, group_idx, path);
-            }
+        // Rebuilt flat_items invalidate the old filtered indices; refresh them so
+        // move_up/move_down don't write a stale out-of-range index.
+        if self.search_mode {
+            self.update_filter();
         }
+
+        self.revision = self.revision.wrapping_add(1);
     }
 
     // === Navigation ===
@@ -527,6 +514,49 @@ impl Menu {
             true
         } else {
             false
+        }
+    }
+}
+
+/// Flatten a slice of command entries into display rows, skipping `visible`-gated
+/// paths. Free function (rather than a `&mut self` method) so the caller can hold
+/// disjoint borrows of `Menu`'s fields and avoid cloning the command tree.
+fn flatten_entries(
+    entries: &[CommandEntry],
+    level: usize,
+    group_idx: usize,
+    parent_path: &[usize],
+    hidden: &HashSet<Vec<usize>>,
+    out: &mut Vec<FlatMenuItem>,
+) {
+    for (idx, entry) in entries.iter().enumerate() {
+        let mut path = parent_path.to_vec();
+        path.push(idx);
+
+        // Skip entries gated by a `visible` probe that hasn't passed.
+        // Descendants are skipped implicitly by not recursing.
+        if hidden.contains(&path) {
+            continue;
+        }
+
+        let has_children = !entry.commands.is_empty();
+        let is_expanded = has_children; // Nested items always expanded for simplicity
+
+        out.push(FlatMenuItem {
+            name: entry.name.clone(),
+            icon: String::new(),
+            level,
+            is_group: false,
+            is_expanded,
+            has_children,
+            is_command: entry.exec.is_some(),
+            group_index: group_idx,
+            item_path: path.clone(),
+        });
+
+        // Recurse if has children
+        if has_children && is_expanded {
+            flatten_entries(&entry.commands, level + 1, group_idx, &path, hidden, out);
         }
     }
 }

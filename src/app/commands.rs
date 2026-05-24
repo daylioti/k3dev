@@ -545,17 +545,14 @@ impl App {
 
     /// Lazily build a shared DockerManager for capture sidecars.
     fn capture_docker(&mut self) -> Option<Arc<crate::cluster::DockerManager>> {
-        if self.docker_manager.is_none() {
-            match crate::cluster::DockerManager::from_default_socket() {
-                Ok(m) => self.docker_manager = Some(Arc::new(m)),
-                Err(e) => {
-                    self.output
-                        .add_error(format!("Capture: Docker connect failed: {}", e));
-                    return None;
-                }
+        match self.ensure_docker_manager() {
+            Some(d) => Some(d),
+            None => {
+                self.output
+                    .add_error("Capture: Docker connect failed (see logs for details)");
+                None
             }
         }
-        self.docker_manager.clone()
     }
 
     /// Start a tcpdump capture for the pod currently displayed in the
@@ -827,7 +824,7 @@ impl App {
         let mut targets: Vec<KubernetesTargetOwned> = Vec::new();
 
         // For leaf commands, use the target directly
-        if let Some(cmd) = &selected.command {
+        if let Some(cmd) = self.menu.command_at_path(&selected.item_path) {
             if let Some(exec) = &cmd.exec {
                 if let Some(t) = kubernetes_target_owned(&exec.target) {
                     targets.push(t);
@@ -850,7 +847,7 @@ impl App {
                     if item.level <= selected_level {
                         break;
                     }
-                    if let Some(cmd) = &item.command {
+                    if let Some(cmd) = self.menu.command_at_path(&item.item_path) {
                         if let Some(exec) = &cmd.exec {
                             if let Some(t) = kubernetes_target_owned(&exec.target) {
                                 targets.push(t);
@@ -876,7 +873,21 @@ impl App {
 
     /// Update pod highlights based on currently selected menu item
     pub(super) fn update_pod_highlights(&mut self) {
-        if self.focus == FocusArea::Content {
+        let focus_content = self.focus == FocusArea::Content;
+        // Skip the recompute when nothing affecting the highlight set changed:
+        // focus, the selected menu item, the menu structure, or the pod list.
+        let key = (
+            focus_content,
+            self.menu.selected_index(),
+            self.menu.revision(),
+            self.pods_generation,
+        );
+        if self.highlight_cache_key == Some(key) {
+            return;
+        }
+        self.highlight_cache_key = Some(key);
+
+        if focus_content {
             let highlighted = self.compute_highlighted_pods();
             if !highlighted.is_empty() {
                 tracing::debug!(count = highlighted.len(), pods = ?highlighted, "Highlighting pods");
