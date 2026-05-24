@@ -203,6 +203,14 @@ pub struct App {
     pub(super) hidden_command_paths: HashSet<Vec<usize>>,
     // Info-block indices currently hidden.
     pub(super) hidden_info_blocks: HashSet<usize>,
+    // Set when a command-visibility flip needs a (deferred) menu+palette rebuild.
+    pub(super) visibility_menu_dirty: bool,
+
+    // Bumped whenever the pod list is replaced; part of the highlight cache key.
+    pub(super) pods_generation: u64,
+    // Last inputs the pod-highlight set was computed for, to skip redundant
+    // recomputes: (focus is Content, selected menu index, menu revision, pods gen).
+    pub(super) highlight_cache_key: Option<(bool, usize, u64, u64)>,
 }
 
 impl App {
@@ -384,6 +392,9 @@ impl App {
             visibility_tasks,
             hidden_command_paths,
             hidden_info_blocks,
+            visibility_menu_dirty: false,
+            pods_generation: 0,
+            highlight_cache_key: None,
         })
     }
 
@@ -406,10 +417,10 @@ impl App {
                 } else {
                     self.hidden_command_paths.insert(path);
                 }
-                self.menu
-                    .set_hidden_command_paths(self.hidden_command_paths.clone());
-                self.command_palette
-                    .load_custom_commands(&self.config.commands, &self.hidden_command_paths);
+                // Defer the (expensive) menu + palette rebuild — both deep-clone
+                // the command tree — so a startup burst of probes flipping at
+                // once rebuilds a single time instead of once per probe.
+                self.visibility_menu_dirty = true;
             }
             VisibilityTarget::InfoBlock { index } => {
                 if visible {
@@ -422,26 +433,52 @@ impl App {
         }
     }
 
+    /// Apply any pending command-visibility changes to the menu + palette in a
+    /// single rebuild. Called once per event-loop pass after messages drain so
+    /// multiple probe results in the same pass collapse into one rebuild.
+    pub(super) fn flush_visibility_changes(&mut self) {
+        if !self.visibility_menu_dirty {
+            return;
+        }
+        self.visibility_menu_dirty = false;
+        self.menu
+            .set_hidden_command_paths(self.hidden_command_paths.clone());
+        self.command_palette
+            .load_custom_commands(&self.config.commands, &self.hidden_command_paths);
+    }
+
     /// Run the application event loop
     pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         // Initial data load
         self.spawn_status_check();
 
+        // Redraw only when something changed this pass. The first frame always
+        // draws; idle passes skip the render (the 100ms event poll still wakes
+        // us, and the 500ms blink tick guarantees a periodic redraw).
+        let mut needs_redraw = true;
+
         loop {
-            // Render and capture layout
-            terminal.draw(|frame| {
-                let longest_menu_item = self.menu.longest_item_width();
-                self.current_layout = Some(AppLayout::calculate_with_config(
-                    frame.area(),
-                    &self.config.ui,
-                    longest_menu_item,
-                    self.menu_width_offset,
-                ));
-                self.render(frame);
-            })?;
+            if needs_redraw {
+                // Render and capture layout
+                terminal.draw(|frame| {
+                    let longest_menu_item = self.menu.longest_item_width();
+                    self.current_layout = Some(AppLayout::calculate_with_config(
+                        frame.area(),
+                        &self.config.ui,
+                        longest_menu_item,
+                        self.menu_width_offset,
+                    ));
+                    self.render(frame);
+                })?;
+                needs_redraw = false;
+            }
+
+            // Whether anything changed this pass; if so, redraw on the next one.
+            let mut activity = false;
 
             // Handle events with timeout for async messages
             if event::poll(Duration::from_millis(100))? {
+                activity = true;
                 match event::read()? {
                     Event::Key(key) => self.handle_key(key.code, key.modifiers),
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -452,15 +489,21 @@ impl App {
             // Process async messages
             while let Ok(msg) = self.message_rx.try_recv() {
                 self.handle_message(msg);
+                activity = true;
             }
+
+            // Collapse any command-visibility flips from this pass into one rebuild.
+            self.flush_visibility_changes();
 
             // Handle pending interactive sudo (needs terminal access)
             if let Some((content, count)) = self.pending_sudo_hosts_content.take() {
                 self.run_interactive_sudo_hosts_update(terminal, &content, count);
+                activity = true;
             }
 
             // Process scheduled refresh tasks
             for task in self.scheduler.tick() {
+                activity = true;
                 match task {
                     RefreshTask::BlinkToggle => {
                         self.menu.toggle_blink();
@@ -510,7 +553,12 @@ impl App {
                     if let Some(session) = &self.shell_session {
                         session.resize(rows, cols);
                     }
+                    activity = true;
                 }
+            }
+
+            if activity {
+                needs_redraw = true;
             }
 
             if self.should_quit {
@@ -705,13 +753,17 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut ratatui::Frame) {
-        let longest_menu_item = self.menu.longest_item_width();
-        let layout = AppLayout::calculate_with_config(
-            frame.area(),
-            &self.config.ui,
-            longest_menu_item,
-            self.menu_width_offset,
-        );
+        // Reuse the layout the draw closure already computed and stored this
+        // frame; only recompute as a fallback (avoids a second full menu scan
+        // + layout calc every frame).
+        let layout = self.current_layout.clone().unwrap_or_else(|| {
+            AppLayout::calculate_with_config(
+                frame.area(),
+                &self.config.ui,
+                self.menu.longest_item_width(),
+                self.menu_width_offset,
+            )
+        });
 
         let is_cluster_stopped = !matches!(
             self.cluster_status,

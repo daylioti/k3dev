@@ -502,8 +502,11 @@ impl App {
                 if let Some(item) = self.menu.selected_item() {
                     if item.has_children {
                         self.menu.toggle();
-                    } else if let Some(cmd) = &item.command {
-                        self.execute_command(cmd.clone());
+                    } else if item.is_command {
+                        let path = item.item_path.clone();
+                        if let Some(cmd) = self.menu.command_at_path(&path).cloned() {
+                            self.execute_command(cmd);
+                        }
                     }
                 }
             }
@@ -680,8 +683,11 @@ impl App {
                     if item.has_children {
                         self.menu.toggle();
                         self.update_pod_highlights();
-                    } else if let Some(cmd) = &item.command {
-                        self.execute_command(cmd.clone());
+                    } else if item.is_command {
+                        let path = item.item_path.clone();
+                        if let Some(cmd) = self.menu.command_at_path(&path).cloned() {
+                            self.execute_command(cmd);
+                        }
                     }
                 }
             }

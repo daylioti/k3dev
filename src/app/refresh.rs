@@ -28,6 +28,22 @@ impl App {
         matches!(self.cluster_status, ClusterStatus::Running)
     }
 
+    /// Lazily build and cache a shared `DockerManager`, returning a clone of the
+    /// cached `Arc`. Periodic refresh tasks reuse this instead of reconnecting
+    /// to the Docker socket on every tick.
+    pub(super) fn ensure_docker_manager(&mut self) -> Option<Arc<DockerManager>> {
+        if self.docker_manager.is_none() {
+            match DockerManager::from_default_socket() {
+                Ok(m) => self.docker_manager = Some(Arc::new(m)),
+                Err(e) => {
+                    tracing::warn!("Failed to connect shared DockerManager: {}", e);
+                    return None;
+                }
+            }
+        }
+        self.docker_manager.clone()
+    }
+
     pub(super) fn spawn_status_check(&self) {
         let message_tx = self.message_tx.clone();
         let cluster_config = Arc::clone(&self.cluster_config);
@@ -124,7 +140,7 @@ impl App {
         });
     }
 
-    pub(super) fn spawn_pod_stats_check(&self) {
+    pub(super) fn spawn_pod_stats_check(&mut self) {
         if !self.cluster_is_running() {
             let message_tx = self.message_tx.clone();
             tokio::spawn(async move {
@@ -133,17 +149,25 @@ impl App {
             return;
         }
 
+        let docker = match self.ensure_docker_manager() {
+            Some(d) => d,
+            None => {
+                let message_tx = self.message_tx.clone();
+                tokio::spawn(async move {
+                    let _ = message_tx.send(AppMessage::PodStatsUpdated(vec![])).await;
+                });
+                return;
+            }
+        };
         let message_tx = self.message_tx.clone();
         let container_name = self.cluster_config.container_name.clone();
         let timeout = self.refresh_config.docker_stats_timeout;
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let docker = DockerManager::from_default_socket()
-                    .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
                 // Try agent first, fall back to direct cgroup reads
                 match docker.get_pod_stats_via_agent(&container_name).await {
-                    Ok(stats) => Ok(stats),
+                    Ok(stats) => Ok::<_, anyhow::Error>(stats),
                     Err(_) => docker.get_pod_stats(&container_name).await,
                 }
             })
@@ -171,6 +195,7 @@ impl App {
             return;
         }
 
+        let cached_k8s = self.k8s_client.clone();
         let message_tx = self.message_tx.clone();
         let kubeconfig = self.cluster_config.kubeconfig.clone();
         let context = self.cluster_config.context.clone();
@@ -178,7 +203,12 @@ impl App {
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let k8s_client = K8sClient::new(kubeconfig.as_deref(), context.as_deref()).await?;
+                // Reuse the lazily-initialized client when available instead of
+                // re-reading kubeconfig + TLS setup on every tick.
+                let k8s_client = match cached_k8s {
+                    Some(c) => c,
+                    None => K8sClient::new(kubeconfig.as_deref(), context.as_deref()).await?,
+                };
                 k8s_client.list_pending_pods().await
             })
             .await;
@@ -248,11 +278,16 @@ impl App {
         }
     }
 
-    pub(super) fn spawn_volume_stats_check(&self) {
+    pub(super) fn spawn_volume_stats_check(&mut self) {
         if !self.cluster_is_running() {
             return;
         }
 
+        let docker = match self.ensure_docker_manager() {
+            Some(d) => d,
+            None => return,
+        };
+        let cached_k8s = self.k8s_client.clone();
         let message_tx = self.message_tx.clone();
         let kubeconfig = self.cluster_config.kubeconfig.clone();
         let context = self.cluster_config.context.clone();
@@ -262,20 +297,20 @@ impl App {
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let docker = DockerManager::from_default_socket()
-                    .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
-
                 // 1. Get volume stats via docker exec + container mounts (PVC dirs, sizes, pod mapping)
                 let volume_stats = docker
                     .get_volume_stats(&container_name, &storage_path)
                     .await;
 
-                // 2. Get PVC metadata from K8s API (single call: capacity, phase, storage_class)
-                let pvc_metadata =
-                    match K8sClient::new(kubeconfig.as_deref(), context.as_deref()).await {
+                // 2. Get PVC metadata from K8s API (single call: capacity, phase, storage_class).
+                //    Reuse the cached client when available, otherwise connect once.
+                let pvc_metadata = match cached_k8s {
+                    Some(k8s) => k8s.list_pvc_metadata().await.unwrap_or_default(),
+                    None => match K8sClient::new(kubeconfig.as_deref(), context.as_deref()).await {
                         Ok(k8s) => k8s.list_pvc_metadata().await.unwrap_or_default(),
                         Err(_) => std::collections::HashMap::new(),
-                    };
+                    },
+                };
 
                 // 3. Merge: filesystem data + K8s metadata → Vec<PvcInfo>
                 let fs_stats = volume_stats.unwrap_or_default();
@@ -369,18 +404,20 @@ impl App {
     }
 
     /// Check image architectures for running pods (spawned when new pods appear)
-    pub(super) fn spawn_image_arch_check(&self) {
+    pub(super) fn spawn_image_arch_check(&mut self) {
         if !self.cluster_is_running() {
             return;
         }
 
+        let docker = match self.ensure_docker_manager() {
+            Some(d) => d,
+            None => return,
+        };
         let message_tx = self.message_tx.clone();
         let timeout = self.refresh_config.docker_stats_timeout;
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let docker = DockerManager::from_default_socket()
-                    .map_err(|_| anyhow::anyhow!("Failed to create DockerManager"))?;
                 Ok::<_, anyhow::Error>(docker.get_pod_image_architectures().await)
             })
             .await;
