@@ -174,6 +174,9 @@ impl Menu {
     /// Replace the set of command paths hidden by `visible` gates and rebuild
     /// the flat item list so the sidebar reflects the new filter immediately.
     pub fn set_hidden_command_paths(&mut self, hidden: HashSet<Vec<usize>>) {
+        if self.hidden_command_paths == hidden {
+            return;
+        }
         self.hidden_command_paths = hidden;
         self.rebuild_flat_items();
     }
@@ -390,6 +393,12 @@ impl Menu {
         // Ensure selected index is valid
         if self.selected_index >= self.flat_items.len() {
             self.selected_index = self.flat_items.len().saturating_sub(1);
+        }
+
+        // Rebuilt flat_items invalidate the old filtered indices; refresh them so
+        // move_up/move_down don't write a stale out-of-range index.
+        if self.search_mode {
+            self.update_filter();
         }
 
         self.revision = self.revision.wrapping_add(1);

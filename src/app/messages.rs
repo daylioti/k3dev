@@ -686,6 +686,9 @@ impl App {
         // Invalidate the pod-highlight cache so the next navigation recomputes
         // against the refreshed pod list.
         self.pods_generation = self.pods_generation.wrapping_add(1);
+        // Recompute now so highlights track the refreshed pod list immediately
+        // instead of staying stale until the next navigation/focus event.
+        self.update_pod_highlights();
 
         // Auto-open detail panel when a pod is selected
         self.ensure_detail_panel_synced();
