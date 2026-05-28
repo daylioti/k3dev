@@ -108,6 +108,9 @@ pub enum AppMessage {
     /// Capture failed (orchestrator/Docker error).
     CaptureFailed(String),
 
+    /// A newer release than the running build was found (version string)
+    UpdateAvailable(String),
+
     /// Error message
     Error(String),
 
@@ -270,6 +273,8 @@ impl App {
                     self.menu
                         .set_missing_hosts(std::collections::HashSet::new());
                     self.pod_stats.set_pods(Vec::new());
+                    // Hide `type: pod` gated entries now that no pods exist.
+                    self.recompute_pod_visibility();
                     self.volume_entries_cache.clear();
                 }
             }
@@ -491,6 +496,10 @@ impl App {
             AppMessage::K8sClientReady(client) => {
                 self.k8s_client = client;
             }
+            AppMessage::UpdateAvailable(version) => {
+                tracing::info!(latest = %version, "Newer k3dev release available");
+                self.update_available_version = Some(version);
+            }
             AppMessage::Error(msg) => {
                 tracing::error!("{}", msg);
                 self.output.add_error(&msg);
@@ -683,6 +692,10 @@ impl App {
         }
 
         self.pod_stats.set_pods(pod_stats);
+        // Re-evaluate `type: pod` visibility gates against the fresh list so
+        // gated commands/info-blocks appear as soon as pods are known (~200ms)
+        // instead of waiting for the next 5s visibility probe.
+        self.recompute_pod_visibility();
         // Invalidate the pod-highlight cache so the next navigation recomputes
         // against the refreshed pod list.
         self.pods_generation = self.pods_generation.wrapping_add(1);

@@ -481,6 +481,11 @@ impl App {
             if task.in_flight {
                 continue;
             }
+            // `type: pod` gates are evaluated in-memory against the pod list
+            // (see `recompute_pod_visibility`), not via a per-probe K8s query.
+            if matches!(task.check, VisibleCheck::Pod { .. }) {
+                continue;
+            }
             if now.duration_since(task.last_run) < task.interval {
                 continue;
             }
@@ -563,5 +568,94 @@ impl App {
                 .send(AppMessage::InfoBlockUpdated { index, result })
                 .await;
         });
+    }
+
+    /// One-shot check at startup: fetch the latest GitHub release and, if it is
+    /// newer than the running build, notify the UI. Fails silently on any
+    /// network/parse error so an offline machine sees no noise.
+    pub(super) fn spawn_version_check(&self) {
+        let message_tx = self.message_tx.clone();
+
+        tokio::spawn(async move {
+            let Some(latest) = fetch_latest_release_version().await else {
+                return;
+            };
+            if is_newer(&latest, env!("CARGO_PKG_VERSION")) {
+                let _ = message_tx.send(AppMessage::UpdateAvailable(latest)).await;
+            }
+        });
+    }
+}
+
+/// Query the GitHub Releases API for the latest published `k3dev` release and
+/// return its version (the `tag_name` with any leading `v` stripped).
+async fn fetch_latest_release_version() -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Release {
+        tag_name: String,
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    let release: Release = client
+        .get("https://api.github.com/repos/daylioti/k3dev/releases/latest")
+        .header(reqwest::header::USER_AGENT, "k3dev")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    Some(release.tag_name.trim_start_matches('v').trim().to_string())
+}
+
+/// Parse a `major.minor.patch` version, ignoring any leading `v` and any
+/// pre-release/build suffix. Missing minor/patch components default to 0.
+fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
+    let core = v.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next().unwrap_or(core);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Whether `latest` is a strictly newer semantic version than `current`.
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_semver(latest), parse_semver(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_newer, parse_semver};
+
+    #[test]
+    fn parses_versions_with_optional_prefix_and_suffix() {
+        assert_eq!(parse_semver("0.1.0"), Some((0, 1, 0)));
+        assert_eq!(parse_semver("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver("v2.0"), Some((2, 0, 0)));
+        assert_eq!(parse_semver("1.4.0-rc.1"), Some((1, 4, 0)));
+        assert_eq!(parse_semver("not-a-version"), None);
+    }
+
+    #[test]
+    fn detects_newer_releases() {
+        assert!(is_newer("0.2.0", "0.1.0"));
+        assert!(is_newer("v1.0.0", "0.9.9"));
+        assert!(is_newer("0.1.1", "0.1.0"));
+        assert!(!is_newer("0.1.0", "0.1.0"));
+        assert!(!is_newer("0.1.0", "0.2.0"));
+        assert!(!is_newer("garbage", "0.1.0"));
     }
 }

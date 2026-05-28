@@ -8,6 +8,8 @@ pub struct AppLayout {
     pub action_bar: Rect,
     pub menu: Rect,
     pub pod_stats: Rect,
+    /// Single line at the very bottom, outside all panel borders (version line)
+    pub footer: Rect,
 }
 
 impl AppLayout {
@@ -18,17 +20,19 @@ impl AppLayout {
         longest_menu_item: u16,
         menu_width_offset: i16,
     ) -> Self {
-        // Vertical split: action bar | content
+        // Vertical split: action bar | content | footer
         let vertical = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1), // Action bar (compact, no borders)
                 Constraint::Min(10),   // Content area
+                Constraint::Length(1), // Footer (version line, outside borders)
             ])
             .split(area);
 
         let action_bar = vertical[0];
         let content_area = vertical[1];
+        let footer = vertical[2];
 
         // Calculate column widths
         let total_width = content_area.width;
@@ -56,6 +60,7 @@ impl AppLayout {
             action_bar,
             menu: horizontal[0],
             pod_stats: horizontal[1],
+            footer,
         }
     }
 }

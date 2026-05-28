@@ -191,6 +191,9 @@ pub struct App {
     // Menu width offset from user adjustments (+/- keys)
     menu_width_offset: i16,
 
+    // Latest release version, set only when newer than the running build
+    update_available_version: Option<String>,
+
     // Whether auto-preflight has been triggered for stopped screen
     preflight_auto_triggered: bool,
 
@@ -387,6 +390,7 @@ impl App {
             keybinding_resolver,
             current_layout: None,
             menu_width_offset: 0,
+            update_available_version: None,
             preflight_auto_triggered: false,
             info_blocks,
             visibility_tasks,
@@ -447,10 +451,37 @@ impl App {
             .load_custom_commands(&self.config.commands, &self.hidden_command_paths);
     }
 
+    /// Re-evaluate every `type: pod` visibility gate against the in-memory pod
+    /// list (running + pending) instead of issuing a per-probe K8s query. The
+    /// pod list is already fetched eagerly when the cluster comes up (~200ms),
+    /// so gated commands/info-blocks appear as soon as it lands rather than
+    /// waiting out the 5s probe interval. Called whenever the pod list changes.
+    pub(super) fn recompute_pod_visibility(&mut self) {
+        let updates: Vec<(usize, bool)> = self
+            .visibility_tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(id, task)| match &task.check {
+                VisibleCheck::Pod {
+                    namespace,
+                    selector,
+                } => Some((
+                    id,
+                    pod_gate_matches(namespace, selector, self.pod_stats.pods()),
+                )),
+                _ => None,
+            })
+            .collect();
+        for (id, visible) in updates {
+            self.apply_visibility_update(id, visible);
+        }
+    }
+
     /// Run the application event loop
     pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         // Initial data load
         self.spawn_status_check();
+        self.spawn_version_check();
 
         // Redraw only when something changed this pass. The first frame always
         // draws; idle passes skip the render (the 100ms event poll still wakes
@@ -780,6 +811,9 @@ impl App {
             self.render_running_screen(frame, &layout);
         }
 
+        // Version line at the very bottom, outside all panel borders
+        self.render_footer(frame, layout.footer);
+
         // Render modal overlays
         if self.mode == AppMode::Help {
             self.help_overlay.render(frame, frame.area());
@@ -799,6 +833,26 @@ impl App {
         if self.mode == AppMode::Diagnostics {
             self.diagnostics_overlay.render(frame, frame.area());
         }
+    }
+
+    /// Render the bottom version line, outside all panel borders. Shows the
+    /// running build's version and, when the startup check found a newer
+    /// release, an "update available" notice.
+    fn render_footer(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        let mut spans = vec![ratatui::text::Span::styled(
+            format!(" {} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            self.styles.muted_text,
+        )];
+
+        if let Some(latest) = &self.update_available_version {
+            spans.push(ratatui::text::Span::styled(
+                format!("  \u{2191} v{latest} available"),
+                self.styles.warning_text,
+            ));
+        }
+
+        let paragraph = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(spans));
+        frame.render_widget(paragraph, area);
     }
 
     /// Render the stopped screen: action list (left) + preflight results (right)
@@ -910,5 +964,91 @@ fn seed_command_visibility(
         let mut child_path = path.clone();
         child_path.push(child_idx);
         seed_command_visibility(child, child_path, now, tasks, hidden);
+    }
+}
+
+/// True if any pod in `pods` satisfies a `type: pod` visibility gate, matched
+/// in-memory against the pod list. Mirrors the selector-by-name convention used
+/// for pod highlighting (`matches_target` in `commands.rs`): a `key=value`
+/// selector matches when `value` is a substring of the pod name (e.g.
+/// `app.kubernetes.io/name=drupal` matches pod `drupal-6dd5cc4b66-…`). A
+/// namespace-only gate matches any pod in that namespace.
+fn pod_gate_matches(
+    namespace: &str,
+    selector: &str,
+    pods: &[crate::ui::components::PodStat],
+) -> bool {
+    pods.iter().any(|pod| {
+        if !namespace.is_empty() && namespace != pod.namespace {
+            return false;
+        }
+        if selector.is_empty() {
+            return !namespace.is_empty();
+        }
+        selector.split(',').any(|part| {
+            matches!(part.trim().split_once('='), Some((_key, value)) if pod.name.contains(value))
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pod_gate_matches;
+    use crate::ui::components::{PodStat, PodState};
+
+    fn pod(name: &str, namespace: &str) -> PodStat {
+        PodStat {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            state: PodState::Running,
+            cpu_percent: 0.0,
+            cpu_limit_millicores: 0.0,
+            memory_used_mb: 0.0,
+            memory_limit_mb: 0.0,
+            arch_mismatch: false,
+        }
+    }
+
+    #[test]
+    fn selector_value_matches_pod_name_substring() {
+        let pods = [pod("drupal-6dd5cc4b66-6lzqh", "default")];
+        // `app.kubernetes.io/name=drupal` → value "drupal" is a substring of the pod name.
+        assert!(pod_gate_matches(
+            "default",
+            "app.kubernetes.io/name=drupal",
+            &pods
+        ));
+        // A non-matching selector value stays hidden.
+        assert!(!pod_gate_matches(
+            "default",
+            "app.kubernetes.io/name=varnish",
+            &pods
+        ));
+    }
+
+    #[test]
+    fn namespace_must_match() {
+        let pods = [pod("drupal-6dd5cc4b66-6lzqh", "default")];
+        assert!(!pod_gate_matches(
+            "other-ns",
+            "app.kubernetes.io/name=drupal",
+            &pods
+        ));
+    }
+
+    #[test]
+    fn empty_selector_matches_any_pod_in_namespace() {
+        let pods = [pod("drupal-abc", "default")];
+        assert!(pod_gate_matches("default", "", &pods));
+        assert!(!pod_gate_matches("kube-system", "", &pods));
+    }
+
+    #[test]
+    fn no_pods_means_hidden() {
+        assert!(!pod_gate_matches(
+            "default",
+            "app.kubernetes.io/name=drupal",
+            &[]
+        ));
     }
 }
