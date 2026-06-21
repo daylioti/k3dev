@@ -26,6 +26,7 @@ infrastructure:
   cluster_name: "k3dev"        # used for container ({name}-server) + network ({name}-net)
   domain: "local.k8s.dev"      # default domain for ingresses
   k3s_version: "v1.35.2-k3s1"  # k3s image tag
+  k3s_image_repo: "ghcr.io/daylioti/k3dev-k3s"  # image repo; tag is k3s_version. See note below.
   api_port: 6443
   http_port: 80
   https_port: 443
@@ -166,6 +167,19 @@ hooks:
       workdir: "~/projects/myapp"
       continue_on_error: true
 ```
+
+## K3s image (`k3s_image_repo`)
+
+The cluster image is `{k3s_image_repo}:{k3s_version}`. The default repo,
+`ghcr.io/daylioti/k3dev-k3s`, is a k3dev-published rebuild of `rancher/k3s` with the
+`socat` and `k3dev-agent` helpers baked in, so a fresh cluster comes up without
+runtime binary injection. Tags mirror the upstream `rancher/k3s` tags exactly
+(e.g. `v1.35.2-k3s1`), and images are published for `linux/amd64` and `linux/arm64`.
+
+Set `k3s_image_repo: "rancher/k3s"` to use the upstream image instead; k3dev then
+injects the helpers into the running container at startup (the previous behavior).
+Only the tags published to the chosen repo are available — the k3dev image is built
+for the latest patch of the newest four k3s minor lines.
 
 ## Command target types
 

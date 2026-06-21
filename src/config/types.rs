@@ -282,6 +282,12 @@ pub struct InfrastructureConfig {
     #[serde(default = "default_k3s_version")]
     pub k3s_version: String,
 
+    /// Container image repository for k3s (the tag is k3s_version).
+    /// Defaults to the k3dev-published image (socat + k3dev-agent baked in).
+    /// Override to "rancher/k3s" to use the upstream image instead.
+    #[serde(default = "default_k3s_image_repo")]
+    pub k3s_image_repo: String,
+
     /// Kubernetes API port
     #[serde(default = "default_api_port")]
     pub api_port: u16,
@@ -355,6 +361,10 @@ fn default_k3s_version() -> String {
     "v1.35.2-k3s1".to_string()
 }
 
+fn default_k3s_image_repo() -> String {
+    "ghcr.io/daylioti/k3dev-k3s".to_string()
+}
+
 fn default_api_port() -> u16 {
     6443
 }
@@ -373,6 +383,7 @@ impl Default for InfrastructureConfig {
             cluster_name: default_cluster_name(),
             domain: default_domain(),
             k3s_version: default_k3s_version(),
+            k3s_image_repo: default_k3s_image_repo(),
             api_port: default_api_port(),
             http_port: default_http_port(),
             https_port: default_https_port(),
