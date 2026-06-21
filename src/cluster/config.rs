@@ -183,9 +183,11 @@ mod tests {
 
     #[test]
     fn k3s_image_honors_overridden_repo() {
-        let mut config = ClusterConfig::default();
-        config.k3s_image_repo = "rancher/k3s".to_string();
-        config.k3s_version = "v1.30.0-k3s1".to_string();
+        let config = ClusterConfig {
+            k3s_image_repo: "rancher/k3s".to_string(),
+            k3s_version: "v1.30.0-k3s1".to_string(),
+            ..Default::default()
+        };
         assert_eq!(config.k3s_image(), "rancher/k3s:v1.30.0-k3s1");
     }
 }
