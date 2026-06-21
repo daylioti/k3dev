@@ -1,0 +1,224 @@
+name: Build k3s images
+
+# Builds custom multi-arch k3s images (rancher/k3s + socat + k3dev-agent baked in)
+# and pushes them to GitHub Container Registry (ghcr.io).
+#
+# Versions are auto-discovered: the latest patch of the newest 4 k3s minor lines
+# (matching the Kubernetes N-3 support window). Override with workflow_dispatch.
+#
+# Image: ghcr.io/<owner>/k3dev-k3s:<version>  (tag mirrors rancher/k3s exactly)
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC — refresh as new k3s patches land.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: 'Comma-separated k3s versions to build (e.g. v1.35.2-k3s1,v1.34.6-k3s1). Leave empty to auto-discover.'
+        required: false
+        default: ''
+  push:
+    branches: [main, master]
+    paths:
+      - docker/k3dev-k3s.Dockerfile
+      - .github/workflows/build-k3s-images.yml
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/k3dev-k3s
+
+jobs:
+  discover:
+    name: Discover k3s versions
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.pick.outputs.versions }}
+      newest: ${{ steps.pick.outputs.newest }}
+    steps:
+      - name: Select versions
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OVERRIDE: ${{ github.event.inputs.versions }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${OVERRIDE// /}" ]]; then
+            echo "Using overridden versions: ${OVERRIDE}"
+            versions=()
+            IFS=',' read -ra parts <<< "${OVERRIDE}"
+            for p in "${parts[@]}"; do
+              p="$(echo "$p" | xargs)"   # trim whitespace
+              [[ -n "$p" ]] && versions+=("$p")
+            done
+          else
+            # Stable k3s release tags look like v1.35.2+k3s1 (rc/alpha excluded by regex).
+            mapfile -t all < <(gh api repos/k3s-io/k3s/releases --paginate \
+              --jq '.[] | select(.prerelease == false) | .tag_name' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$' | sort -V)
+
+            if [[ ${#all[@]} -eq 0 ]]; then
+              echo "::error::No stable k3s releases found"
+              exit 1
+            fi
+
+            # Highest patch/k3sN per minor line (ascending sort → last wins).
+            declare -A best
+            for t in "${all[@]}"; do
+              minor="$(sed -E 's/^(v[0-9]+\.[0-9]+)\..*/\1/' <<< "$t")"
+              best["$minor"]="$t"
+            done
+
+            # Newest 4 minor lines.
+            mapfile -t minors < <(printf '%s\n' "${!best[@]}" | sort -V | tail -4)
+            versions=()
+            for m in "${minors[@]}"; do
+              # Docker Hub tag form uses '-k3s1', release tags use '+k3s1'.
+              versions+=("${best[$m]/+/-}")
+            done
+          fi
+
+          if [[ ${#versions[@]} -eq 0 ]]; then
+            echo "::error::No versions selected"
+            exit 1
+          fi
+
+          json="$(printf '%s\n' "${versions[@]}" | jq -R . | jq -cs .)"
+          newest="${versions[${#versions[@]}-1]}"
+
+          echo "Selected versions: ${json}"
+          echo "Newest (tagged :latest): ${newest}"
+          echo "versions=${json}" >> "$GITHUB_OUTPUT"
+          echo "newest=${newest}" >> "$GITHUB_OUTPUT"
+
+  helpers:
+    name: Build helper binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust + musl targets
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93"
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build k3dev-agent (amd64 + arm64)
+        run: |
+          set -euo pipefail
+          mkdir -p helpers
+          cross build --release --target x86_64-unknown-linux-musl  --manifest-path agent/Cargo.toml
+          cross build --release --target aarch64-unknown-linux-musl --manifest-path agent/Cargo.toml
+          cp agent/target/x86_64-unknown-linux-musl/release/k3dev-agent  helpers/k3dev-agent-amd64
+          cp agent/target/aarch64-unknown-linux-musl/release/k3dev-agent helpers/k3dev-agent-arm64
+
+      - name: Build socat (amd64 + arm64)
+        run: |
+          set -euo pipefail
+          SOCAT_VERSION="1.8.0.3"
+          # Pinned upstream source checksum — the integrity guarantee for the
+          # download. dest-unreach.org serves a self-signed cert, so TLS can't be
+          # trusted (HTTPS would fail validation); this hash is what defeats a MITM,
+          # since a tampered tarball won't match and the build aborts.
+          #
+          # When bumping SOCAT_VERSION, update this hash too. Get the new value and
+          # cross-check it against a distro (e.g. Alpine aports sha512sums) — do not
+          # trust the upstream download.sha256sum (same insecure channel):
+          #   curl -sk https://www.dest-unreach.org/socat/download/socat-<ver>.tar.gz | sha512sum
+          SOCAT_SHA512="600a3387e9756e0937d2db49de9066df03d9818e4042da6b72109d1b5688dd72352754773a19bd2558fe93ec6a8a73e80e7cf2602fd915960f66c403fd89beef"
+          build_socat() {
+            local arch="$1" platform="$2"
+            docker run --rm --platform "${platform}" \
+              -v "$PWD/helpers:/out" \
+              alpine:3.21 sh -c "
+                apk add -q build-base linux-headers && \
+                wget -q http://www.dest-unreach.org/socat/download/socat-${SOCAT_VERSION}.tar.gz \
+                  -O /tmp/socat.tar.gz && \
+                echo '${SOCAT_SHA512}  /tmp/socat.tar.gz' | sha512sum -c - && \
+                cd /tmp && tar xzf socat.tar.gz && cd socat-${SOCAT_VERSION} && \
+                CFLAGS='-static -Os' LDFLAGS='-static -s' ./configure \
+                  --disable-openssl --disable-readline --disable-libwrap --disable-fips \
+                  >/dev/null 2>&1 && \
+                make -j\$(nproc) >/dev/null 2>&1 && \
+                strip socat && \
+                cp socat /out/socat-${arch}"
+          }
+          build_socat amd64 linux/amd64
+          build_socat arm64 linux/arm64
+
+      - name: Verify helper binaries
+        run: |
+          set -euo pipefail
+          ls -lh helpers
+          for f in k3dev-agent-amd64 k3dev-agent-arm64 socat-amd64 socat-arm64; do
+            file "helpers/$f" | grep -q ELF || { echo "::error::helpers/$f is not an ELF binary"; exit 1; }
+          done
+
+      - name: Upload helpers artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helpers
+          path: helpers/
+
+  build-push:
+    name: Build & push ${{ matrix.version }}
+    needs: [discover, helpers]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.discover.outputs.versions) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download helpers artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: helpers
+          path: helpers
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          set -euo pipefail
+          tags="${IMAGE}:${{ matrix.version }}"
+          if [[ "${{ matrix.version }}" == "${{ needs.discover.outputs.newest }}" ]]; then
+            tags="${tags},${IMAGE}:latest"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: helpers
+          file: docker/k3dev-k3s.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            K3S_VERSION=${{ matrix.version }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: true
+          provenance: false

@@ -17,6 +17,7 @@ pub struct ClusterConfig {
 
     // Kubernetes
     pub k3s_version: String,
+    pub k3s_image_repo: String,
     pub domain: String,
 
     // Container settings
@@ -63,6 +64,7 @@ impl From<InfrastructureConfig> for ClusterConfig {
             kubeconfig: None,
             context: None,
             k3s_version: infra.k3s_version,
+            k3s_image_repo: infra.k3s_image_repo,
             domain: infra.domain,
             container_name,
             network_name,
@@ -87,6 +89,7 @@ impl Default for ClusterConfig {
             context: None,
 
             k3s_version: infra.k3s_version,
+            k3s_image_repo: infra.k3s_image_repo,
             domain: infra.domain,
 
             container_name,
@@ -107,7 +110,7 @@ impl Default for ClusterConfig {
 impl ClusterConfig {
     /// Get the k3s image name
     pub fn k3s_image(&self) -> String {
-        format!("rancher/k3s:{}", self.k3s_version)
+        format!("{}:{}", self.k3s_image_repo, self.k3s_version)
     }
 
     /// Get kubeconfig path
@@ -162,5 +165,29 @@ impl ClusterConfig {
         self.kubeconfig = kubeconfig;
         self.context = context;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn k3s_image_uses_default_ghcr_repo() {
+        let config = ClusterConfig::default();
+        assert_eq!(
+            config.k3s_image(),
+            format!("ghcr.io/daylioti/k3dev-k3s:{}", config.k3s_version)
+        );
+    }
+
+    #[test]
+    fn k3s_image_honors_overridden_repo() {
+        let config = ClusterConfig {
+            k3s_image_repo: "rancher/k3s".to_string(),
+            k3s_version: "v1.30.0-k3s1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config.k3s_image(), "rancher/k3s:v1.30.0-k3s1");
     }
 }

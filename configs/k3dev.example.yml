@@ -28,6 +28,11 @@ infrastructure:
   # K3s version
   k3s_version: "v1.35.2-k3s1"
 
+  # K3s image repository (the tag is k3s_version).
+  # Defaults to the k3dev-published image with socat + k3dev-agent baked in.
+  # Set to "rancher/k3s" to use the upstream image (helpers are then injected at runtime).
+  # k3s_image_repo: "ghcr.io/daylioti/k3dev-k3s"
+
   # Ports
   api_port: 6443
   http_port: 80
