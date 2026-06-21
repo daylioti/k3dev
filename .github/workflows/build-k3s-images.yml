@@ -123,6 +123,16 @@ jobs:
         run: |
           set -euo pipefail
           SOCAT_VERSION="1.8.0.3"
+          # Pinned upstream source checksum — the integrity guarantee for the
+          # download. dest-unreach.org serves a self-signed cert, so TLS can't be
+          # trusted (HTTPS would fail validation); this hash is what defeats a MITM,
+          # since a tampered tarball won't match and the build aborts.
+          #
+          # When bumping SOCAT_VERSION, update this hash too. Get the new value and
+          # cross-check it against a distro (e.g. Alpine aports sha512sums) — do not
+          # trust the upstream download.sha256sum (same insecure channel):
+          #   curl -sk https://www.dest-unreach.org/socat/download/socat-<ver>.tar.gz | sha512sum
+          SOCAT_SHA512="600a3387e9756e0937d2db49de9066df03d9818e4042da6b72109d1b5688dd72352754773a19bd2558fe93ec6a8a73e80e7cf2602fd915960f66c403fd89beef"
           build_socat() {
             local arch="$1" platform="$2"
             docker run --rm --platform "${platform}" \
@@ -131,6 +141,7 @@ jobs:
                 apk add -q build-base linux-headers && \
                 wget -q http://www.dest-unreach.org/socat/download/socat-${SOCAT_VERSION}.tar.gz \
                   -O /tmp/socat.tar.gz && \
+                echo '${SOCAT_SHA512}  /tmp/socat.tar.gz' | sha512sum -c - && \
                 cd /tmp && tar xzf socat.tar.gz && cd socat-${SOCAT_VERSION} && \
                 CFLAGS='-static -Os' LDFLAGS='-static -s' ./configure \
                   --disable-openssl --disable-readline --disable-libwrap --disable-fips \
