@@ -59,6 +59,49 @@ fn main() {
 
     println!("cargo:rerun-if-changed=agent/src/main.rs");
     println!("cargo:rerun-if-changed=agent/Cargo.toml");
+
+    emit_version(&project_dir);
+}
+
+/// Embed the version as `K3DEV_VERSION`. Locally this is derived from git tags
+/// so dev builds report an accurate version without hand-editing Cargo.toml. In
+/// CI release builds the shallow checkout has no tags, so `git describe` fails
+/// and we fall back to `CARGO_PKG_VERSION`, which the release workflow sets from
+/// the pushed tag (this also covers cross-compilation containers, where host
+/// env vars aren't forwarded but the mounted Cargo.toml is already patched).
+fn emit_version(project_dir: &Path) {
+    let version = git_describe(project_dir)
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    println!("cargo:rustc-env=K3DEV_VERSION={}", version);
+
+    // Rebuild when the checked-out commit or tags change so the embedded
+    // version stays fresh.
+    for rel in [".git/HEAD", ".git/packed-refs", ".git/refs/tags"] {
+        let path = project_dir.join(rel);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+/// `git describe --tags` with the leading `v` stripped, or `None` when git is
+/// unavailable or no tag is reachable (e.g. a shallow CI checkout).
+fn git_describe(dir: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["describe", "--tags"])
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = String::from_utf8(output.stdout).ok()?;
+    let version = version.trim().trim_start_matches('v').trim();
+    if version.is_empty() {
+        None
+    } else {
+        Some(version.to_string())
+    }
 }
 
 /// Check if a binary needs to be (re)built: missing, placeholder, or not a valid ELF.

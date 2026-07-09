@@ -32,6 +32,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set crate version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          perl -i -pe 'if (!$done && s/^version = "[^"]*"/version = "'"$VERSION"'"/) { $done = 1 }' Cargo.toml
+          grep -m1 '^version' Cargo.toml
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
@@ -192,6 +198,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set crate version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          perl -i -pe 'if (!$done && s/^version = "[^"]*"/version = "'"$VERSION"'"/) { $done = 1 }' Cargo.toml
+          grep -m1 '^version' Cargo.toml
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master

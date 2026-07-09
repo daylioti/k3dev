@@ -1,6 +1,6 @@
 [package]
 name = "k3dev"
-version = "0.1.0"
+version = "0.2.3"
 edition = "2021"
 description = "TUI for local k3s cluster development"
 authors = ["daylioti"]

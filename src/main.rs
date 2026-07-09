@@ -28,7 +28,7 @@ use ui::components::ClusterAction;
 
 #[derive(Parser)]
 #[command(name = "k3dev")]
-#[command(version = "0.1.0")]
+#[command(version = env!("K3DEV_VERSION"))]
 #[command(about = "TUI for local k3s cluster development")]
 struct Cli {
     /// Path to configuration file

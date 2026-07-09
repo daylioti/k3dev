@@ -580,7 +580,7 @@ impl App {
             let Some(latest) = fetch_latest_release_version().await else {
                 return;
             };
-            if is_newer(&latest, env!("CARGO_PKG_VERSION")) {
+            if is_newer(&latest, env!("K3DEV_VERSION")) {
                 let _ = message_tx.send(AppMessage::UpdateAvailable(latest)).await;
             }
         });

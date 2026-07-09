@@ -840,7 +840,7 @@ impl App {
     /// release, an "update available" notice.
     fn render_footer(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         let mut spans = vec![ratatui::text::Span::styled(
-            format!(" {} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+            format!(" {} v{}", env!("CARGO_PKG_NAME"), env!("K3DEV_VERSION")),
             self.styles.muted_text,
         )];
 
