@@ -714,8 +714,7 @@ impl DockerManager {
                 // Success, or the volume doesn't exist — nothing more to do.
                 Ok(()) => return Ok(()),
                 Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404,
-                    ..
+                    status_code: 404, ..
                 }) => return Ok(()),
                 Err(e) => {
                     if attempt == 4 {
