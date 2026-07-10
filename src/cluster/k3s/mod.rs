@@ -537,6 +537,24 @@ impl K3sManager {
             .send(OutputLine::info("Deleting k3s cluster..."))
             .await;
 
+        // While the container is still alive, unmount kubelet/local-path mounts
+        // from inside it. k3s runs with /var/lib/docker bind-mounted rshared, so
+        // those mounts propagate into the host mount namespace and are NOT
+        // cleaned up when the container is force-killed. Left behind they pin the
+        // PV volume ("device or resource busy"), so its data survives a destroy
+        // and old pods reappear on the next start. Unmounting inside the running
+        // container propagates the unmount back to the host and frees the volume.
+        if self
+            .docker
+            .container_running(&self.config.container_name)
+            .await
+        {
+            let _ = output_tx
+                .send(OutputLine::info("Unmounting cluster volumes..."))
+                .await;
+            self.unmount_leaked_mounts().await;
+        }
+
         // Force-remove k3s container (skip stop - force remove handles it)
         if self
             .docker
@@ -585,6 +603,31 @@ impl K3sManager {
             .send(OutputLine::success("K3s cluster deleted"))
             .await;
         Ok(())
+    }
+
+    /// Lazily unmount kubelet and local-path-provisioner mounts from inside the
+    /// running k3s container. Because /var/lib/docker is bind-mounted rshared,
+    /// the unmounts propagate back to the host and free the k3dev volumes for
+    /// removal. Errors are non-fatal (best-effort cleanup).
+    async fn unmount_leaked_mounts(&self) {
+        let docker_root = self.docker.get_docker_root_dir().await;
+        let root = docker_root.trim_end_matches('/');
+        // Unmount deepest paths first (sort -r) so parent mounts are freed after
+        // their children. Covers pod mounts under kubelet/ and the local-path/PV
+        // and rancher volume data directories.
+        let script = format!(
+            "awk '{{print $2}}' /proc/mounts | \
+             grep -E '^{root}/(kubelet|volumes/(k3s-local-pv-data|k3s-rancher-data))(/|$)' | \
+             sort -r | while read m; do umount -l \"$m\" 2>/dev/null || true; done",
+            root = root,
+        );
+        if let Err(e) = self
+            .docker
+            .exec_in_container(&self.config.container_name, &["sh", "-c", &script])
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to unmount leaked cluster mounts before delete");
+        }
     }
 
     /// Get cluster info

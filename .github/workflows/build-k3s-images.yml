@@ -7,6 +7,20 @@ name: Build k3s images
 # (matching the Kubernetes N-3 support window). Override with workflow_dispatch.
 #
 # Image: ghcr.io/<owner>/k3dev-k3s:<version>  (tag mirrors rancher/k3s exactly)
+#
+# INVARIANT — this workflow is APPEND-ONLY. It must never delete, prune, or
+# overwrite existing image tags. Version tags are immutable (they mirror k3s
+# releases and are unique); only `:latest` moves, which does NOT remove the
+# versioned image it previously pointed at. Do not add delete-package-versions,
+# retention, or any cleanup step here.
+#
+# Old versions can still "disappear" from ghcr.io via a GHCR retention policy
+# configured in the package settings UI (outside this repo). If tags go missing,
+# check/disable it at:
+#   https://github.com/users/<owner>/packages/container/k3dev-k3s/settings
+# and audit versions with (needs a PAT with read:packages):
+#   gh api users/<owner>/packages/container/k3dev-k3s/versions \
+#     --jq '.[].metadata.container.tags'
 
 on:
   schedule:
@@ -211,6 +225,8 @@ jobs:
           fi
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
 
+      # Append-only: each tag here is a unique, immutable k3s version (plus the
+      # moving `:latest`). This step never overwrites or removes prior versions.
       - name: Build & push
         uses: docker/build-push-action@v6
         with:

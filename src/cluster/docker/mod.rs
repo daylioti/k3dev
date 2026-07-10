@@ -670,13 +670,62 @@ impl DockerManager {
         Ok(())
     }
 
-    /// Remove a Docker volume
+    /// Remove a Docker volume.
+    ///
+    /// The k3dev volume names are shared constants, so a stale container left
+    /// over from a previous cluster (e.g. a differently-named config) can pin
+    /// the volume and make removal fail with "volume is in use". Any container
+    /// referencing these volumes belongs to k3dev, so force-remove them first
+    /// to guarantee the volume (and its etcd/PV state) is actually deleted.
+    ///
+    /// Docker releases a volume's reference count asynchronously after a
+    /// container is removed, so removal can still report "in use" immediately
+    /// after force-removing the holder. Retry a few times to absorb that lag.
     pub async fn remove_volume(&self, name: &str) -> Result<()> {
-        // Ignore errors - volume might not exist
-        let _ = self
-            .client
-            .remove_volume(name, Some(RemoveVolumeOptions { force: true }))
-            .await;
+        for attempt in 0..5 {
+            // Force-remove any container still referencing this volume.
+            let mut filters = HashMap::new();
+            filters.insert("volume".to_string(), vec![name.to_string()]);
+            if let Ok(containers) = self
+                .client
+                .list_containers(Some(ListContainersOptions {
+                    all: true,
+                    filters: Some(filters),
+                    ..Default::default()
+                }))
+                .await
+            {
+                let names: Vec<String> = containers
+                    .into_iter()
+                    .filter_map(|c| c.names)
+                    .flatten()
+                    .map(|n| n.trim_start_matches('/').to_string())
+                    .collect();
+                for container in names {
+                    let _ = self.remove_container(&container, true).await;
+                }
+            }
+
+            match self
+                .client
+                .remove_volume(name, Some(RemoveVolumeOptions { force: true }))
+                .await
+            {
+                // Success, or the volume doesn't exist — nothing more to do.
+                Ok(()) => return Ok(()),
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                }) => return Ok(()),
+                Err(e) => {
+                    if attempt == 4 {
+                        tracing::warn!(volume = %name, error = %e, "Failed to remove volume after retries");
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        }
         Ok(())
     }
 
