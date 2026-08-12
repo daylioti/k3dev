@@ -30,6 +30,7 @@ pub enum StartOutcome {
 }
 
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -556,6 +557,12 @@ impl K3sManager {
                 .await
         };
 
+        // Ask kubelet which pods are ours while it can still answer: its state
+        // directory names one directory per pod UID, including pods that never
+        // got past the sandbox and so own no container mounts to be found by
+        // `owned_pod_containers` later.
+        let pod_uids = self.kubelet_pod_uids().await;
+
         // Force-remove the k3s container first (skip stop - force remove handles
         // it). Killing kubelet up front means nothing recreates pod containers
         // or re-mounts volumes while the rest of the teardown runs.
@@ -580,13 +587,26 @@ impl K3sManager {
             .await;
         // Best effort: a transient Docker listing failure must not skip the
         // host-state, network, volume and kubeconfig cleanup that follows.
-        if let Err(e) = self.docker.cleanup_containers_by_prefix("k8s_").await {
-            let _ = output_tx
-                .send(OutputLine::warning(format!(
-                    "Could not list pod containers: {}",
-                    e
-                )))
-                .await;
+        match self.owned_pod_containers(&pod_uids).await {
+            Ok((mine, foreign)) => {
+                self.docker.remove_containers(&mine).await;
+                if foreign > 0 {
+                    let _ = output_tx
+                        .send(OutputLine::info(format!(
+                            "Left {} pod container(s) from another Kubernetes install untouched",
+                            foreign
+                        )))
+                        .await;
+                }
+            }
+            Err(e) => {
+                let _ = output_tx
+                    .send(OutputLine::warning(format!(
+                        "Could not list pod containers: {}",
+                        e
+                    )))
+                    .await;
+            }
         }
 
         // Kubelet and local-path mounts made inside the k3s container propagate
@@ -666,6 +686,93 @@ impl K3sManager {
         }
 
         Ok(())
+    }
+
+    /// Pod UID from a kubelet container name, which Docker formats as
+    /// `k8s_{container}_{pod}_{namespace}_{uid}_{attempt}` (pod, namespace and
+    /// container names are DNS-1123, so they never contain an underscore).
+    fn pod_uid(container_name: &str) -> Option<&str> {
+        container_name
+            .strip_prefix("k8s_")
+            .and_then(|rest| rest.split('_').nth(3))
+    }
+
+    /// Pod UIDs kubelet currently tracks, read from the one-directory-per-pod
+    /// layout of its state dir. Empty when the cluster is not running - the
+    /// state dir lives under Docker's root and is only readable as root.
+    async fn kubelet_pod_uids(&self) -> Vec<String> {
+        if !self
+            .docker
+            .container_running(&self.config.container_name)
+            .await
+        {
+            return Vec::new();
+        }
+        let docker_root = self.docker.get_docker_root_dir().await;
+        let pods_dir = format!("{}/pods", Self::kubelet_root_dir(&docker_root));
+        // Destroy exists to clean up broken clusters, so a container that is
+        // running but wedged must not stall it: give up and fall back to the
+        // mounts of the pod containers themselves.
+        let exec = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.docker
+                .exec_in_container(&self.config.container_name, &["ls", "-1", &pods_dir]),
+        )
+        .await;
+        match exec {
+            // Any non-UID noise is harmless: a UID only matters when it also
+            // appears in a container name.
+            Ok(Ok(out)) => out.lines().map(|l| l.trim().to_string()).collect(),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "Could not list kubelet pod state");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::warn!("Timed out listing kubelet pod state");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Splits the host daemon's `k8s_*` containers into the ones this cluster
+    /// created and a count of the ones it did not, so `delete` never touches
+    /// another Kubernetes install's workloads.
+    ///
+    /// Every kubelet on a shared Docker daemon names its containers `k8s_*`, so
+    /// the prefix identifies a pod container but not its owner. Ownership comes
+    /// from the pod UID instead: k3dev runs kubelet with
+    /// `--kubelet-arg=root-dir={docker_root}/kubelet`, so pod state mounted from
+    /// that path is ours, and `kubelet_pod_uids` covers the pods that have no
+    /// such mount yet. The UID then claims the whole pod, including its sandbox
+    /// (`k8s_POD_*`), which carries no mounts of its own.
+    async fn owned_pod_containers(
+        &self,
+        kubelet_pod_uids: &[String],
+    ) -> Result<(Vec<String>, usize)> {
+        let docker_root = self.docker.get_docker_root_dir().await;
+        let pods_dir = format!("{}/pods/", Self::kubelet_root_dir(&docker_root));
+        let containers = self.docker.list_containers_with_mounts("k8s_").await?;
+
+        let mut owned: HashSet<&str> = kubelet_pod_uids.iter().map(String::as_str).collect();
+        owned.extend(
+            containers
+                .iter()
+                .flat_map(|c| &c.mounts)
+                .filter_map(|m| m.source.strip_prefix(pods_dir.as_str()))
+                .filter_map(|pod_path| pod_path.split('/').next()),
+        );
+
+        // Docker's name filter matches a substring, so drop what only happens to
+        // contain `k8s_` before splitting the rest by owner.
+        let (mine, foreign): (Vec<_>, Vec<_>) = containers
+            .iter()
+            .filter(|c| c.container_name.starts_with("k8s_"))
+            .partition(|c| Self::pod_uid(&c.container_name).is_some_and(|uid| owned.contains(uid)));
+
+        Ok((
+            mine.into_iter().map(|c| c.container_name.clone()).collect(),
+            foreign.len(),
+        ))
     }
 
     /// Shell script that releases the cluster state left in the host mount
@@ -845,6 +952,28 @@ impl K3sManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pod_uid_reads_the_uid_field_of_kubelet_container_names() {
+        let uid = "7117180a-b65d-4815-adaa-bdc9a993c36a";
+
+        assert_eq!(
+            K3sManager::pod_uid(&format!(
+                "k8s_coredns_coredns-54996dc9b4-94mw9_kube-system_{uid}_1"
+            )),
+            Some(uid)
+        );
+        // The sandbox of the same pod resolves to the same UID
+        assert_eq!(
+            K3sManager::pod_uid(&format!(
+                "k8s_POD_coredns-54996dc9b4-94mw9_kube-system_{uid}_1"
+            )),
+            Some(uid)
+        );
+        // Containers that merely contain `k8s_` are not pod containers
+        assert_eq!(K3sManager::pod_uid("my_k8s_thing"), None);
+        assert_eq!(K3sManager::pod_uid("k8s_too_short"), None);
+    }
 
     #[test]
     fn host_cleanup_script_targets_cluster_paths_only() {

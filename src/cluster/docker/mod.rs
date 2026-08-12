@@ -627,31 +627,27 @@ impl DockerManager {
                 .filter_map(|m| Some(MountSource { source: m.source? }))
                 .collect();
 
-            result.push(ContainerMountInfo { pod_name, mounts });
+            result.push(ContainerMountInfo {
+                container_name,
+                pod_name,
+                mounts,
+            });
         }
 
         Ok(result)
     }
 
-    /// Force-remove all containers with a name prefix (parallel)
-    pub async fn cleanup_containers_by_prefix(&self, prefix: &str) -> Result<()> {
-        let containers = self.list_containers_by_prefix(prefix).await?;
-
-        if containers.is_empty() {
-            return Ok(());
-        }
-
-        // Force-remove all containers in parallel (no need to stop first)
-        let futures: Vec<_> = containers
-            .into_iter()
-            .map(|container| async move {
-                let _ = self.remove_container(&container, true).await;
+    /// Force-remove the given containers in parallel (no need to stop first).
+    /// Individual removal failures are ignored (best effort).
+    pub async fn remove_containers(&self, names: &[String]) {
+        let futures: Vec<_> = names
+            .iter()
+            .map(|name| async move {
+                let _ = self.remove_container(name, true).await;
             })
             .collect();
 
         futures_util::future::join_all(futures).await;
-
-        Ok(())
     }
 
     // === Network Operations ===
@@ -1159,6 +1155,7 @@ impl DockerManager {
 
 /// Container with parsed pod info and volume mounts
 pub struct ContainerMountInfo {
+    pub container_name: String,
     pub pod_name: String,
     pub mounts: Vec<MountSource>,
 }
