@@ -228,6 +228,16 @@ impl DockerManager {
             .map(|s| s.to_string())
     }
 
+    /// Exit code of a stopped container (`None` while it runs or when unknown)
+    pub async fn container_exit_code(&self, name: &str) -> Option<i64> {
+        self.client
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+            .ok()
+            .and_then(|info| info.state)
+            .and_then(|state| state.exit_code)
+    }
+
     /// Start a stopped container
     pub async fn start_container(&self, name: &str) -> Result<()> {
         self.client
@@ -250,18 +260,34 @@ impl DockerManager {
             .with_context(|| format!("Failed to stop container {}", name))
     }
 
-    /// Remove a container
+    /// Remove a container together with its anonymous volumes.
+    ///
+    /// All persistent k3dev state lives in *named* volumes, so the anonymous
+    /// volumes Docker creates for the k3s image's `VOLUME` directories
+    /// (`/var/lib/cni`, `/var/lib/kubelet`, `/var/log`) are throwaway. Without
+    /// `v` they survive every container removal and pile up as dangling volumes.
     pub async fn remove_container(&self, name: &str, force: bool) -> Result<()> {
         self.client
             .remove_container(
                 name,
                 Some(RemoveContainerOptions {
                     force,
+                    v: true,
                     ..Default::default()
                 }),
             )
             .await
             .with_context(|| format!("Failed to remove container {}", name))
+    }
+
+    /// Get the image a container was created from
+    pub async fn container_image(&self, name: &str) -> Option<String> {
+        self.client
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+            .ok()
+            .and_then(|info| info.config)
+            .and_then(|config| config.image)
     }
 
     /// Send a signal to a running container.
@@ -528,7 +554,11 @@ impl DockerManager {
         Ok(port_map)
     }
 
-    /// List containers by name prefix
+    /// List containers by name prefix.
+    ///
+    /// Docker's `name` filter matches a substring anywhere in the name, so the
+    /// results are post-filtered on the real prefix - otherwise a `k8s_` lookup
+    /// would also return unrelated containers like `my_k8s_thing`.
     pub async fn list_containers_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![prefix.to_string()]);
@@ -548,6 +578,7 @@ impl DockerManager {
             .filter_map(|c| c.names)
             .flatten()
             .map(|n| n.trim_start_matches('/').to_string())
+            .filter(|n| n.starts_with(prefix))
             .collect();
 
         Ok(names)
@@ -596,31 +627,27 @@ impl DockerManager {
                 .filter_map(|m| Some(MountSource { source: m.source? }))
                 .collect();
 
-            result.push(ContainerMountInfo { pod_name, mounts });
+            result.push(ContainerMountInfo {
+                container_name,
+                pod_name,
+                mounts,
+            });
         }
 
         Ok(result)
     }
 
-    /// Force-remove all containers with a name prefix (parallel)
-    pub async fn cleanup_containers_by_prefix(&self, prefix: &str) -> Result<()> {
-        let containers = self.list_containers_by_prefix(prefix).await?;
-
-        if containers.is_empty() {
-            return Ok(());
-        }
-
-        // Force-remove all containers in parallel (no need to stop first)
-        let futures: Vec<_> = containers
-            .into_iter()
-            .map(|container| async move {
-                let _ = self.remove_container(&container, true).await;
+    /// Force-remove the given containers in parallel (no need to stop first).
+    /// Individual removal failures are ignored (best effort).
+    pub async fn remove_containers(&self, names: &[String]) {
+        let futures: Vec<_> = names
+            .iter()
+            .map(|name| async move {
+                let _ = self.remove_container(name, true).await;
             })
             .collect();
 
         futures_util::future::join_all(futures).await;
-
-        Ok(())
     }
 
     // === Network Operations ===
@@ -1128,6 +1155,7 @@ impl DockerManager {
 
 /// Container with parsed pod info and volume mounts
 pub struct ContainerMountInfo {
+    pub container_name: String,
     pub pod_name: String,
     pub mounts: Vec<MountSource>,
 }

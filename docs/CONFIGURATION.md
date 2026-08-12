@@ -25,7 +25,7 @@ cluster:
 infrastructure:
   cluster_name: "k3dev"        # used for container ({name}-server) + network ({name}-net)
   domain: "local.k8s.dev"      # default domain for ingresses
-  k3s_version: "v1.35.2-k3s1"  # k3s image tag
+  k3s_version: "latest"        # k3s image tag; pin e.g. "v1.35.2-k3s1" for a fixed version
   k3s_image_repo: "ghcr.io/daylioti/k3dev-k3s"  # image repo; tag is k3s_version. See note below.
   api_port: 6443
   http_port: 80
@@ -175,6 +175,15 @@ The cluster image is `{k3s_image_repo}:{k3s_version}`. The default repo,
 `socat` and `k3dev-agent` helpers baked in, so a fresh cluster comes up without
 runtime binary injection. Tags mirror the upstream `rancher/k3s` tags exactly
 (e.g. `v1.35.2-k3s1`), and images are published for `linux/amd64` and `linux/arm64`.
+
+`k3s_version` defaults to `latest`, which tracks the newest k3s release published to
+the repo. Note that Docker only resolves a tag when the image is missing locally, so
+an already-pulled `latest` keeps being reused until you `docker rmi` it. Snapshots stay
+valid too, since the snapshot hash is over the tag string, not the resolved digest — a
+kept snapshot restores the old k3s build even after the image is gone. Moving to a newer
+`latest` therefore needs both: remove the cached image *and* drop the snapshots
+(`k3dev delete-snapshots`, or `k3dev destroy --all`). Pin a version tag when you need a
+specific k3s release.
 
 Set `k3s_image_repo: "rancher/k3s"` to use the upstream image instead; k3dev then
 injects the helpers into the running container at startup (the previous behavior).

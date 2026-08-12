@@ -71,7 +71,7 @@ impl PaletteCommandId {
             Self::ClusterStart => Some(ClusterAction::Start),
             Self::ClusterStop => Some(ClusterAction::Stop),
             Self::ClusterRestart => Some(ClusterAction::Restart),
-            Self::ClusterDestroy => Some(ClusterAction::Destroy),
+            Self::ClusterDestroy => Some(ClusterAction::Destroy { all: false }),
             Self::ClusterInfo => Some(ClusterAction::Info),
             Self::ClusterDeleteSnapshots => Some(ClusterAction::DeleteSnapshots),
             Self::ClusterDiagnostics => Some(ClusterAction::Diagnostics),

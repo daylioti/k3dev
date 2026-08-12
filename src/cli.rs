@@ -80,7 +80,7 @@ pub async fn run_cli_action(action: ClusterAction, config_path: Option<&str>) ->
             ClusterAction::Start => manager.start(output_tx).await,
             ClusterAction::Stop => manager.stop(output_tx).await,
             ClusterAction::Restart => manager.restart(output_tx).await,
-            ClusterAction::Destroy => manager.delete(output_tx).await,
+            ClusterAction::Destroy { all } => manager.delete(output_tx, all).await,
             ClusterAction::Info => manager.info(output_tx).await,
             ClusterAction::DeleteSnapshots => manager.delete_snapshots(output_tx).await,
             ClusterAction::Diagnostics | ClusterAction::PreflightCheck => unreachable!(),
