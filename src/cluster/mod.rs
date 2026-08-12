@@ -200,14 +200,19 @@ impl ClusterManager {
         self.start(output_tx).await
     }
 
-    /// Delete the cluster and cleanup
-    pub async fn delete(&mut self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
+    /// Delete the cluster and cleanup. `delete_snapshots` also removes the
+    /// snapshot images (opt-in: `k3dev destroy --all`).
+    pub async fn delete(
+        &mut self,
+        output_tx: mpsc::Sender<OutputLine>,
+        delete_snapshots: bool,
+    ) -> Result<()> {
         // Skip Traefik uninstall - resources live inside k3s container which is being deleted
         // This saves ~2-3 seconds since we don't need to wait for K8s API calls
 
         // Delete k3s cluster
         if let Some(k3s) = &self.k3s {
-            k3s.delete(output_tx.clone()).await?;
+            k3s.delete(output_tx.clone(), delete_snapshots).await?;
         }
 
         // Note: /etc/hosts entries are kept on purpose - user can manually update with 'H' key

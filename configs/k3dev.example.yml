@@ -25,8 +25,8 @@ infrastructure:
   # Domain for local cluster ingresses
   domain: "myapp.local"
 
-  # K3s version
-  k3s_version: "v1.35.2-k3s1"
+  # K3s image tag: "latest" (default) or a pinned version like "v1.35.2-k3s1"
+  k3s_version: "latest"
 
   # K3s image repository (the tag is k3s_version).
   # Defaults to the k3dev-published image with socat + k3dev-agent baked in.

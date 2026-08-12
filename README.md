@@ -107,7 +107,7 @@ cluster:
 infrastructure:
   cluster_name: "k3dev"
   domain: "myapp.local"
-  k3s_version: "v1.35.2-k3s1"
+  k3s_version: "latest"
 
 theme: fallout
 
@@ -151,7 +151,8 @@ Running `k3dev` with no arguments launches the TUI. Passing a subcommand runs th
 k3dev start              # Start the cluster
 k3dev stop               # Stop the cluster
 k3dev restart            # Restart the cluster
-k3dev destroy            # Delete the cluster
+k3dev destroy            # Delete the cluster (snapshots kept)
+k3dev destroy --all      # Delete the cluster and its snapshot images
 k3dev info               # Show cluster info
 k3dev delete-snapshots   # Delete all snapshot images
 

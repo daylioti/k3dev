@@ -49,7 +49,12 @@ enum CliCommand {
     Restart,
     /// Destroy the cluster
     #[command(alias = "delete")]
-    Destroy,
+    Destroy {
+        /// Also delete the snapshot images (otherwise the next start restores
+        /// cluster state from them)
+        #[arg(long)]
+        all: bool,
+    },
     /// Show cluster info
     Info,
     /// Delete all snapshot images
@@ -185,7 +190,7 @@ impl CliCommand {
             CliCommand::Start => Some(ClusterAction::Start),
             CliCommand::Stop => Some(ClusterAction::Stop),
             CliCommand::Restart => Some(ClusterAction::Restart),
-            CliCommand::Destroy => Some(ClusterAction::Destroy),
+            CliCommand::Destroy { all } => Some(ClusterAction::Destroy { all: *all }),
             CliCommand::Info => Some(ClusterAction::Info),
             CliCommand::DeleteSnapshots => Some(ClusterAction::DeleteSnapshots),
             _ => None,

@@ -250,18 +250,34 @@ impl DockerManager {
             .with_context(|| format!("Failed to stop container {}", name))
     }
 
-    /// Remove a container
+    /// Remove a container together with its anonymous volumes.
+    ///
+    /// All persistent k3dev state lives in *named* volumes, so the anonymous
+    /// volumes Docker creates for the k3s image's `VOLUME` directories
+    /// (`/var/lib/cni`, `/var/lib/kubelet`, `/var/log`) are throwaway. Without
+    /// `v` they survive every container removal and pile up as dangling volumes.
     pub async fn remove_container(&self, name: &str, force: bool) -> Result<()> {
         self.client
             .remove_container(
                 name,
                 Some(RemoveContainerOptions {
                     force,
+                    v: true,
                     ..Default::default()
                 }),
             )
             .await
             .with_context(|| format!("Failed to remove container {}", name))
+    }
+
+    /// Get the image a container was created from
+    pub async fn container_image(&self, name: &str) -> Option<String> {
+        self.client
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+            .ok()
+            .and_then(|info| info.config)
+            .and_then(|config| config.image)
     }
 
     /// Send a signal to a running container.

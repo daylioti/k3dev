@@ -278,7 +278,7 @@ pub struct InfrastructureConfig {
     #[serde(default = "default_domain")]
     pub domain: String,
 
-    /// K3s version to use (e.g., "v1.33.4-k3s1")
+    /// K3s image tag to use ("latest", or a pinned version like "v1.33.4-k3s1")
     #[serde(default = "default_k3s_version")]
     pub k3s_version: String,
 
@@ -358,7 +358,7 @@ fn default_domain() -> String {
 }
 
 fn default_k3s_version() -> String {
-    "v1.35.2-k3s1".to_string()
+    "latest".to_string()
 }
 
 fn default_k3s_image_repo() -> String {

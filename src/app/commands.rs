@@ -123,11 +123,13 @@ impl App {
         }
 
         // Show confirmation for destroy action
-        if action == ClusterAction::Destroy {
+        if matches!(action, ClusterAction::Destroy { .. }) {
             self.pending_cluster_action = Some(action);
             self.confirm_popup.set_content(
                 "Destroy Cluster",
-                "This will permanently destroy the cluster. This cannot be undone.",
+                "This will permanently destroy the cluster: containers and volumes (all PV data). \
+                 This cannot be undone. Snapshot images are kept - use Delete Snapshots to remove \
+                 them.",
             );
             self.mode = AppMode::ConfirmDestroy;
             return;
@@ -191,7 +193,7 @@ impl App {
                     ClusterAction::Start => manager.start(tx).await,
                     ClusterAction::Stop => manager.stop(tx).await,
                     ClusterAction::Restart => manager.restart(tx).await,
-                    ClusterAction::Destroy => manager.delete(tx).await,
+                    ClusterAction::Destroy { all } => manager.delete(tx, all).await,
                     ClusterAction::Info => manager.info(tx).await,
                     ClusterAction::DeleteSnapshots => manager.delete_snapshots(tx).await,
                     // Diagnostics and PreflightCheck are handled before reaching here

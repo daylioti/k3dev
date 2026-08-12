@@ -526,8 +526,15 @@ impl K3sManager {
         Ok(())
     }
 
-    /// Delete the k3s cluster and cleanup
-    pub async fn delete(&self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
+    /// Delete the k3s cluster and cleanup. With `delete_snapshots` the snapshot
+    /// images are removed too — they carry a full copy of the cluster state (k3s
+    /// database + local PV data) and are restored on the next start, so keeping
+    /// them brings the deleted workloads back.
+    pub async fn delete(
+        &self,
+        output_tx: mpsc::Sender<OutputLine>,
+        delete_snapshots: bool,
+    ) -> Result<()> {
         tracing::warn!(
             container_name = %self.config.container_name,
             "Deleting k3s cluster and all data"
@@ -537,25 +544,21 @@ impl K3sManager {
             .send(OutputLine::info("Deleting k3s cluster..."))
             .await;
 
-        // While the container is still alive, unmount kubelet/local-path mounts
-        // from inside it. k3s runs with /var/lib/docker bind-mounted rshared, so
-        // those mounts propagate into the host mount namespace and are NOT
-        // cleaned up when the container is force-killed. Left behind they pin the
-        // PV volume ("device or resource busy"), so its data survives a destroy
-        // and old pods reappear on the next start. Unmounting inside the running
-        // container propagates the unmount back to the host and frees the volume.
-        if self
-            .docker
-            .container_running(&self.config.container_name)
-            .await
-        {
-            let _ = output_tx
-                .send(OutputLine::info("Unmounting cluster volumes..."))
-                .await;
-            self.unmount_leaked_mounts().await;
-        }
+        // Resolve the image for the host cleanup container while the cluster
+        // container still exists. Prefer the configured k3s image; a cluster
+        // started from a snapshot runs a snapshot image, which is only usable
+        // before the snapshots are (optionally) deleted below.
+        let cleanup_image = if self.docker.image_exists(&self.config.k3s_image()).await {
+            Some(self.config.k3s_image())
+        } else {
+            self.docker
+                .container_image(&self.config.container_name)
+                .await
+        };
 
-        // Force-remove k3s container (skip stop - force remove handles it)
+        // Force-remove the k3s container first (skip stop - force remove handles
+        // it). Killing kubelet up front means nothing recreates pod containers
+        // or re-mounts volumes while the rest of the teardown runs.
         if self
             .docker
             .container_exists(&self.config.container_name)
@@ -570,64 +573,158 @@ impl K3sManager {
                 .await;
         }
 
-        // Run all cleanup tasks in parallel:
-        // - Pod containers (k8s_*) can be force-removed in parallel
+        // Pod containers live in the HOST Docker daemon (k3s runs with --docker),
+        // so they outlive the k3s container and keep running until removed.
+        let _ = output_tx
+            .send(OutputLine::info("Removing pod containers..."))
+            .await;
+        self.docker.cleanup_containers_by_prefix("k8s_").await?;
+
+        // Kubelet and local-path mounts made inside the k3s container propagate
+        // into the host mount namespace (/var/lib/docker is bind-mounted
+        // rshared) and are NOT cleaned up when the container dies. Left behind
+        // they pin the k3dev volumes ("device or resource busy"), so the old
+        // cluster state survives the destroy and its pods reappear on the next
+        // start. Unmounting needs root, hence a throwaway privileged container.
+        match cleanup_image {
+            Some(image) => {
+                let _ = output_tx
+                    .send(OutputLine::info("Unmounting cluster volumes..."))
+                    .await;
+                self.cleanup_host_state(&image).await;
+            }
+            None => {
+                let _ = output_tx
+                    .send(OutputLine::warning(
+                        "No local k3s image: skipping host mount cleanup",
+                    ))
+                    .await;
+            }
+        }
+
+        // Remaining resources are independent of each other:
         // - Network removal will fail if containers still attached, but we retry
-        // - Volumes and kubeconfig are independent
+        // - Volumes, kubeconfig and snapshot images are independent
         let _ = output_tx
             .send(OutputLine::info("Cleaning up cluster resources..."))
             .await;
 
         let (
-            pods_result,
             network_result,
             rancher_volume_result,
             pv_volume_result,
             kubeconfig_result,
+            snapshot_result,
         ) = tokio::join!(
-            self.docker.cleanup_containers_by_prefix("k8s_"),
             self.docker.remove_network(&self.config.network_name),
             self.docker.remove_volume(Self::RANCHER_VOLUME_NAME),
             self.docker.remove_volume(Self::LOCAL_PV_VOLUME_NAME),
             self.cleanup_kubeconfig(),
+            async {
+                if delete_snapshots {
+                    self.delete_snapshots(&output_tx).await
+                } else {
+                    Ok(())
+                }
+            },
         );
 
         // Propagate errors (most operations ignore errors gracefully)
-        pods_result?;
         network_result?;
         rancher_volume_result?;
         pv_volume_result?;
         kubeconfig_result?;
+        snapshot_result?;
 
         let _ = output_tx
             .send(OutputLine::success("K3s cluster deleted"))
             .await;
+
+        if !delete_snapshots {
+            let kept = self
+                .docker
+                .list_images_by_pattern("k3dev-snapshot-")
+                .await
+                .unwrap_or_default();
+            if !kept.is_empty() {
+                let _ = output_tx
+                    .send(OutputLine::info(format!(
+                        "{} snapshot image(s) kept - the next start restores cluster state from them",
+                        kept.len()
+                    )))
+                    .await;
+            }
+        }
+
         Ok(())
     }
 
-    /// Lazily unmount kubelet and local-path-provisioner mounts from inside the
-    /// running k3s container. Because /var/lib/docker is bind-mounted rshared,
-    /// the unmounts propagate back to the host and free the k3dev volumes for
-    /// removal. Errors are non-fatal (best-effort cleanup).
-    async fn unmount_leaked_mounts(&self) {
-        let docker_root = self.docker.get_docker_root_dir().await;
+    /// Shell script that releases the cluster state left in the host mount
+    /// namespace: lazily unmount everything k3s mounted under Docker's data
+    /// root, then delete the kubelet state directory (it lives on the host
+    /// filesystem, not in a volume, so removing volumes does not clear it).
+    fn host_cleanup_script(docker_root: &str) -> String {
         let root = docker_root.trim_end_matches('/');
+        let kubelet = Self::kubelet_root_dir(root);
         // Unmount deepest paths first (sort -r) so parent mounts are freed after
         // their children. Covers pod mounts under kubelet/ and the local-path/PV
-        // and rancher volume data directories.
-        let script = format!(
+        // and rancher volume data directories. The kubelet directory is only
+        // deleted once nothing is mounted under it, so a failed unmount can
+        // never make `rm -rf` delete through a live bind mount.
+        format!(
             "awk '{{print $2}}' /proc/mounts | \
-             grep -E '^{root}/(kubelet|volumes/(k3s-local-pv-data|k3s-rancher-data))(/|$)' | \
-             sort -r | while read m; do umount -l \"$m\" 2>/dev/null || true; done",
+             grep -E '^{root}/(kubelet|volumes/({rancher}|{pv}))(/|$)' | \
+             sort -r | while read m; do umount -l \"$m\" 2>/dev/null || true; done; \
+             awk '{{print $2}}' /proc/mounts | grep -qE '^{kubelet}(/|$)' || rm -rf {kubelet}",
             root = root,
-        );
-        if let Err(e) = self
-            .docker
-            .exec_in_container(&self.config.container_name, &["sh", "-c", &script])
-            .await
-        {
-            tracing::warn!(error = %e, "Failed to unmount leaked cluster mounts before delete");
+            rancher = Self::RANCHER_VOLUME_NAME,
+            pv = Self::LOCAL_PV_VOLUME_NAME,
+            kubelet = kubelet,
+        )
+    }
+
+    /// Run the host cleanup script in a throwaway privileged container. Docker's
+    /// data root is bind-mounted rshared, so unmounts inside the container
+    /// propagate back to the host and free the k3dev volumes for removal.
+    /// Errors are non-fatal (best-effort cleanup).
+    async fn cleanup_host_state(&self, image: &str) {
+        let docker_root = self.docker.get_docker_root_dir().await;
+        let script = Self::host_cleanup_script(&docker_root);
+        let name = format!("{}-cleanup", self.config.container_name);
+
+        // A leftover helper from an interrupted destroy would block the name.
+        let _ = self.docker.remove_container(&name, true).await;
+
+        let run_config = ContainerRunConfig {
+            name: name.clone(),
+            image: image.to_string(),
+            detach: true,
+            privileged: true,
+            volumes: vec![(
+                docker_root.clone(),
+                docker_root.clone(),
+                "bind-propagation=rshared".to_string(),
+            )],
+            entrypoint: Some(String::new()),
+            command: Some(vec!["/bin/sh".to_string(), "-c".to_string(), script]),
+            security_opt: vec!["apparmor=unconfined".to_string()],
+            ..Default::default()
+        };
+
+        if let Err(e) = self.docker.run_container(&run_config).await {
+            tracing::warn!(error = %e, "Failed to start host cleanup container");
+            return;
         }
+
+        // The script only unmounts and deletes, so it finishes in well under a
+        // second; wait for it so volume removal sees the released mounts.
+        for _ in 0..50 {
+            if !self.docker.container_running(&name).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        let _ = self.docker.remove_container(&name, true).await;
     }
 
     /// Get cluster info
@@ -694,5 +791,35 @@ impl K3sManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_cleanup_script_targets_cluster_paths_only() {
+        let script = K3sManager::host_cleanup_script("/mnt/data/docker");
+
+        // Unmounts only the kubelet root and the two k3dev volumes, deepest first
+        assert!(script.contains(
+            "^/mnt/data/docker/(kubelet|volumes/(k3s-rancher-data|k3s-local-pv-data))(/|$)"
+        ));
+        assert!(script.contains("sort -r"));
+        assert!(script.contains("umount -l \"$m\""));
+
+        // Kubelet state is only deleted when nothing is mounted under it
+        assert!(script.contains(
+            "grep -qE '^/mnt/data/docker/kubelet(/|$)' || rm -rf /mnt/data/docker/kubelet"
+        ));
+    }
+
+    #[test]
+    fn host_cleanup_script_normalizes_trailing_slash() {
+        let script = K3sManager::host_cleanup_script("/var/lib/docker/");
+
+        assert!(!script.contains("//"));
+        assert!(script.contains("rm -rf /var/lib/docker/kubelet"));
     }
 }

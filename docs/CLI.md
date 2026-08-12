@@ -19,7 +19,8 @@ Config resolution (when `--config` is not provided) follows the same order as th
 | `k3dev start` | Start the cluster (uses a snapshot if available). |
 | `k3dev stop` | Stop the running cluster container. |
 | `k3dev restart` | Stop then start the cluster. |
-| `k3dev destroy` | Delete the cluster container and associated resources. |
+| `k3dev destroy` | Delete the cluster: k3s container, pod containers, volumes (all PV data), network and kubeconfig entries. Snapshot images are kept, so the next start restores cluster state from a matching snapshot. |
+| `k3dev destroy --all` | Same, plus the snapshot images — the next start creates a fresh cluster. |
 | `k3dev info` | Show cluster metadata (name, version, endpoints). |
 | `k3dev delete-snapshots` | Remove all snapshot images created by k3dev. |
 
