@@ -228,6 +228,16 @@ impl DockerManager {
             .map(|s| s.to_string())
     }
 
+    /// Exit code of a stopped container (`None` while it runs or when unknown)
+    pub async fn container_exit_code(&self, name: &str) -> Option<i64> {
+        self.client
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+            .ok()
+            .and_then(|info| info.state)
+            .and_then(|state| state.exit_code)
+    }
+
     /// Start a stopped container
     pub async fn start_container(&self, name: &str) -> Result<()> {
         self.client
@@ -544,7 +554,11 @@ impl DockerManager {
         Ok(port_map)
     }
 
-    /// List containers by name prefix
+    /// List containers by name prefix.
+    ///
+    /// Docker's `name` filter matches a substring anywhere in the name, so the
+    /// results are post-filtered on the real prefix - otherwise a `k8s_` lookup
+    /// would also return unrelated containers like `my_k8s_thing`.
     pub async fn list_containers_by_prefix(&self, prefix: &str) -> Result<Vec<String>> {
         let mut filters = HashMap::new();
         filters.insert("name".to_string(), vec![prefix.to_string()]);
@@ -564,6 +578,7 @@ impl DockerManager {
             .filter_map(|c| c.names)
             .flatten()
             .map(|n| n.trim_start_matches('/').to_string())
+            .filter(|n| n.starts_with(prefix))
             .collect();
 
         Ok(names)

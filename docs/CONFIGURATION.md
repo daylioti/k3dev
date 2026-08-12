@@ -178,9 +178,12 @@ runtime binary injection. Tags mirror the upstream `rancher/k3s` tags exactly
 
 `k3s_version` defaults to `latest`, which tracks the newest k3s release published to
 the repo. Note that Docker only resolves a tag when the image is missing locally, so
-an already-pulled `latest` keeps being reused until you `docker rmi` it (and snapshots
-stay valid, since the snapshot hash is over the tag string, not the resolved digest).
-Pin a version tag when you need a specific k3s release.
+an already-pulled `latest` keeps being reused until you `docker rmi` it. Snapshots stay
+valid too, since the snapshot hash is over the tag string, not the resolved digest — a
+kept snapshot restores the old k3s build even after the image is gone. Moving to a newer
+`latest` therefore needs both: remove the cached image *and* drop the snapshots
+(`k3dev delete-snapshots`, or `k3dev destroy --all`). Pin a version tag when you need a
+specific k3s release.
 
 Set `k3s_image_repo: "rancher/k3s"` to use the upstream image instead; k3dev then
 injects the helpers into the running container at startup (the previous behavior).

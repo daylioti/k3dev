@@ -578,7 +578,16 @@ impl K3sManager {
         let _ = output_tx
             .send(OutputLine::info("Removing pod containers..."))
             .await;
-        self.docker.cleanup_containers_by_prefix("k8s_").await?;
+        // Best effort: a transient Docker listing failure must not skip the
+        // host-state, network, volume and kubeconfig cleanup that follows.
+        if let Err(e) = self.docker.cleanup_containers_by_prefix("k8s_").await {
+            let _ = output_tx
+                .send(OutputLine::warning(format!(
+                    "Could not list pod containers: {}",
+                    e
+                )))
+                .await;
+        }
 
         // Kubelet and local-path mounts made inside the k3s container propagate
         // into the host mount namespace (/var/lib/docker is bind-mounted
@@ -663,24 +672,42 @@ impl K3sManager {
     /// namespace: lazily unmount everything k3s mounted under Docker's data
     /// root, then delete the kubelet state directory (it lives on the host
     /// filesystem, not in a volume, so removing volumes does not clear it).
-    fn host_cleanup_script(docker_root: &str) -> String {
+    ///
+    /// Returns `None` unless the data root is a plain absolute path. The root is
+    /// interpolated into a script that runs `rm -rf` as root in a privileged
+    /// container, so a path holding a space or a quote would delete the wrong
+    /// directory - skipping cleanup is the safe answer for those.
+    fn host_cleanup_script(docker_root: &str) -> Option<String> {
         let root = docker_root.trim_end_matches('/');
+        if !root.starts_with('/')
+            || !root
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+        {
+            return None;
+        }
         let kubelet = Self::kubelet_root_dir(root);
+        // `.` is the only regex metacharacter the guard above lets through, and
+        // it shows up in a rootless data root (~/.local/share/docker), where an
+        // unescaped `.` would widen the pattern to unrelated mounts.
+        let root_pattern = root.replace('.', "\\.");
+        let kubelet_pattern = kubelet.replace('.', "\\.");
         // Unmount deepest paths first (sort -r) so parent mounts are freed after
         // their children. Covers pod mounts under kubelet/ and the local-path/PV
         // and rancher volume data directories. The kubelet directory is only
         // deleted once nothing is mounted under it, so a failed unmount can
         // never make `rm -rf` delete through a live bind mount.
-        format!(
+        Some(format!(
             "awk '{{print $2}}' /proc/mounts | \
              grep -E '^{root}/(kubelet|volumes/({rancher}|{pv}))(/|$)' | \
-             sort -r | while read m; do umount -l \"$m\" 2>/dev/null || true; done; \
-             awk '{{print $2}}' /proc/mounts | grep -qE '^{kubelet}(/|$)' || rm -rf {kubelet}",
-            root = root,
+             sort -r | while IFS= read -r m; do umount -l \"$m\" 2>/dev/null || true; done; \
+             awk '{{print $2}}' /proc/mounts | grep -qE '^{kubelet_pattern}(/|$)' || rm -rf \"{kubelet}\"",
+            root = root_pattern,
             rancher = Self::RANCHER_VOLUME_NAME,
             pv = Self::LOCAL_PV_VOLUME_NAME,
+            kubelet_pattern = kubelet_pattern,
             kubelet = kubelet,
-        )
+        ))
     }
 
     /// Run the host cleanup script in a throwaway privileged container. Docker's
@@ -689,7 +716,13 @@ impl K3sManager {
     /// Errors are non-fatal (best-effort cleanup).
     async fn cleanup_host_state(&self, image: &str) {
         let docker_root = self.docker.get_docker_root_dir().await;
-        let script = Self::host_cleanup_script(&docker_root);
+        let Some(script) = Self::host_cleanup_script(&docker_root) else {
+            tracing::warn!(
+                docker_root = %docker_root,
+                "Docker data root is not a plain absolute path: skipping host mount cleanup"
+            );
+            return;
+        };
         let name = format!("{}-cleanup", self.config.container_name);
 
         // A leftover helper from an interrupted destroy would block the name.
@@ -724,6 +757,21 @@ impl K3sManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+
+        // A failed cleanup surfaces later as "device or resource busy" on volume
+        // removal, so record the cause here.
+        if self.docker.container_running(&name).await {
+            tracing::warn!(container = %name, "Host cleanup container did not exit in time");
+        } else if let Some(code) = self.docker.container_exit_code(&name).await {
+            if code != 0 {
+                tracing::warn!(
+                    container = %name,
+                    exit_code = code,
+                    "Host cleanup script failed: cluster volumes may still be mounted"
+                );
+            }
+        }
+
         let _ = self.docker.remove_container(&name, true).await;
     }
 
@@ -800,26 +848,49 @@ mod tests {
 
     #[test]
     fn host_cleanup_script_targets_cluster_paths_only() {
-        let script = K3sManager::host_cleanup_script("/mnt/data/docker");
+        let script = K3sManager::host_cleanup_script("/mnt/data/docker").unwrap();
 
         // Unmounts only the kubelet root and the two k3dev volumes, deepest first
         assert!(script.contains(
             "^/mnt/data/docker/(kubelet|volumes/(k3s-rancher-data|k3s-local-pv-data))(/|$)"
         ));
         assert!(script.contains("sort -r"));
+        assert!(script.contains("while IFS= read -r m"));
         assert!(script.contains("umount -l \"$m\""));
 
         // Kubelet state is only deleted when nothing is mounted under it
         assert!(script.contains(
-            "grep -qE '^/mnt/data/docker/kubelet(/|$)' || rm -rf /mnt/data/docker/kubelet"
+            "grep -qE '^/mnt/data/docker/kubelet(/|$)' || rm -rf \"/mnt/data/docker/kubelet\""
         ));
     }
 
     #[test]
     fn host_cleanup_script_normalizes_trailing_slash() {
-        let script = K3sManager::host_cleanup_script("/var/lib/docker/");
+        let script = K3sManager::host_cleanup_script("/var/lib/docker/").unwrap();
 
         assert!(!script.contains("//"));
-        assert!(script.contains("rm -rf /var/lib/docker/kubelet"));
+        assert!(script.contains("rm -rf \"/var/lib/docker/kubelet\""));
+    }
+
+    #[test]
+    fn host_cleanup_script_escapes_dots_in_grep_patterns() {
+        let script = K3sManager::host_cleanup_script("/home/dev/.local/share/docker").unwrap();
+
+        // Patterns escape the dot so it cannot match unrelated mount paths...
+        assert!(script.contains("^/home/dev/\\.local/share/docker/(kubelet|"));
+        assert!(script.contains("grep -qE '^/home/dev/\\.local/share/docker/kubelet(/|$)'"));
+        // ...while the rm target stays a literal path
+        assert!(script.contains("rm -rf \"/home/dev/.local/share/docker/kubelet\""));
+    }
+
+    #[test]
+    fn host_cleanup_script_rejects_unsafe_roots() {
+        // A space would make the unquoted-word split delete the wrong directory
+        assert!(K3sManager::host_cleanup_script("/Users/jane doe/docker").is_none());
+        // Shell metacharacters and relative roots never reach the script
+        assert!(K3sManager::host_cleanup_script("/var/lib/docker\"; rm -rf /").is_none());
+        assert!(K3sManager::host_cleanup_script("/var/lib/$(whoami)").is_none());
+        assert!(K3sManager::host_cleanup_script("var/lib/docker").is_none());
+        assert!(K3sManager::host_cleanup_script("").is_none());
     }
 }
