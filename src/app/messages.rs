@@ -71,6 +71,17 @@ pub enum AppMessage {
     /// Shell session closed (optional error message)
     ShellSessionEnded(Option<String>),
 
+    /// A child opened its pseudo-terminal; bytes sent here reach its tty
+    ChildTtyOpened {
+        input: tokio::sync::mpsc::Sender<Vec<u8>>,
+    },
+
+    /// Text a child wrote to its tty (prompts, echoed input)
+    ChildTtyOutput(String),
+
+    /// The child holding the pseudo-terminal has exited
+    ChildTtyClosed,
+
     /// Pod resolved for a shell command — open shell tab and send command
     ShellCommandPodResolved {
         pod_name: String,
@@ -107,6 +118,9 @@ pub enum AppMessage {
 
     /// Capture failed (orchestrator/Docker error).
     CaptureFailed(String),
+
+    /// Cluster names currently running in Docker (for the cluster switcher)
+    RunningClustersLoaded(Vec<String>),
 
     /// A newer release than the running build was found (version string)
     UpdateAvailable(String),
@@ -406,6 +420,22 @@ impl App {
                     handle.close();
                 }
             }
+            AppMessage::ChildTtyOpened { input } => {
+                self.tty_input = Some(input);
+                self.output_popup.set_interactive(true);
+            }
+            AppMessage::ChildTtyOutput(text) => {
+                tracing::info!(event = "child_tty", "{}", text.trim_end());
+                self.output_popup.push_tty(&text);
+                // A command talking to the terminal wants the user's attention
+                if self.mode == AppMode::Normal {
+                    self.mode = AppMode::OutputPopup;
+                }
+            }
+            AppMessage::ChildTtyClosed => {
+                self.tty_input = None;
+                self.output_popup.set_interactive(false);
+            }
             AppMessage::ShellSessionEnded(error) => {
                 self.shell_session = None;
                 self.pending_shell_command = None;
@@ -495,6 +525,9 @@ impl App {
             }
             AppMessage::K8sClientReady(client) => {
                 self.k8s_client = client;
+            }
+            AppMessage::RunningClustersLoaded(names) => {
+                self.cluster_switcher.apply_running(&names);
             }
             AppMessage::UpdateAvailable(version) => {
                 tracing::info!(latest = %version, "Newer k3dev release available");

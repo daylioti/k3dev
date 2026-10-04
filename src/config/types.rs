@@ -155,6 +155,8 @@ pub struct KeybindingsConfig {
     #[serde(default)]
     pub update_hosts: Option<String>,
     #[serde(default)]
+    pub switch_cluster: Option<String>,
+    #[serde(default)]
     pub cancel: Option<String>,
 
     // Navigation
@@ -178,11 +180,14 @@ pub struct KeybindingsConfig {
 
 /// Hook event types for cluster lifecycle
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum HookEvent {
     /// After k3s API is responding, before traefik is deployed
     OnClusterAvailable,
     /// After traefik and core services are deployed
     OnServicesDeployed,
+    /// After a cluster snapshot image has been committed
+    OnSnapshotCreated,
 }
 
 impl HookEvent {
@@ -190,6 +195,7 @@ impl HookEvent {
         match self {
             HookEvent::OnClusterAvailable => "on_cluster_available",
             HookEvent::OnServicesDeployed => "on_services_deployed",
+            HookEvent::OnSnapshotCreated => "on_snapshot_created",
         }
     }
 }
@@ -238,12 +244,18 @@ pub struct HooksConfig {
     /// Hooks to run after services are deployed
     #[serde(default)]
     pub on_services_deployed: Vec<HookCommand>,
+
+    /// Hooks to run after a snapshot image has been created
+    #[serde(default)]
+    pub on_snapshot_created: Vec<HookCommand>,
 }
 
 impl HooksConfig {
     /// Check if any hooks are configured
     pub fn has_hooks(&self) -> bool {
-        !self.on_cluster_available.is_empty() || !self.on_services_deployed.is_empty()
+        !self.on_cluster_available.is_empty()
+            || !self.on_services_deployed.is_empty()
+            || !self.on_snapshot_created.is_empty()
     }
 
     /// Get hooks for a specific event
@@ -251,6 +263,7 @@ impl HooksConfig {
         match event {
             HookEvent::OnClusterAvailable => &self.on_cluster_available,
             HookEvent::OnServicesDeployed => &self.on_services_deployed,
+            HookEvent::OnSnapshotCreated => &self.on_snapshot_created,
         }
     }
 }
@@ -270,9 +283,14 @@ pub struct K8sClientConfig {
 /// Infrastructure configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct InfrastructureConfig {
-    /// Cluster name - used to derive container and network names
+    /// Cluster name - used to derive container, network, volume and context names
     #[serde(default = "default_cluster_name")]
     pub cluster_name: String,
+
+    /// Stable index used to derive non-overlapping pod/service CIDRs.
+    /// Omit to have k3dev allocate and persist one in ~/.k3dev/clusters.json.
+    #[serde(default)]
+    pub cluster_index: Option<u16>,
 
     /// Domain for the local cluster
     #[serde(default = "default_domain")]
@@ -301,12 +319,44 @@ pub struct InfrastructureConfig {
     pub https_port: u16,
 
     /// Additional port mappings (host:container format)
-    #[serde(default)]
+    #[serde(default = "default_additional_ports")]
     pub additional_ports: Vec<String>,
+
+    /// Front-router configuration
+    #[serde(default)]
+    pub router: RouterConfig,
 
     /// Speedup optimizations configuration
     #[serde(default)]
     pub speedup: SpeedupConfig,
+}
+
+/// Shared front-router configuration.
+///
+/// When enabled a single `k3dev-router` container owns host :80/:443 and
+/// forwards to each cluster by Host header (HTTP) or SNI (HTTPS), which is what
+/// lets several clusters serve clean URLs at the same time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouterConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Router image (Traefik v3 with a file provider)
+    #[serde(default = "default_router_image")]
+    pub image: String,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            image: default_router_image(),
+        }
+    }
+}
+
+fn default_router_image() -> String {
+    "traefik:v3.3".to_string()
 }
 
 /// Speedup optimization configuration
@@ -377,17 +427,23 @@ fn default_https_port() -> u16 {
     443
 }
 
+fn default_additional_ports() -> Vec<String> {
+    vec!["2345:2345".to_string(), "8309:8309".to_string()]
+}
+
 impl Default for InfrastructureConfig {
     fn default() -> Self {
         Self {
             cluster_name: default_cluster_name(),
+            cluster_index: None,
             domain: default_domain(),
             k3s_version: default_k3s_version(),
             k3s_image_repo: default_k3s_image_repo(),
             api_port: default_api_port(),
             http_port: default_http_port(),
             https_port: default_https_port(),
-            additional_ports: vec!["2345:2345".to_string(), "8309:8309".to_string()],
+            additional_ports: default_additional_ports(),
+            router: RouterConfig::default(),
             speedup: SpeedupConfig::default(),
         }
     }
@@ -996,5 +1052,24 @@ cmd: "uname -s"
         let err = serde_yml::from_str::<Visible>(r#"{ type: bogus }"#).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown"), "unexpected error: {msg}");
+    }
+
+    /// A key left out of the YAML must land on the documented default, which
+    /// only holds while the serde default and `Default` share one source.
+    #[test]
+    fn omitted_infrastructure_keys_fall_back_to_the_struct_defaults() {
+        let infra: InfrastructureConfig = serde_yml::from_str("cluster_name: \"k3dev\"").unwrap();
+        let defaults = InfrastructureConfig::default();
+
+        assert_eq!(infra.additional_ports, defaults.additional_ports);
+        assert!(!infra.additional_ports.is_empty());
+        assert_eq!(infra.k3s_version, defaults.k3s_version);
+    }
+
+    /// An explicit empty list is a choice, not an omission — it must survive.
+    #[test]
+    fn explicit_empty_additional_ports_stay_empty() {
+        let infra: InfrastructureConfig = serde_yml::from_str("additional_ports: []").unwrap();
+        assert!(infra.additional_ports.is_empty());
     }
 }

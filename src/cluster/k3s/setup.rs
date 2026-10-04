@@ -13,6 +13,8 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 use super::K3sManager;
+use kube::config::Kubeconfig;
+
 use crate::cluster::kube_ops::KubeOps;
 use crate::cluster::platform::PlatformInfo;
 use crate::ui::components::OutputLine;
@@ -45,7 +47,10 @@ impl K3sManager {
 
         for attempt in 0..max_attempts {
             match client
-                .get(format!("https://{}:6443/healthz", api_host))
+                .get(format!(
+                    "https://{}:{}/healthz",
+                    api_host, self.config.api_port
+                ))
                 .send()
                 .await
             {
@@ -126,16 +131,21 @@ impl K3sManager {
         #[cfg(target_arch = "aarch64")]
         const AGENT_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-agent-aarch64");
 
-        if self
+        // The prebuilt k3s image bakes in an agent, which may predate the CLI
+        // contract this build expects (it now takes a per-cluster cgroup root).
+        // Reinstall unless the version string matches exactly.
+        let expected = format!("k3dev-agent {}", Self::AGENT_VERSION);
+        if let Ok(out) = self
             .docker
             .exec_in_container(
                 &self.config.container_name,
-                &["test", "-x", "/usr/local/bin/k3dev-agent"],
+                &["/usr/local/bin/k3dev-agent", "--version"],
             )
             .await
-            .is_ok()
         {
-            return Ok(());
+            if out.trim() == expected {
+                return Ok(());
+            }
         }
 
         self.install_binary_via_docker_cp(
@@ -145,6 +155,63 @@ impl K3sManager {
         )
         .await
         .context("Failed to install k3dev-agent")?;
+
+        Ok(())
+    }
+
+    /// Install k3dev-criproxy in the k3s container using embedded static binary.
+    ///
+    /// Unlike socat and the stats agent this runs *before* k3s does — the
+    /// container entrypoint waits for it — so it is uploaded straight after the
+    /// container starts rather than after the API comes up.
+    pub(super) async fn install_criproxy(&self) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        const CRIPROXY_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-criproxy-x86_64");
+
+        #[cfg(target_arch = "aarch64")]
+        const CRIPROXY_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-criproxy-aarch64");
+
+        let expected = format!("k3dev-criproxy {}", Self::CRIPROXY_VERSION);
+        if let Ok(out) = self
+            .docker
+            .exec_in_container(
+                &self.config.container_name,
+                &["/usr/local/bin/k3dev-criproxy", "--version"],
+            )
+            .await
+        {
+            if out.trim() == expected {
+                return Ok(());
+            }
+        }
+
+        self.install_binary_via_docker_cp(
+            CRIPROXY_BINARY,
+            "k3dev-criproxy",
+            "/usr/local/bin/k3dev-criproxy",
+        )
+        .await
+        .context("Failed to install k3dev-criproxy")?;
+
+        // The container entrypoint blocks on this binary's socket, so a broken
+        // upload (a build placeholder, a mismatched arch) would stall startup
+        // until the API wait times out with an unrelated message. Fail here
+        // instead, while the cause is still obvious.
+        let installed = self
+            .docker
+            .exec_in_container(
+                &self.config.container_name,
+                &["/usr/local/bin/k3dev-criproxy", "--version"],
+            )
+            .await
+            .context("k3dev-criproxy verification failed")?;
+        if installed.trim() != expected {
+            return Err(anyhow!(
+                "k3dev-criproxy reports '{}', expected '{}'",
+                installed.trim(),
+                expected
+            ));
+        }
 
         Ok(())
     }
@@ -185,7 +252,13 @@ impl K3sManager {
         Ok(())
     }
 
-    /// Setup kubeconfig file
+    /// Merge this cluster's credentials into `~/.kube/config`.
+    ///
+    /// k3s emits a kubeconfig whose cluster, user and context are all literally
+    /// `default`. Copying that file over `~/.kube/config` — which is what k3dev
+    /// used to do — destroys every unrelated context the user has. Instead the
+    /// entries are renamed to the cluster name and merged in by name, so several
+    /// k3dev clusters (and any pre-existing contexts) coexist.
     pub(super) async fn setup_kubeconfig(&self) -> Result<()> {
         let kube_dir = dirs::home_dir()
             .ok_or_else(|| anyhow!("Cannot find home directory"))?
@@ -195,7 +268,6 @@ impl K3sManager {
         fs::create_dir_all(&kube_dir).await?;
 
         let kubeconfig_path = kube_dir.join("config");
-        let temp_config = kube_dir.join("k3s-config.tmp");
 
         // Wait for k3s to generate kubeconfig
         let max_retries = 30;
@@ -210,29 +282,19 @@ impl K3sManager {
 
             if let Ok(content) = result {
                 if !content.is_empty() && content.contains("clusters:") {
-                    // Replace 127.0.0.1 with the remote host's address when Docker is remote.
-                    // For local Docker, keep 127.0.0.1 (matches k3s default and SAN certs).
-                    let fixed_content =
-                        if let Some(remote_host) = PlatformInfo::docker_remote_host() {
-                            content.replace("127.0.0.1", remote_host)
-                        } else {
-                            content
-                        };
+                    let name = self.config.context_name();
+                    let host = PlatformInfo::docker_remote_host().unwrap_or("127.0.0.1");
+                    let server = format!("https://{}:{}", host, self.config.api_port);
 
-                    fs::write(&temp_config, &fixed_content).await?;
-                    fs::copy(&temp_config, &kubeconfig_path).await?;
+                    let generated = Kubeconfig::from_yaml(&content)
+                        .context("Failed to parse kubeconfig emitted by k3s")?;
+                    let standalone = KubeOps::rename_kubeconfig_entries(generated, &name, &server)?;
 
-                    // Set permissions
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mut perms = fs::metadata(&kubeconfig_path).await?.permissions();
-                        perms.set_mode(0o600);
-                        fs::set_permissions(&kubeconfig_path, perms).await?;
-                    }
+                    KubeOps::write_kubeconfig(&self.config.pinned_kubeconfig_path(), &standalone)
+                        .await
+                        .context("Failed to write pinned kubeconfig")?;
 
-                    // Cleanup temp file
-                    let _ = fs::remove_file(&temp_config).await;
+                    KubeOps::merge_kubeconfig_entries(&kubeconfig_path, &standalone, &name).await?;
 
                     return Ok(());
                 }
@@ -246,9 +308,9 @@ impl K3sManager {
 
     /// Cleanup kubeconfig entries
     pub(super) async fn cleanup_kubeconfig(&self) -> Result<()> {
-        // Remove cluster, context, and user entries using kube crate
         // Ignore errors as entries might not exist
-        let _ = KubeOps::cleanup_kubeconfig_entries("default", "default", "default").await;
+        let name = self.config.context_name();
+        let _ = KubeOps::cleanup_kubeconfig_entries(&name, &name, &name).await;
         Ok(())
     }
 
@@ -266,10 +328,13 @@ impl K3sManager {
         // We create separate KubeOps instances to avoid borrow checker issues
         let tx1 = output_tx.clone();
         let tx2 = output_tx.clone();
+        let kubeconfig = self.config.kubeconfig.clone();
+        let context = self.config.context.clone();
+        let (kubeconfig2, context2) = (kubeconfig.clone(), context.clone());
 
         let coredns_task = tokio::spawn(async move {
             let _ = tx1.send(OutputLine::info("Waiting for coredns...")).await;
-            let mut kube_ops = KubeOps::new();
+            let mut kube_ops = KubeOps::with_context(kubeconfig, context);
             match kube_ops
                 .wait_for_deployment_ready("coredns", "kube-system", 60)
                 .await
@@ -298,7 +363,7 @@ impl K3sManager {
             let _ = tx2
                 .send(OutputLine::info("Waiting for local-path-provisioner..."))
                 .await;
-            let mut kube_ops = KubeOps::new();
+            let mut kube_ops = KubeOps::with_context(kubeconfig2, context2);
             match kube_ops
                 .wait_for_deployment_ready("local-path-provisioner", "kube-system", 60)
                 .await

@@ -1,0 +1,20 @@
+[package]
+name = "k3dev-criproxy"
+version = "0.1.0"
+edition = "2021"
+description = "Filtering Docker API proxy that scopes cri-dockerd to a single k3dev cluster"
+
+[[bin]]
+name = "k3dev-criproxy"
+path = "src/main.rs"
+
+# Zero external dependencies - std only for minimal binary size
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"  # Optimize for size
+# NOTE: no `panic = "abort"` here (unlike k3dev-agent): a panic while handling one
+# connection must kill only that connection's thread, never the whole proxy.

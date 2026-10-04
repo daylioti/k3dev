@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::sync::mpsc;
 
+use super::config::ClusterConfig;
 use super::kube_ops::KubeOps;
 use crate::ui::components::OutputLine;
 
@@ -27,6 +28,52 @@ fn hosts_file_path() -> PathBuf {
     {
         PathBuf::from("/etc/hosts")
     }
+}
+
+/// Does this line carry the pre-multi-cluster `# k3dev-ingress` marker
+/// (i.e. without the `[cluster]` suffix)?
+fn is_legacy_marker(line: &str) -> bool {
+    match line.find("# k3dev-ingress") {
+        Some(idx) => !line[idx + "# k3dev-ingress".len()..].starts_with('['),
+        None => false,
+    }
+}
+
+/// Rewrite `current` so that this cluster owns exactly one line per host in
+/// `hosts`, returning the new content plus the entries it added.
+///
+/// Only this cluster's marked lines are dropped; every other cluster's block
+/// survives untouched. Legacy unbracketed `# k3dev-ingress` lines predate
+/// multi-cluster support and are cleaned up once, since no cluster claims them.
+/// An empty `hosts` therefore strips this cluster's lines instead of leaving
+/// them behind, which is what makes a destroyed cluster stop resolving.
+fn rewrite_hosts(
+    current: &str,
+    marker: &str,
+    target_ip: &str,
+    hosts: &[String],
+) -> (String, Vec<String>) {
+    let cleaned: Vec<&str> = current
+        .lines()
+        .filter(|line| !line.contains(marker) && !is_legacy_marker(line))
+        .collect();
+
+    let mut new_entries: Vec<String> = hosts
+        .iter()
+        .map(|host| format!("{} {} {}", target_ip, host, marker))
+        .collect();
+    new_entries.sort();
+
+    let mut content = cleaned.join("\n");
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !new_entries.is_empty() {
+        content.push_str(&new_entries.join("\n"));
+        content.push('\n');
+    }
+
+    (content, new_entries)
 }
 
 /// Health status for an ingress endpoint
@@ -145,29 +192,19 @@ pub struct IngressManager {
 }
 
 impl IngressManager {
-    pub fn new() -> Self {
+    /// Build a manager bound to one cluster: its own hosts marker, its own
+    /// domain and its own kubeconfig context. Two clusters would otherwise
+    /// rewrite each other's /etc/hosts block every `HostsRefresh` tick.
+    pub fn for_cluster(config: &ClusterConfig) -> Self {
         use crate::cluster::platform::PlatformInfo;
         let target_ip = PlatformInfo::docker_remote_host()
             .unwrap_or("127.0.0.1")
             .to_string();
         Self {
-            hosts_marker: "# k3dev-ingress".to_string(),
-            domain: None,
+            hosts_marker: config.hosts_marker(),
+            domain: Some(config.domain.clone()),
             target_ip,
-            kube_ops: KubeOps::new(),
-        }
-    }
-
-    pub fn with_domain(domain: String) -> Self {
-        use crate::cluster::platform::PlatformInfo;
-        let target_ip = PlatformInfo::docker_remote_host()
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        Self {
-            hosts_marker: "# k3dev-ingress".to_string(),
-            domain: Some(domain),
-            target_ip,
-            kube_ops: KubeOps::new(),
+            kube_ops: KubeOps::for_cluster(config),
         }
     }
 
@@ -313,51 +350,49 @@ impl IngressManager {
     ) -> Result<HostsUpdateResult> {
         let hosts = self.get_ingress_hosts().await?;
 
-        if hosts.is_empty() {
-            if let Some(tx) = &output_tx {
-                let _ = tx.send(OutputLine::info("No ingress hosts found")).await;
-            }
-            return Ok(HostsUpdateResult::NoUpdateNeeded);
-        }
-
-        // Check if update is needed - check ALL hosts in /etc/hosts
-        let hosts_set: HashSet<String> = hosts.iter().cloned().collect();
-        let etc_hosts = self.get_all_hosts_from_etc_hosts().await;
-        if hosts_set.is_subset(&etc_hosts) {
-            if let Some(tx) = &output_tx {
-                let _ = tx
-                    .send(OutputLine::info(
-                        "All hosts already in /etc/hosts, skipping update",
-                    ))
-                    .await;
-            }
-            return Ok(HostsUpdateResult::NoUpdateNeeded);
-        }
-
         // Read current /etc/hosts
         let hosts_path = hosts_file_path();
         let current_content = fs::read_to_string(&hosts_path).await.unwrap_or_default();
 
-        // Remove existing k3dev entries
-        let cleaned: Vec<&str> = current_content
-            .lines()
-            .filter(|line| !line.contains(&self.hosts_marker))
-            .collect();
+        let (final_content, new_entries) = rewrite_hosts(
+            &current_content,
+            &self.hosts_marker,
+            &self.target_ip,
+            &hosts,
+        );
 
-        // Add new entries
-        let mut new_entries: Vec<String> = hosts
-            .iter()
-            .map(|host| format!("{} {} {}", self.target_ip, host, self.hosts_marker))
-            .collect();
-        new_entries.sort();
-
-        // Combine
-        let mut final_content = cleaned.join("\n");
-        if !final_content.ends_with('\n') {
-            final_content.push('\n');
+        if hosts.is_empty() {
+            // Nothing to publish for this cluster, but the file may still carry
+            // its lines from an earlier run: rewriting strips them, which is how
+            // a destroyed cluster stops resolving.
+            if final_content == current_content {
+                if let Some(tx) = &output_tx {
+                    let _ = tx.send(OutputLine::info("No ingress hosts found")).await;
+                }
+                return Ok(HostsUpdateResult::NoUpdateNeeded);
+            }
+            if let Some(tx) = &output_tx {
+                let _ = tx
+                    .send(OutputLine::info(
+                        "No ingress hosts left, removing this cluster's /etc/hosts entries",
+                    ))
+                    .await;
+            }
+        } else {
+            // Check if update is needed - check ALL hosts in /etc/hosts
+            let hosts_set: HashSet<String> = hosts.iter().cloned().collect();
+            let etc_hosts = self.get_all_hosts_from_etc_hosts().await;
+            if hosts_set.is_subset(&etc_hosts) && final_content == current_content {
+                if let Some(tx) = &output_tx {
+                    let _ = tx
+                        .send(OutputLine::info(
+                            "All hosts already in /etc/hosts, skipping update",
+                        ))
+                        .await;
+                }
+                return Ok(HostsUpdateResult::NoUpdateNeeded);
+            }
         }
-        final_content.push_str(&new_entries.join("\n"));
-        final_content.push('\n');
 
         // Check if hosts file is on a read-only filesystem (NixOS, MicroOS, etc.)
         #[cfg(unix)]
@@ -393,12 +428,12 @@ impl IngressManager {
         // Try to write directly first (works if run as root or have write permissions)
         if fs::write(&hosts_path, &final_content).await.is_ok() {
             if let Some(tx) = &output_tx {
-                let _ = tx
-                    .send(OutputLine::success(format!(
-                        "Updated /etc/hosts with {} entries",
-                        hosts.len()
-                    )))
-                    .await;
+                let message = if hosts.is_empty() {
+                    "Removed this cluster's /etc/hosts entries".to_string()
+                } else {
+                    format!("Updated /etc/hosts with {} entries", hosts.len())
+                };
+                let _ = tx.send(OutputLine::success(message)).await;
             }
             return Ok(HostsUpdateResult::WrittenDirectly { count: hosts.len() });
         }
@@ -442,8 +477,75 @@ impl IngressManager {
     }
 }
 
-impl Default for IngressManager {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+mod tests {
+    use super::rewrite_hosts;
+
+    const MINE: &str = "# k3dev-ingress[alpha]";
+    const THEIRS: &str = "# k3dev-ingress[beta]";
+
+    fn hosts(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_host_list_strips_this_clusters_lines_and_keeps_the_rest() {
+        let current = format!(
+            "127.0.0.1 localhost\n127.0.0.1 app.alpha.dev {MINE}\n127.0.0.1 api.alpha.dev {MINE}\n127.0.0.1 app.beta.dev {THEIRS}\n"
+        );
+
+        let (content, entries) = rewrite_hosts(&current, MINE, "127.0.0.1", &[]);
+
+        assert!(entries.is_empty());
+        assert_eq!(
+            content,
+            format!("127.0.0.1 localhost\n127.0.0.1 app.beta.dev {THEIRS}\n")
+        );
+    }
+
+    #[test]
+    fn empty_host_list_changes_nothing_when_the_cluster_owns_no_lines() {
+        let current = format!("127.0.0.1 localhost\n127.0.0.1 app.beta.dev {THEIRS}\n");
+
+        let (content, entries) = rewrite_hosts(&current, MINE, "127.0.0.1", &[]);
+
+        assert!(entries.is_empty());
+        assert_eq!(content, current, "a no-op rewrite must not touch the file");
+    }
+
+    #[test]
+    fn hosts_replace_this_clusters_previous_lines() {
+        let current = format!("127.0.0.1 localhost\n127.0.0.1 old.alpha.dev {MINE}\n127.0.0.1 app.beta.dev {THEIRS}\n");
+
+        let (content, entries) =
+            rewrite_hosts(&current, MINE, "127.0.0.1", &hosts(&["new.alpha.dev"]));
+
+        assert_eq!(entries, vec![format!("127.0.0.1 new.alpha.dev {MINE}")]);
+        assert!(!content.contains("old.alpha.dev"));
+        assert!(content.contains(&format!("127.0.0.1 app.beta.dev {THEIRS}")));
+        assert!(content.contains(&format!("127.0.0.1 new.alpha.dev {MINE}")));
+    }
+
+    #[test]
+    fn legacy_unbracketed_lines_are_dropped_too() {
+        let current = format!("127.0.0.1 localhost\n127.0.0.1 old.dev # k3dev-ingress\n127.0.0.1 app.beta.dev {THEIRS}\n");
+
+        let (content, _) = rewrite_hosts(&current, MINE, "127.0.0.1", &[]);
+
+        assert!(!content.contains("old.dev"));
+        assert!(content.contains(&format!("127.0.0.1 app.beta.dev {THEIRS}")));
+    }
+
+    #[test]
+    fn rewriting_twice_is_stable() {
+        let current = "127.0.0.1 localhost\n".to_string();
+        let wanted = hosts(&["b.alpha.dev", "a.alpha.dev"]);
+
+        let (once, _) = rewrite_hosts(&current, MINE, "127.0.0.1", &wanted);
+        let (twice, _) = rewrite_hosts(&once, MINE, "127.0.0.1", &wanted);
+
+        assert_eq!(once, twice);
+        // Entries are sorted, so the file order never flaps between runs
+        assert!(once.find("a.alpha.dev") < once.find("b.alpha.dev"));
     }
 }

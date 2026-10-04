@@ -37,27 +37,19 @@ fn load_cluster_config(config_path: Option<&str>) -> (crate::config::Config, Arc
     (config, cluster_config)
 }
 
-/// Create a K8sClient from config
+/// Create a K8sClient bound to the configured cluster's kubeconfig context.
+///
+/// Goes through `ClusterConfig` rather than reading `cluster.context` directly,
+/// so the per-cluster context derived from `cluster_name` applies when the user
+/// has not pinned one.
 async fn create_k8s_client(config_path: Option<&str>) -> Result<K8sClient> {
-    let loader = ConfigLoader::new(config_path);
-    let config = loader.load().unwrap_or_default();
+    let (_, cluster_config) = load_cluster_config(config_path);
 
-    let kubeconfig = if config.cluster.kubeconfig.is_empty() {
-        None
-    } else {
-        Some(config.cluster.kubeconfig.as_str())
-    };
-    let context = if config.cluster.context.is_empty() {
-        None
-    } else {
-        Some(config.cluster.context.as_str())
-    };
-
-    // Need to own the strings for the async call
-    let kc = kubeconfig.map(String::from);
-    let ctx = context.map(String::from);
-
-    K8sClient::new(kc.as_deref(), ctx.as_deref()).await
+    K8sClient::new(
+        cluster_config.kubeconfig.as_deref(),
+        cluster_config.context.as_deref(),
+    )
+    .await
 }
 
 /// Run a cluster action headlessly, printing output to stdout.
@@ -71,6 +63,9 @@ pub async fn run_cli_action(action: ClusterAction, config_path: Option<&str>) ->
     let timeout = refresh_config.cluster_operation_timeout;
 
     let (output_tx, mut output_rx) = mpsc::channel::<OutputLine>(100);
+
+    // The action takes ownership of the config; /etc/hosts needs it afterwards
+    let hosts_config = Arc::clone(&cluster_config);
 
     // Spawn the cluster action
     let action_handle = tokio::spawn(async move {
@@ -102,6 +97,18 @@ pub async fn run_cli_action(action: ClusterAction, config_path: Option<&str>) ->
 
     match result {
         Ok(Ok(Ok(()))) => {
+            // /etc/hosts follows the cluster: a start publishes this cluster's
+            // ingress hosts, a destroy drops them. Needing root for that is
+            // information — the action itself already succeeded, so it never
+            // changes the exit code.
+            if matches!(action, ClusterAction::Start | ClusterAction::Destroy { .. }) {
+                if let Err(e) = update_hosts_reporting(hosts_config).await {
+                    print_output_line(&OutputLine::info(format!(
+                        "Skipped /etc/hosts update: {}",
+                        e
+                    )));
+                }
+            }
             print_output_line(&OutputLine::success("Done."));
             Ok(0)
         }
@@ -392,17 +399,28 @@ pub async fn run_cli_bench(config_path: Option<&str>, json: bool) -> Result<i32>
 
 /// Update /etc/hosts with ingress entries
 pub async fn run_cli_update_hosts(config_path: Option<&str>) -> Result<i32> {
-    use crate::cluster::HostsUpdateResult;
-
-    let (config, _cluster_config) = load_cluster_config(config_path);
+    let (config, cluster_config) = load_cluster_config(config_path);
     let _ = crate::logging::init_logging(&config.logging, &config.infrastructure.cluster_name);
 
-    let domain = config.infrastructure.domain.clone();
+    update_hosts_reporting(cluster_config).await
+}
+
+/// Bring /etc/hosts in line with one cluster's ingresses and print the outcome.
+///
+/// Returns the exit code the standalone `update-hosts` command reports: 1 when
+/// the write could not happen unattended. Callers that only piggyback on a
+/// cluster action ignore it, since the action itself succeeded.
+async fn update_hosts_reporting(cluster_config: Arc<ClusterConfig>) -> Result<i32> {
+    use crate::cluster::HostsUpdateResult;
+
+    // Only this cluster's lines are ours to suggest; the file also carries the
+    // other clusters' blocks, which are already in place.
+    let hosts_marker = cluster_config.hosts_marker();
 
     let (output_tx, mut output_rx) = mpsc::channel::<OutputLine>(100);
 
     let update_handle = tokio::spawn(async move {
-        let mut ingress_manager = IngressManager::with_domain(domain);
+        let mut ingress_manager = IngressManager::for_cluster(&cluster_config);
         ingress_manager.update_hosts(Some(output_tx)).await
     });
 
@@ -422,10 +440,25 @@ pub async fn run_cli_update_hosts(config_path: Option<&str>) -> Result<i32> {
             Ok(0)
         }
         HostsUpdateResult::WrittenDirectly { count } => {
-            println!("\x1b[32m✓ Updated /etc/hosts with {} entries\x1b[0m", count);
+            if count == 0 {
+                println!("\x1b[32m✓ Removed this cluster's /etc/hosts entries\x1b[0m");
+            } else {
+                println!("\x1b[32m✓ Updated /etc/hosts with {} entries\x1b[0m", count);
+            }
             Ok(0)
         }
         HostsUpdateResult::NeedsSudo { content, count } => {
+            if count == 0 {
+                // The cluster is gone but its lines are still there
+                println!(
+                    "\x1b[33m⚠ Need elevated privileges to drop this cluster's /etc/hosts entries\x1b[0m"
+                );
+                println!(
+                    "Run `update-hosts` as root, or remove the lines marked {} yourself",
+                    hosts_marker
+                );
+                return Ok(1);
+            }
             println!(
                 "\x1b[33m⚠ Need elevated privileges to write {} entries to /etc/hosts\x1b[0m",
                 count
@@ -434,7 +467,7 @@ pub async fn run_cli_update_hosts(config_path: Option<&str>) -> Result<i32> {
             println!();
             // Extract just the k3dev entries from content
             for line in content.lines() {
-                if line.contains("# k3dev-ingress") {
+                if line.contains(&hosts_marker) {
                     println!("  {}", line);
                 }
             }
@@ -728,7 +761,7 @@ pub async fn run_cli_capture(
     use crate::app::AppMessage;
     use crate::capture;
 
-    let (config, _cluster_config) = load_cluster_config(config_path);
+    let (config, cluster_config) = load_cluster_config(config_path);
     let _ = crate::logging::init_logging(&config.logging, &config.infrastructure.cluster_name);
 
     // Resolve target.
@@ -775,6 +808,7 @@ pub async fn run_cli_capture(
 
     let spec = capture::CaptureSpec {
         target,
+        cgroup_root: cluster_config.cgroup_root(),
         output_path: output_path.clone(),
         image: image
             .map(String::from)

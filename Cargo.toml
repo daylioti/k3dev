@@ -96,7 +96,7 @@ base64 = "0.22"
 vt100 = "0.16"
 
 # Filesystem info (disk space check without shelling out to df)
-nix = { version = "0.29", features = ["fs"] }
+nix = { version = "0.29", features = ["fs", "process", "term"] }
 
 # Cross-platform URL opening
 open = "5"

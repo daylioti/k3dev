@@ -34,10 +34,16 @@ use crate::cluster::DockerManager;
 use sidecar::build_capture_config;
 
 /// Resolve a `CaptureTarget` to a Docker container name/id.
-async fn resolve_target(docker: &DockerManager, target: &CaptureTarget) -> Result<String> {
+async fn resolve_target(
+    docker: &DockerManager,
+    target: &CaptureTarget,
+    cgroup_root: &str,
+) -> Result<String> {
     match target {
         CaptureTarget::Pod { pod, namespace } => {
-            docker.find_pod_pause_container(pod, namespace).await
+            docker
+                .find_pod_pause_container(pod, namespace, cgroup_root)
+                .await
         }
         CaptureTarget::Container(name) => {
             if !docker.container_exists(name).await {
@@ -105,7 +111,7 @@ async fn run_capture(
     cancel: CancellationToken,
 ) -> Result<()> {
     // 1. Resolve target container.
-    let target_id = resolve_target(&docker, &spec.target).await?;
+    let target_id = resolve_target(&docker, &spec.target, &spec.cgroup_root).await?;
     let _ = msg_tx
         .send(AppMessage::CaptureStatus(format!("Target: {}", target_id)))
         .await;

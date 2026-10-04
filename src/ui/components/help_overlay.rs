@@ -125,6 +125,10 @@ impl HelpOverlay {
                         get_binding(&KeyAction::CommandPalette, ":"),
                         "Open command palette".to_string(),
                     ),
+                    (
+                        get_binding(&KeyAction::SwitchCluster, "c"),
+                        "Switch cluster".to_string(),
+                    ),
                     ("/".to_string(), "Search/filter menu".to_string()),
                     (
                         get_binding(&KeyAction::Help, "?"),

@@ -29,7 +29,7 @@ pub enum StartOutcome {
     FreshCreated,
 }
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -51,27 +51,120 @@ pub struct K3sManager {
 }
 
 impl K3sManager {
-    /// Docker volume name for rancher data (no sudo required)
-    pub(crate) const RANCHER_VOLUME_NAME: &'static str = "k3s-rancher-data";
-
     /// Rancher data directory inside container
     pub(crate) const RANCHER_DATA_PATH: &'static str = "/var/lib/rancher/k3s";
 
-    /// Docker volume name for local PV storage (no sudo required)
-    pub(crate) const LOCAL_PV_VOLUME_NAME: &'static str = "k3s-local-pv-data";
+    /// CLI contract version of the embedded k3dev-agent. Bump in lockstep with
+    /// `agent/src/main.rs::VERSION` so a stale agent baked into a prebuilt image
+    /// is replaced instead of silently reported as present.
+    pub(crate) const AGENT_VERSION: &'static str = "2";
 
-    /// Default PV storage path (used when Docker root is not yet detected)
-    pub(crate) const LOCAL_PV_STORAGE_PATH: &'static str =
-        "/var/lib/docker/volumes/k3s-local-pv-data/_data";
+    /// CLI contract version of the embedded k3dev-criproxy
+    pub(crate) const CRIPROXY_VERSION: &'static str = "1";
 
-    /// Get PV storage path based on Docker's actual data root directory
-    pub(crate) fn local_pv_storage_path(docker_root: &str) -> String {
-        format!("{}/volumes/k3s-local-pv-data/_data", docker_root)
+    /// Socket cri-dockerd talks to — served by k3dev-criproxy
+    pub(crate) const PROXY_DOCKER_SOCK: &'static str = "/var/run/docker.sock";
+
+    /// Where the real host Docker socket is bind-mounted, behind the proxy
+    pub(crate) const HOST_DOCKER_SOCK: &'static str = "/var/run/docker-host.sock";
+
+    /// The real Docker socket the proxy forwards to.
+    ///
+    /// On macOS the mounted Docker Desktop socket is a proxy that filters
+    /// container visibility and breaks cri-dockerd; the container runs with
+    /// `--pid=host`, so the VM's raw socket is reachable through /proc.
+    pub(crate) fn upstream_docker_sock() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "/proc/1/root/run/docker.sock"
+        } else {
+            Self::HOST_DOCKER_SOCK
+        }
     }
 
-    /// Get kubelet root dir based on Docker's actual data root directory
-    pub(crate) fn kubelet_root_dir(docker_root: &str) -> String {
-        format!("{}/kubelet", docker_root)
+    /// Shell prologue that brings up the CRI filtering proxy before k3s.
+    ///
+    /// Without it, two clusters sharing the host daemon see each other's pod
+    /// containers through cri-dockerd, decide the pod UIDs are unknown, and
+    /// garbage-collect each other's running sandboxes in a loop. The proxy
+    /// stamps `k3dev.cluster` on every container this cluster creates and
+    /// filters container listings by it, so each kubelet only ever sees its own.
+    ///
+    /// The binary is uploaded right after the container starts, so wait for it;
+    /// the restart loop keeps CRI alive if the proxy ever dies.
+    pub(crate) fn criproxy_prologue(config: &ClusterConfig) -> String {
+        format!(
+            "while [ ! -x /usr/local/bin/k3dev-criproxy ]; do sleep 0.2; done; \
+             (while true; do /usr/local/bin/k3dev-criproxy \
+               --listen {listen} --upstream {upstream} --cluster {cluster}; \
+               sleep 1; done) & \
+             while [ ! -S {listen} ]; do sleep 0.1; done; ",
+            listen = Self::PROXY_DOCKER_SOCK,
+            upstream = Self::upstream_docker_sock(),
+            cluster = config.cluster_name,
+        )
+    }
+
+    /// Build the `k3s server` flag list shared by fresh and snapshot startup.
+    ///
+    /// Every path and CIDR here is namespaced by cluster name or index so two
+    /// clusters can run against the same host Docker daemon without corrupting
+    /// each other's kubelet state, cgroups or DNS.
+    pub(crate) fn k3s_server_args(
+        config: &ClusterConfig,
+        docker_root: &str,
+        use_proxy: bool,
+    ) -> String {
+        // Point cri-dockerd at the filtering proxy rather than the raw daemon.
+        let docker_endpoint = if use_proxy {
+            format!(" --container-runtime-endpoint {}", Self::PROXY_DOCKER_SOCK)
+        } else {
+            String::new()
+        };
+
+        format!(
+            "/bin/k3s server \
+             --docker{docker_endpoint} \
+             --node-name={node} \
+             --disable=metrics-server \
+             --disable=servicelb \
+             --disable-cloud-controller \
+             --disable-network-policy \
+             --flannel-backend=host-gw \
+             --cluster-cidr={cluster_cidr} \
+             --service-cidr={service_cidr} \
+             --cluster-dns={cluster_dns} \
+             --default-local-storage-path {pv} \
+             --service-node-port-range 80-32767 \
+             --kubelet-arg=root-dir={kubelet} \
+             --kubelet-arg=cgroup-root={cgroup_root} \
+             --kubelet-arg=cgroup-driver=cgroupfs \
+             --kubelet-arg=image-gc-high-threshold=100 \
+             --kube-apiserver-arg=profiling=false \
+             --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
+             --kube-controller-manager-arg=concurrent-deployment-syncs=1",
+            docker_endpoint = docker_endpoint,
+            node = config.node_name(),
+            cluster_cidr = config.cluster_cidr(),
+            service_cidr = config.service_cidr(),
+            cluster_dns = config.cluster_dns(),
+            pv = config.local_pv_storage_path(docker_root),
+            kubelet = config.kubelet_root_dir(docker_root),
+            cgroup_root = config.cgroup_root(),
+        )
+    }
+
+    /// Docker labels stamped on this cluster's server container and images.
+    ///
+    /// `k3dev.role` is what separates the server from the pod containers the CRI
+    /// proxy stamps with the same `k3dev.cluster` value: those outlive a stopped
+    /// cluster, so "is this cluster up?" has to key on the role.
+    pub(crate) fn cluster_labels(
+        config: &ClusterConfig,
+    ) -> std::collections::HashMap<String, String> {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("k3dev.cluster".to_string(), config.cluster_name.clone());
+        labels.insert("k3dev.role".to_string(), "server".to_string());
+        labels
     }
 
     pub async fn new(config: Arc<ClusterConfig>) -> Result<Self> {
@@ -90,7 +183,7 @@ impl K3sManager {
         // Warn if Docker daemon architecture differs from binary's compile-time target_arch
         docker.check_architecture_mismatch().await;
 
-        let kube_ops = KubeOps::new();
+        let kube_ops = KubeOps::for_cluster(&config);
 
         Ok(Self {
             config,
@@ -165,14 +258,28 @@ impl K3sManager {
             let _ = output_tx
                 .send(OutputLine::info("Starting existing cluster container..."))
                 .await;
+            // Pod containers left over from a stop that did not sweep them - an
+            // older build, a plain `docker stop`, a host reboot - still hold a
+            // sandbox netns whose veth peer died with the previous server
+            // container. Remove them so kubelet builds fresh ones.
+            self.sweep_pod_containers(&output_tx).await;
             self.docker
                 .start_container(&self.config.container_name)
                 .await?;
             self.wait_for_api(&output_tx).await?;
 
+            // Refresh kubeconfig before hooks run: a container created by an
+            // older version has no pinned kubeconfig yet, and the merged entry
+            // can be stale if the API port changed while it was stopped.
+            self.setup_kubeconfig().await?;
+
             // Execute on_cluster_available hooks
             if self.config.hooks.has_hooks() {
-                let hook_executor = HookExecutor::new(self.config.hooks.clone());
+                let hook_executor = HookExecutor::new(
+                    self.config.hooks.clone(),
+                    self.config.pinned_kubeconfig(),
+                    self.config.context_name(),
+                );
                 hook_executor
                     .execute_hooks(HookEvent::OnClusterAvailable, output_tx.clone())
                     .await?;
@@ -183,7 +290,8 @@ impl K3sManager {
 
         // Create new cluster - check snapshot first
         if self.config.speedup.use_snapshot {
-            let snapshot_image = self.get_snapshot_image_name();
+            let docker_root = self.docker.get_docker_root_dir().await;
+            let snapshot_image = self.get_snapshot_image_name(&docker_root);
 
             // Fast path: use snapshot if it exists
             if self.docker.image_exists(&snapshot_image).await {
@@ -208,6 +316,23 @@ impl K3sManager {
             if let Err(e) = self.create_snapshot(&output_tx).await {
                 tracing::warn!(error = %e, "Snapshot creation failed but cluster is running");
             } else {
+                // Execute on_snapshot_created hooks (non-fatal, cluster is already up)
+                if self.config.hooks.has_hooks() {
+                    let hook_executor = HookExecutor::new(
+                        self.config.hooks.clone(),
+                        self.config.pinned_kubeconfig(),
+                        self.config.context_name(),
+                    );
+                    if let Err(e) = hook_executor
+                        .execute_hooks(HookEvent::OnSnapshotCreated, output_tx.clone())
+                        .await
+                    {
+                        let _ = output_tx
+                            .send(OutputLine::error(format!("Hook execution failed: {}", e)))
+                            .await;
+                    }
+                }
+
                 // Cleanup old snapshots if enabled
                 if self.config.speedup.snapshot_auto_cleanup {
                     if let Err(e) = self
@@ -239,6 +364,8 @@ impl K3sManager {
             .await;
         let image = self.config.k3s_image();
         let image_exists = self.docker.image_exists(&image).await;
+        let rancher_volume = self.config.rancher_volume_name();
+        let pv_volume = self.config.local_pv_volume_name();
 
         // Create volume, PV directory, network, and pull image in parallel
         let pull_future = async {
@@ -259,13 +386,13 @@ impl K3sManager {
                         "Creating Docker volume for rancher data...",
                     ))
                     .await;
-                self.docker.create_volume(Self::RANCHER_VOLUME_NAME).await
+                self.docker.create_volume(&rancher_volume).await
             },
             async {
                 let _ = output_tx
                     .send(OutputLine::info("Creating Docker volume for PV storage..."))
                     .await;
-                self.docker.create_volume(Self::LOCAL_PV_VOLUME_NAME).await
+                self.docker.create_volume(&pv_volume).await
             },
             async {
                 let _ = output_tx
@@ -278,10 +405,8 @@ impl K3sManager {
 
         // Get docker socket path, docker root, and iptables mode
         let socket_path = self.platform.docker_socket_path().await?;
-        let cgroup_driver = "cgroupfs";
         let docker_root = self.docker.get_docker_root_dir().await;
-        let pv_storage_path = Self::local_pv_storage_path(&docker_root);
-        let kubelet_root = Self::kubelet_root_dir(&docker_root);
+        let pv_storage_path = self.config.local_pv_storage_path(&docker_root);
         let iptables_mode = PlatformInfo::detect_iptables_mode();
 
         // Build port mappings
@@ -315,15 +440,15 @@ impl K3sManager {
         // Traefik is enabled (K3s built-in) and configured via HelmChartConfig CRD
         // Optimized flags to disable unnecessary components for faster startup
         //
-        // On macOS (Docker Desktop), the mounted Docker socket is a proxy that filters
-        // container visibility, breaking cri-dockerd. The container runs with --pid=host,
-        // so we can access the VM's raw Docker socket at /proc/1/root/run/docker.sock.
-        // Use --container-runtime-endpoint to tell cri-dockerd to use the raw socket.
-        let docker_endpoint = if cfg!(target_os = "macos") {
-            " --container-runtime-endpoint /proc/1/root/run/docker.sock"
-        } else {
-            ""
-        };
+        // The proxy speaks unix sockets only; a TCP DOCKER_HOST bypasses it,
+        // which means that setup supports one cluster at a time.
+        let use_proxy = docker_host_tcp_url().is_none();
+        if !use_proxy {
+            tracing::warn!(
+                "TCP Docker endpoint: CRI filtering proxy disabled, \
+                 running more than one cluster concurrently is unsafe"
+            );
+        }
 
         let k3s_command = vec![
             "/bin/sh".to_string(),
@@ -331,25 +456,15 @@ impl K3sManager {
             format!(
                 "nsenter --mount=/proc/1/ns/mnt modprobe br_netfilter 2>/dev/null || true && \
                  sysctl -w net.bridge.bridge-nf-call-iptables=1 2>/dev/null || true && \
-                 mkdir -p /run/k3s /sys/fs/cgroup/kubepods && \
-                 /bin/k3s server \
-                 --docker{docker_endpoint} \
-                 --disable=metrics-server \
-                 --disable=servicelb \
-                 --disable-cloud-controller \
-                 --disable-network-policy \
-                 --flannel-backend=host-gw \
-                 --default-local-storage-path {pv} \
-                 --service-node-port-range 80-32767 \
-                 --kubelet-arg=root-dir={kubelet} \
-                 --kubelet-arg=cgroup-driver={cgroup} \
-                 --kube-apiserver-arg=profiling=false \
-                 --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
-                 --kube-controller-manager-arg=concurrent-deployment-syncs=1",
-                docker_endpoint = docker_endpoint,
-                pv = pv_storage_path,
-                kubelet = kubelet_root,
-                cgroup = cgroup_driver
+                 mkdir -p /run/k3s {cgroup_path} && \
+                 {proxy}{server}",
+                cgroup_path = self.config.cgroup_root_path(),
+                proxy = if use_proxy {
+                    Self::criproxy_prologue(&self.config)
+                } else {
+                    String::new()
+                },
+                server = Self::k3s_server_args(&self.config, &docker_root, use_proxy),
             ),
         ];
 
@@ -369,13 +484,13 @@ impl K3sManager {
             ),
             // Docker volume for rancher data (server config, agent data) - no sudo required
             (
-                Self::RANCHER_VOLUME_NAME.to_string(),
+                self.config.rancher_volume_name(),
                 Self::RANCHER_DATA_PATH.to_string(),
                 "volume".to_string(),
             ),
             // Docker volume for local PV storage - accessible to pod containers via Docker's volume path
             (
-                Self::LOCAL_PV_VOLUME_NAME.to_string(),
+                self.config.local_pv_volume_name(),
                 pv_storage_path.clone(),
                 "volume".to_string(),
             ),
@@ -392,11 +507,13 @@ impl K3sManager {
             env.push(("DOCKER_HOST".to_string(), url.clone()));
         } else {
             // Mount the Docker socket for the container
+            // Mounted behind the proxy: cri-dockerd gets the filtered socket at
+            // /var/run/docker.sock, the proxy forwards here.
             volumes.insert(
                 0,
                 (
                     self.platform.docker_socket_mount_source(&socket_path),
-                    "/var/run/docker.sock".to_string(),
+                    Self::HOST_DOCKER_SOCK.to_string(),
                     String::new(),
                 ),
             );
@@ -417,11 +534,22 @@ impl K3sManager {
             entrypoint: Some(String::new()),
             command: Some(k3s_command),
             security_opt: vec!["apparmor=unconfined".to_string()],
-            labels: Default::default(),
+            labels: Self::cluster_labels(&self.config),
             auto_remove: false,
         };
 
         self.docker.run_container(&run_config).await?;
+
+        // The container's entrypoint blocks until this lands, so it has to be
+        // uploaded before anything waits on the API.
+        if use_proxy {
+            let _ = output_tx
+                .send(OutputLine::info("Installing CRI filtering proxy..."))
+                .await;
+            self.install_criproxy()
+                .await
+                .context("Failed to install CRI filtering proxy")?;
+        }
 
         // Wait for k3s API
         self.wait_for_api(output_tx).await?;
@@ -482,7 +610,11 @@ impl K3sManager {
 
         // Execute on_cluster_available hooks
         if self.config.hooks.has_hooks() {
-            let hook_executor = HookExecutor::new(self.config.hooks.clone());
+            let hook_executor = HookExecutor::new(
+                self.config.hooks.clone(),
+                self.config.pinned_kubeconfig(),
+                self.config.context_name(),
+            );
             hook_executor
                 .execute_hooks(HookEvent::OnClusterAvailable, output_tx.clone())
                 .await?;
@@ -521,10 +653,44 @@ impl K3sManager {
             .stop_container(&self.config.container_name)
             .await?;
 
+        self.sweep_pod_containers(&output_tx).await;
+
         let _ = output_tx
             .send(OutputLine::success("K3s cluster stopped"))
             .await;
         Ok(())
+    }
+
+    /// Remove this cluster's pod containers.
+    ///
+    /// The CNI bridge and every veth peer live in the server container's
+    /// network namespace, which is destroyed and rebuilt whenever that
+    /// container stops and starts. A pod container that survives keeps a
+    /// sandbox namespace holding nothing but `lo`, and kubelet only rebuilds
+    /// the sandboxes whose probes fail - a pod without a probe stays Ready
+    /// with no network at all. Pod containers therefore cannot outlive the
+    /// namespace they were wired into.
+    ///
+    /// Best-effort: a container that fails to go is logged, not fatal, because
+    /// the cluster still has to stop.
+    async fn sweep_pod_containers(&self, output_tx: &mpsc::Sender<OutputLine>) {
+        let names = self
+            .docker
+            .list_cluster_pod_containers(&self.config.cluster_name)
+            .await;
+
+        if names.is_empty() {
+            return;
+        }
+
+        let _ = output_tx
+            .send(OutputLine::info(format!(
+                "Removing {} pod containers (recreated on start)...",
+                names.len()
+            )))
+            .await;
+
+        self.docker.remove_containers(&names).await;
     }
 
     /// Delete the k3s cluster and cleanup. With `delete_snapshots` the snapshot
@@ -593,7 +759,7 @@ impl K3sManager {
                 if foreign > 0 {
                     let _ = output_tx
                         .send(OutputLine::info(format!(
-                            "Left {} pod container(s) from another Kubernetes install untouched",
+                            "Left {} pod container(s) of other clusters untouched",
                             foreign
                         )))
                         .await;
@@ -638,6 +804,9 @@ impl K3sManager {
             .send(OutputLine::info("Cleaning up cluster resources..."))
             .await;
 
+        let rancher_volume = self.config.rancher_volume_name();
+        let pv_volume = self.config.local_pv_volume_name();
+
         let (
             network_result,
             rancher_volume_result,
@@ -646,8 +815,8 @@ impl K3sManager {
             snapshot_result,
         ) = tokio::join!(
             self.docker.remove_network(&self.config.network_name),
-            self.docker.remove_volume(Self::RANCHER_VOLUME_NAME),
-            self.docker.remove_volume(Self::LOCAL_PV_VOLUME_NAME),
+            self.docker.remove_volume(&rancher_volume),
+            self.docker.remove_volume(&pv_volume),
             self.cleanup_kubeconfig(),
             async {
                 if delete_snapshots {
@@ -665,6 +834,8 @@ impl K3sManager {
         kubeconfig_result?;
         snapshot_result?;
 
+        crate::cluster::registry::release_index(&self.config.cluster_name);
+
         let _ = output_tx
             .send(OutputLine::success("K3s cluster deleted"))
             .await;
@@ -672,7 +843,7 @@ impl K3sManager {
         if !delete_snapshots {
             let kept = self
                 .docker
-                .list_images_by_pattern("k3dev-snapshot-")
+                .list_images_by_pattern(&self.config.snapshot_prefix(), &self.config.cluster_name)
                 .await
                 .unwrap_or_default();
             if !kept.is_empty() {
@@ -709,7 +880,7 @@ impl K3sManager {
             return Vec::new();
         }
         let docker_root = self.docker.get_docker_root_dir().await;
-        let pods_dir = format!("{}/pods", Self::kubelet_root_dir(&docker_root));
+        let pods_dir = format!("{}/pods", self.config.kubelet_root_dir(&docker_root));
         // Destroy exists to clean up broken clusters, so a container that is
         // running but wedged must not stall it: give up and fall back to the
         // mounts of the pod containers themselves.
@@ -736,22 +907,29 @@ impl K3sManager {
 
     /// Splits the host daemon's `k8s_*` containers into the ones this cluster
     /// created and a count of the ones it did not, so `delete` never touches
-    /// another Kubernetes install's workloads.
+    /// another cluster's workloads.
     ///
     /// Every kubelet on a shared Docker daemon names its containers `k8s_*`, so
     /// the prefix identifies a pod container but not its owner. Ownership comes
-    /// from the pod UID instead: k3dev runs kubelet with
-    /// `--kubelet-arg=root-dir={docker_root}/kubelet`, so pod state mounted from
-    /// that path is ours, and `kubelet_pod_uids` covers the pods that have no
-    /// such mount yet. The UID then claims the whole pod, including its sandbox
-    /// (`k8s_POD_*`), which carries no mounts of its own.
+    /// from three places. The CRI proxy labels every container it creates for
+    /// this cluster, which holds even once the cluster is stopped. Kubelet runs
+    /// with a per-cluster `root-dir`, so pod state mounted from that path is
+    /// ours, and `kubelet_pod_uids` covers the pods that have no such mount yet.
+    /// A UID then claims the whole pod, including its sandbox (`k8s_POD_*`),
+    /// which carries no mounts of its own.
     async fn owned_pod_containers(
         &self,
         kubelet_pod_uids: &[String],
     ) -> Result<(Vec<String>, usize)> {
         let docker_root = self.docker.get_docker_root_dir().await;
-        let pods_dir = format!("{}/pods/", Self::kubelet_root_dir(&docker_root));
+        let pods_dir = format!("{}/pods/", self.config.kubelet_root_dir(&docker_root));
         let containers = self.docker.list_containers_with_mounts("k8s_").await?;
+        let labelled: HashSet<String> = self
+            .docker
+            .list_cluster_pod_containers(&self.config.cluster_name)
+            .await
+            .into_iter()
+            .collect();
 
         let mut owned: HashSet<&str> = kubelet_pod_uids.iter().map(String::as_str).collect();
         owned.extend(
@@ -767,7 +945,10 @@ impl K3sManager {
         let (mine, foreign): (Vec<_>, Vec<_>) = containers
             .iter()
             .filter(|c| c.container_name.starts_with("k8s_"))
-            .partition(|c| Self::pod_uid(&c.container_name).is_some_and(|uid| owned.contains(uid)));
+            .partition(|c| {
+                labelled.contains(&c.container_name)
+                    || Self::pod_uid(&c.container_name).is_some_and(|uid| owned.contains(uid))
+            });
 
         Ok((
             mine.into_iter().map(|c| c.container_name.clone()).collect(),
@@ -776,43 +957,51 @@ impl K3sManager {
     }
 
     /// Shell script that releases the cluster state left in the host mount
-    /// namespace: lazily unmount everything k3s mounted under Docker's data
-    /// root, then delete the kubelet state directory (it lives on the host
-    /// filesystem, not in a volume, so removing volumes does not clear it).
+    /// namespace: lazily unmount everything this cluster's k3s mounted under
+    /// Docker's data root, then delete its kubelet state directory (it lives on
+    /// the host filesystem, not in a volume, so removing volumes does not clear
+    /// it).
     ///
-    /// Returns `None` unless the data root is a plain absolute path. The root is
-    /// interpolated into a script that runs `rm -rf` as root in a privileged
-    /// container, so a path holding a space or a quote would delete the wrong
-    /// directory - skipping cleanup is the safe answer for those.
-    fn host_cleanup_script(docker_root: &str) -> Option<String> {
-        let root = docker_root.trim_end_matches('/');
-        if !root.starts_with('/')
-            || !root
-                .chars()
+    /// Returns `None` unless the data root is a plain absolute path and the
+    /// cluster name a plain path component. Both are interpolated into a script
+    /// that runs `rm -rf` as root in a privileged container, so a space, a
+    /// quote or a `/` would delete the wrong directory - skipping cleanup is
+    /// the safe answer for those.
+    fn host_cleanup_script(config: &ClusterConfig, docker_root: &str) -> Option<String> {
+        let plain = |s: &str| {
+            s.chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+        };
+        let root = docker_root.trim_end_matches('/');
+        let name = &config.cluster_name;
+        if !root.starts_with('/')
+            || !plain(root)
+            || name.is_empty()
+            || name.contains('/')
+            || !plain(name)
         {
             return None;
         }
-        let kubelet = Self::kubelet_root_dir(root);
+        let kubelet = config.kubelet_root_dir(root);
         // `.` is the only regex metacharacter the guard above lets through, and
-        // it shows up in a rootless data root (~/.local/share/docker), where an
-        // unescaped `.` would widen the pattern to unrelated mounts.
-        let root_pattern = root.replace('.', "\\.");
-        let kubelet_pattern = kubelet.replace('.', "\\.");
+        // it shows up in a rootless data root (~/.local/share/docker) or a
+        // dotted cluster name, where an unescaped `.` would widen the pattern
+        // to unrelated mounts.
+        let escape = |s: &str| s.replace('.', "\\.");
         // Unmount deepest paths first (sort -r) so parent mounts are freed after
-        // their children. Covers pod mounts under kubelet/ and the local-path/PV
-        // and rancher volume data directories. The kubelet directory is only
-        // deleted once nothing is mounted under it, so a failed unmount can
-        // never make `rm -rf` delete through a live bind mount.
+        // their children. Covers pod mounts under the kubelet root and the
+        // local-path/PV and rancher volume data directories. The kubelet
+        // directory is only deleted once nothing is mounted under it, so a
+        // failed unmount can never make `rm -rf` delete through a live bind mount.
         Some(format!(
             "awk '{{print $2}}' /proc/mounts | \
-             grep -E '^{root}/(kubelet|volumes/({rancher}|{pv}))(/|$)' | \
+             grep -E '^({kubelet_pattern}|{root}/volumes/({rancher}|{pv}))(/|$)' | \
              sort -r | while IFS= read -r m; do umount -l \"$m\" 2>/dev/null || true; done; \
              awk '{{print $2}}' /proc/mounts | grep -qE '^{kubelet_pattern}(/|$)' || rm -rf \"{kubelet}\"",
-            root = root_pattern,
-            rancher = Self::RANCHER_VOLUME_NAME,
-            pv = Self::LOCAL_PV_VOLUME_NAME,
-            kubelet_pattern = kubelet_pattern,
+            kubelet_pattern = escape(&kubelet),
+            root = escape(root),
+            rancher = escape(&config.rancher_volume_name()),
+            pv = escape(&config.local_pv_volume_name()),
             kubelet = kubelet,
         ))
     }
@@ -823,10 +1012,11 @@ impl K3sManager {
     /// Errors are non-fatal (best-effort cleanup).
     async fn cleanup_host_state(&self, image: &str) {
         let docker_root = self.docker.get_docker_root_dir().await;
-        let Some(script) = Self::host_cleanup_script(&docker_root) else {
+        let Some(script) = Self::host_cleanup_script(&self.config, &docker_root) else {
             tracing::warn!(
                 docker_root = %docker_root,
-                "Docker data root is not a plain absolute path: skipping host mount cleanup"
+                cluster = %self.config.cluster_name,
+                "Docker data root or cluster name is not a plain path: skipping host mount cleanup"
             );
             return;
         };
@@ -953,6 +1143,13 @@ impl K3sManager {
 mod tests {
     use super::*;
 
+    fn named(cluster: &str) -> ClusterConfig {
+        ClusterConfig {
+            cluster_name: cluster.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn pod_uid_reads_the_uid_field_of_kubelet_container_names() {
         let uid = "7117180a-b65d-4815-adaa-bdc9a993c36a";
@@ -977,11 +1174,11 @@ mod tests {
 
     #[test]
     fn host_cleanup_script_targets_cluster_paths_only() {
-        let script = K3sManager::host_cleanup_script("/mnt/data/docker").unwrap();
+        let script = K3sManager::host_cleanup_script(&named("alpha"), "/mnt/data/docker").unwrap();
 
-        // Unmounts only the kubelet root and the two k3dev volumes, deepest first
+        // Unmounts only this cluster's kubelet root and volumes, deepest first
         assert!(script.contains(
-            "^/mnt/data/docker/(kubelet|volumes/(k3s-rancher-data|k3s-local-pv-data))(/|$)"
+            "^(/mnt/data/docker/kubelet-alpha|/mnt/data/docker/volumes/(alpha-rancher-data|alpha-local-pv-data))(/|$)"
         ));
         assert!(script.contains("sort -r"));
         assert!(script.contains("while IFS= read -r m"));
@@ -989,37 +1186,81 @@ mod tests {
 
         // Kubelet state is only deleted when nothing is mounted under it
         assert!(script.contains(
-            "grep -qE '^/mnt/data/docker/kubelet(/|$)' || rm -rf \"/mnt/data/docker/kubelet\""
+            "grep -qE '^/mnt/data/docker/kubelet-alpha(/|$)' || rm -rf \"/mnt/data/docker/kubelet-alpha\""
         ));
     }
 
     #[test]
     fn host_cleanup_script_normalizes_trailing_slash() {
-        let script = K3sManager::host_cleanup_script("/var/lib/docker/").unwrap();
+        let script = K3sManager::host_cleanup_script(&named("alpha"), "/var/lib/docker/").unwrap();
 
         assert!(!script.contains("//"));
-        assert!(script.contains("rm -rf \"/var/lib/docker/kubelet\""));
+        assert!(script.contains("rm -rf \"/var/lib/docker/kubelet-alpha\""));
     }
 
     #[test]
     fn host_cleanup_script_escapes_dots_in_grep_patterns() {
-        let script = K3sManager::host_cleanup_script("/home/dev/.local/share/docker").unwrap();
+        let script =
+            K3sManager::host_cleanup_script(&named("my.app"), "/home/dev/.local/share/docker")
+                .unwrap();
 
         // Patterns escape the dot so it cannot match unrelated mount paths...
-        assert!(script.contains("^/home/dev/\\.local/share/docker/(kubelet|"));
-        assert!(script.contains("grep -qE '^/home/dev/\\.local/share/docker/kubelet(/|$)'"));
+        assert!(script.contains("^(/home/dev/\\.local/share/docker/kubelet-my\\.app|"));
+        assert!(script.contains("volumes/(my\\.app-rancher-data|my\\.app-local-pv-data)"));
+        assert!(
+            script.contains("grep -qE '^/home/dev/\\.local/share/docker/kubelet-my\\.app(/|$)'")
+        );
         // ...while the rm target stays a literal path
-        assert!(script.contains("rm -rf \"/home/dev/.local/share/docker/kubelet\""));
+        assert!(script.contains("rm -rf \"/home/dev/.local/share/docker/kubelet-my.app\""));
     }
 
     #[test]
     fn host_cleanup_script_rejects_unsafe_roots() {
+        let config = named("alpha");
         // A space would make the unquoted-word split delete the wrong directory
-        assert!(K3sManager::host_cleanup_script("/Users/jane doe/docker").is_none());
+        assert!(K3sManager::host_cleanup_script(&config, "/Users/jane doe/docker").is_none());
         // Shell metacharacters and relative roots never reach the script
-        assert!(K3sManager::host_cleanup_script("/var/lib/docker\"; rm -rf /").is_none());
-        assert!(K3sManager::host_cleanup_script("/var/lib/$(whoami)").is_none());
-        assert!(K3sManager::host_cleanup_script("var/lib/docker").is_none());
-        assert!(K3sManager::host_cleanup_script("").is_none());
+        assert!(K3sManager::host_cleanup_script(&config, "/var/lib/docker\"; rm -rf /").is_none());
+        assert!(K3sManager::host_cleanup_script(&config, "/var/lib/$(whoami)").is_none());
+        assert!(K3sManager::host_cleanup_script(&config, "var/lib/docker").is_none());
+        assert!(K3sManager::host_cleanup_script(&config, "").is_none());
+    }
+
+    #[test]
+    fn host_cleanup_script_rejects_unsafe_cluster_names() {
+        // The name becomes part of the `rm -rf` target, so a slash could walk
+        // out of the data root and anything else could break the quoting
+        for name in ["", "a/../../etc", "a b", "a\"b", "$(whoami)"] {
+            assert!(
+                K3sManager::host_cleanup_script(&named(name), "/var/lib/docker").is_none(),
+                "accepted cluster name {:?}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_labels_mark_the_server_role() {
+        let config = named("alpha");
+        let labels = K3sManager::cluster_labels(&config);
+
+        assert_eq!(
+            labels.get("k3dev.cluster").map(String::as_str),
+            Some("alpha")
+        );
+        // The CRI proxy stamps `k3dev.cluster` on pod containers too, and those
+        // outlive a stopped cluster; the role is what identifies the server.
+        assert_eq!(labels.get("k3dev.role").map(String::as_str), Some("server"));
+    }
+
+    #[test]
+    fn criproxy_prologue_waits_for_binary_and_socket() {
+        let config = named("alpha");
+        let prologue = K3sManager::criproxy_prologue(&config);
+
+        assert!(prologue.contains("--cluster alpha"));
+        // k3s must not come up before the filtered socket exists, or its
+        // cri-dockerd connects straight to the unfiltered daemon.
+        assert!(prologue.contains(&format!("while [ ! -S {} ]", K3sManager::PROXY_DOCKER_SOCK)));
     }
 }

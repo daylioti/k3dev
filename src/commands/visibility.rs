@@ -13,13 +13,15 @@ use crate::k8s::{K8sClient, PodExecutor};
 
 /// Evaluate a `VisibleCheck`. A timeout elapsing — or a missing k8s/docker
 /// client when the check needs one — is treated as "not visible".
+/// `host_env` is added to the environment of host-target checks.
 pub async fn check_visible(
     check: &VisibleCheck,
     k8s: Option<&K8sClient>,
     docker: Option<&DockerManager>,
     timeout: Duration,
+    host_env: &[(String, String)],
 ) -> Result<bool> {
-    let fut = run(check, k8s, docker);
+    let fut = run(check, k8s, docker, host_env);
     match tokio::time::timeout(timeout, fut).await {
         Ok(res) => res,
         Err(_) => Ok(false),
@@ -30,6 +32,7 @@ async fn run(
     check: &VisibleCheck,
     k8s: Option<&K8sClient>,
     docker: Option<&DockerManager>,
+    host_env: &[(String, String)],
 ) -> Result<bool> {
     match check {
         VisibleCheck::Pod {
@@ -53,7 +56,7 @@ async fn run(
             };
             Ok(docker.container_exists(container).await)
         }
-        VisibleCheck::Exec(cfg) => run_exec(cfg, k8s, docker).await,
+        VisibleCheck::Exec(cfg) => run_exec(cfg, k8s, docker, host_env).await,
     }
 }
 
@@ -61,9 +64,10 @@ async fn run_exec(
     exec: &ExecConfig,
     k8s: Option<&K8sClient>,
     docker: Option<&DockerManager>,
+    host_env: &[(String, String)],
 ) -> Result<bool> {
     match &exec.target {
-        ExecutionTarget::Host => run_host(&exec.workdir, &exec.cmd).await,
+        ExecutionTarget::Host => run_host(&exec.workdir, &exec.cmd, host_env).await,
         ExecutionTarget::Docker { container } => {
             let Some(docker) = docker else {
                 return Ok(false);
@@ -114,9 +118,9 @@ async fn run_exec(
     }
 }
 
-async fn run_host(workdir: &str, cmd: &str) -> Result<bool> {
+async fn run_host(workdir: &str, cmd: &str, env: &[(String, String)]) -> Result<bool> {
     let mut command = tokio::process::Command::new("sh");
-    command.arg("-c").arg(cmd);
+    command.arg("-c").arg(cmd).envs(env.iter().cloned());
     if !workdir.is_empty() {
         command.current_dir(workdir);
     }
@@ -132,5 +136,27 @@ fn build_shell_cmd(workdir: &str, cmd: &str) -> String {
         cmd.to_string()
     } else {
         format!("cd {} && {}", workdir, cmd)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn host_exec_check_runs_with_the_cluster_env() {
+        let check = VisibleCheck::Exec(ExecConfig {
+            target: ExecutionTarget::Host,
+            workdir: String::new(),
+            cmd: r#"test "$K3DEV_CONTEXT" = k3dev"#.to_string(),
+            input: Default::default(),
+        });
+        let env = vec![("K3DEV_CONTEXT".to_string(), "k3dev".to_string())];
+
+        let visible = check_visible(&check, None, None, Duration::from_secs(5), &env)
+            .await
+            .unwrap();
+
+        assert!(visible);
     }
 }

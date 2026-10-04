@@ -1,12 +1,12 @@
 //! Kubernetes operations using the kube crate (replaces kubectl commands)
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Namespace, Node, Pod, Secret, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::ByteString;
 use kube::api::{Api, DynamicObject, ListParams, Patch, PatchParams, PostParams};
-use kube::config::Kubeconfig;
+use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::discovery::ApiResource;
 use kube::{Client, Config};
 use once_cell::sync::Lazy;
@@ -28,17 +28,71 @@ static PATH_PREFIX_REGEX: Lazy<Regex> = Lazy::new(|| {
 /// Creates connection on first use, handles cases where cluster isn't ready yet
 pub struct KubeOps {
     client: Option<Client>,
+    /// Kubeconfig path override (None = default `~/.kube/config` discovery)
+    kubeconfig: Option<String>,
+    /// Kubeconfig context to bind to. Without this every k3dev process would
+    /// drive whichever cluster wrote `current-context` last.
+    context: Option<String>,
 }
 
 impl KubeOps {
     pub fn new() -> Self {
-        Self { client: None }
+        Self {
+            client: None,
+            kubeconfig: None,
+            context: None,
+        }
+    }
+
+    /// Bind this KubeOps to one cluster's kubeconfig context
+    pub fn for_cluster(config: &crate::cluster::ClusterConfig) -> Self {
+        Self {
+            client: None,
+            kubeconfig: config.kubeconfig.clone(),
+            context: config.context.clone(),
+        }
+    }
+
+    /// Bind to an explicit (kubeconfig, context) pair — for spawned tasks that
+    /// can only carry owned strings across the await boundary.
+    pub fn with_context(kubeconfig: Option<String>, context: Option<String>) -> Self {
+        Self {
+            client: None,
+            kubeconfig,
+            context,
+        }
+    }
+
+    /// Build a client config, honoring the bound context when one is set and
+    /// falling back to ambient inference otherwise.
+    async fn build_config(&self) -> Result<Config> {
+        let context = self.context.as_deref().filter(|s| !s.is_empty());
+        let kubeconfig_path = self.kubeconfig.as_deref().filter(|s| !s.is_empty());
+
+        if context.is_none() && kubeconfig_path.is_none() {
+            return Ok(Config::infer().await?);
+        }
+
+        let path = match kubeconfig_path {
+            Some(p) => crate::config::expand_home(std::path::Path::new(p))?,
+            None => dirs::home_dir()
+                .ok_or_else(|| anyhow!("Cannot find home directory"))?
+                .join(".kube")
+                .join("config"),
+        };
+
+        let kubeconfig = Kubeconfig::read_from(&path)?;
+        let options = KubeConfigOptions {
+            context: context.map(String::from),
+            ..Default::default()
+        };
+        Ok(Config::from_custom_kubeconfig(kubeconfig, &options).await?)
     }
 
     /// Get or create the kube client
     async fn client(&mut self) -> Result<&Client> {
         if self.client.is_none() {
-            let config = Config::infer().await?;
+            let config = self.build_config().await?;
             let client = Client::try_from(config)?;
             self.client = Some(client);
         }
@@ -49,7 +103,7 @@ impl KubeOps {
     /// Try to get client, returns None if cluster not accessible
     async fn try_client(&mut self) -> Option<&Client> {
         if self.client.is_none() {
-            let config = Config::infer().await.ok()?;
+            let config = self.build_config().await.ok()?;
             let client = Client::try_from(config).ok()?;
             self.client = Some(client);
         }
@@ -481,6 +535,125 @@ impl KubeOps {
 
     // ==================== Kubeconfig Management ====================
 
+    /// Rewrite the raw `k3s.yaml` into a standalone, single-cluster kubeconfig.
+    ///
+    /// k3s names its cluster/user/context `default`; they are renamed to `name`
+    /// and the server URL is replaced with `server`. `current-context` points at
+    /// this cluster, so anything handed this file as `KUBECONFIG` talks to it
+    /// regardless of what the user's global current-context happens to be.
+    pub fn rename_kubeconfig_entries(
+        generated: Kubeconfig,
+        name: &str,
+        server: &str,
+    ) -> Result<Kubeconfig> {
+        let mut cluster = generated
+            .clusters
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("k3s kubeconfig has no cluster entry"))?;
+        let mut auth_info = generated
+            .auth_infos
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("k3s kubeconfig has no user entry"))?;
+        let mut context = generated
+            .contexts
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("k3s kubeconfig has no context entry"))?;
+
+        cluster.name = name.to_string();
+        if let Some(c) = cluster.cluster.as_mut() {
+            c.server = Some(server.to_string());
+        }
+        auth_info.name = name.to_string();
+        context.name = name.to_string();
+        if let Some(c) = context.context.as_mut() {
+            c.cluster = name.to_string();
+            c.user = Some(name.to_string());
+        }
+
+        Ok(Kubeconfig {
+            api_version: Some("v1".to_string()),
+            kind: Some("Config".to_string()),
+            clusters: vec![cluster],
+            auth_infos: vec![auth_info],
+            contexts: vec![context],
+            current_context: Some(name.to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// Merge one cluster's entries into an existing kubeconfig.
+    ///
+    /// Each entry is merged retain-by-name-then-push so unrelated contexts
+    /// survive untouched.
+    pub async fn merge_kubeconfig_entries(
+        path: &std::path::Path,
+        standalone: &Kubeconfig,
+        name: &str,
+    ) -> Result<()> {
+        // Never fall back to an empty config on a parse failure: writing that
+        // back would replace every context the user has with just this one.
+        // (An empty or missing file legitimately parses as the default.)
+        let mut merged = if path.exists() {
+            Kubeconfig::read_from(path).with_context(|| {
+                format!(
+                    "Failed to parse existing kubeconfig {}; refusing to overwrite it",
+                    path.display()
+                )
+            })?
+        } else {
+            Kubeconfig::default()
+        };
+
+        merged.clusters.retain(|c| c.name != name);
+        merged.clusters.extend(standalone.clusters.iter().cloned());
+        merged.auth_infos.retain(|a| a.name != name);
+        merged
+            .auth_infos
+            .extend(standalone.auth_infos.iter().cloned());
+        merged.contexts.retain(|c| c.name != name);
+        merged.contexts.extend(standalone.contexts.iter().cloned());
+
+        // Point at the cluster we just started, but only claim the slot if
+        // nothing valid is there — switching a user's context out from under
+        // them is exactly the destructiveness this merge exists to avoid.
+        // Hooks never rely on this; they get the standalone file instead.
+        let current_valid = merged
+            .current_context
+            .as_ref()
+            .is_some_and(|cur| merged.contexts.iter().any(|c| &c.name == cur));
+        if !current_valid {
+            merged.current_context = Some(name.to_string());
+        }
+
+        if merged.api_version.is_none() {
+            merged.api_version = Some("v1".to_string());
+        }
+        if merged.kind.is_none() {
+            merged.kind = Some("Config".to_string());
+        }
+
+        Self::write_kubeconfig(path, &merged).await
+    }
+
+    /// Write a kubeconfig with owner-only permissions
+    pub async fn write_kubeconfig(path: &std::path::Path, config: &Kubeconfig) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(path, serde_yml::to_string(config)?).await?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+
+        Ok(())
+    }
+
     /// Remove cluster, context, and user entries from kubeconfig
     /// This replaces `kubectl config delete-cluster/context/user`
     pub async fn cleanup_kubeconfig_entries(
@@ -591,4 +764,141 @@ pub struct IngressInfo {
 pub struct IngressRouteInfo {
     pub host: String,
     pub path: String,
+}
+
+#[cfg(test)]
+mod kubeconfig_tests {
+    use super::*;
+    use kube::config::Kubeconfig;
+
+    /// k3s emits everything under the name `default`
+    fn k3s_yaml() -> Kubeconfig {
+        Kubeconfig::from_yaml(
+            r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: default
+  cluster:
+    server: https://127.0.0.1:6443
+    certificate-authority-data: Q0E=
+users:
+- name: default
+  user:
+    client-certificate-data: Q0VSVA==
+contexts:
+- name: default
+  context:
+    cluster: default
+    user: default
+current-context: default
+"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rename_produces_standalone_config_pinned_to_this_cluster() {
+        let standalone =
+            KubeOps::rename_kubeconfig_entries(k3s_yaml(), "k3dev", "https://127.0.0.1:7443")
+                .unwrap();
+
+        assert_eq!(standalone.clusters[0].name, "k3dev");
+        assert_eq!(standalone.auth_infos[0].name, "k3dev");
+        assert_eq!(standalone.contexts[0].name, "k3dev");
+        assert_eq!(
+            standalone.clusters[0].cluster.as_ref().unwrap().server,
+            Some("https://127.0.0.1:7443".to_string())
+        );
+        // The whole point: a hook pointed at this file lands on this cluster
+        // no matter what the user's global current-context says.
+        assert_eq!(standalone.current_context, Some("k3dev".to_string()));
+    }
+
+    #[tokio::test]
+    async fn merge_keeps_unrelated_contexts_and_refreshes_stale_own_entry() {
+        let dir = std::env::temp_dir().join("k3dev-kubeconfig-merge-test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("config");
+        tokio::fs::write(
+            &path,
+            r#"
+apiVersion: v1
+kind: Config
+clusters:
+- name: work
+  cluster:
+    server: https://work.example:6443
+users:
+- name: work
+  user: {}
+contexts:
+- name: work
+  context:
+    cluster: work
+    user: work
+current-context: work
+"#,
+        )
+        .await
+        .unwrap();
+
+        let standalone =
+            KubeOps::rename_kubeconfig_entries(k3s_yaml(), "k3dev", "https://127.0.0.1:6443")
+                .unwrap();
+        KubeOps::merge_kubeconfig_entries(&path, &standalone, "k3dev")
+            .await
+            .unwrap();
+
+        let merged = Kubeconfig::read_from(&path).unwrap();
+        let names: Vec<_> = merged.contexts.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"work"));
+        assert!(names.contains(&"k3dev"));
+        // A valid user context is never stolen
+        assert_eq!(merged.current_context, Some("work".to_string()));
+    }
+
+    /// A kubeconfig that does not parse must abort the merge: treating it as
+    /// empty would write this cluster back over every context the user has.
+    #[tokio::test]
+    async fn merge_refuses_to_clobber_a_kubeconfig_it_cannot_parse() {
+        let dir = std::env::temp_dir().join("k3dev-kubeconfig-broken-test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("config");
+        let broken = "clusters: [oops\n";
+        tokio::fs::write(&path, broken).await.unwrap();
+
+        let standalone =
+            KubeOps::rename_kubeconfig_entries(k3s_yaml(), "k3dev", "https://127.0.0.1:6443")
+                .unwrap();
+
+        assert!(
+            KubeOps::merge_kubeconfig_entries(&path, &standalone, "k3dev")
+                .await
+                .is_err()
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), broken);
+    }
+
+    /// An empty `~/.kube/config` is not a parse failure — the merge still has to
+    /// produce this cluster's entries.
+    #[tokio::test]
+    async fn merge_into_an_empty_file_writes_this_cluster() {
+        let dir = std::env::temp_dir().join("k3dev-kubeconfig-empty-test");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("config");
+        tokio::fs::write(&path, "").await.unwrap();
+
+        let standalone =
+            KubeOps::rename_kubeconfig_entries(k3s_yaml(), "k3dev", "https://127.0.0.1:6443")
+                .unwrap();
+        KubeOps::merge_kubeconfig_entries(&path, &standalone, "k3dev")
+            .await
+            .unwrap();
+
+        let merged = Kubeconfig::read_from(&path).unwrap();
+        assert_eq!(merged.contexts.len(), 1);
+        assert_eq!(merged.contexts[0].name, "k3dev");
+        assert_eq!(merged.current_context, Some("k3dev".to_string()));
+    }
 }

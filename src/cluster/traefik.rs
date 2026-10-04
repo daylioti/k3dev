@@ -25,8 +25,8 @@ pub struct TraefikManager {
 impl TraefikManager {
     pub fn new(config: Arc<ClusterConfig>) -> Self {
         Self {
+            kube_ops: KubeOps::for_cluster(&config),
             config,
-            kube_ops: KubeOps::new(),
         }
     }
 
@@ -81,7 +81,7 @@ impl TraefikManager {
 
     /// Setup TLS certificates using built-in rcgen CA
     async fn setup_certificates(&self, output_tx: &mpsc::Sender<OutputLine>) -> Result<()> {
-        let certs_dir = ClusterConfig::certs_dir();
+        let certs_dir = self.config.certs_dir();
         fs::create_dir_all(&certs_dir).await?;
 
         let cert_path = certs_dir.join("local-cert.pem");
@@ -445,7 +445,7 @@ impl TraefikManager {
 
     /// Create Kubernetes TLS secret
     async fn create_tls_secret(&mut self, output_tx: &mpsc::Sender<OutputLine>) -> Result<()> {
-        let certs_dir = ClusterConfig::certs_dir();
+        let certs_dir = self.config.certs_dir();
         let cert_path = certs_dir.join("local-cert.pem");
         let key_path = certs_dir.join("local-key.pem");
 
@@ -486,7 +486,11 @@ impl TraefikManager {
             dashboard_domain
         );
 
-        // HelmChartConfig to customize K3s built-in Traefik
+        // HelmChartConfig to customize K3s built-in Traefik.
+        // These nodePorts are *in-cluster* and stay 80/443 for every cluster —
+        // `http_port`/`https_port` are host-side only, mapped by the router or a
+        // direct publish. Conflating them would give a cluster on host 8080 a
+        // NodePort of 8080.
         let helm_chart_config = format!(
             r#"apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
@@ -517,8 +521,8 @@ spec:
         entryPoints:
           - websecure
 "#,
-            http_port = self.config.http_port,
-            https_port = self.config.https_port,
+            http_port = crate::cluster::config::NODEPORT_HTTP,
+            https_port = crate::cluster::config::NODEPORT_HTTPS,
             match_rule = match_rule,
         );
 

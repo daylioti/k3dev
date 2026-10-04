@@ -16,6 +16,7 @@ pub enum KeyAction {
     Refresh,
     CommandPalette,
     UpdateHosts,
+    SwitchCluster,
     Cancel,
 
     // Navigation actions
@@ -60,6 +61,7 @@ impl KeybindingResolver {
         resolver.register_default("r", KeyAction::Refresh);
         resolver.register_default(":", KeyAction::CommandPalette);
         resolver.register_default("H", KeyAction::UpdateHosts);
+        resolver.register_default("c", KeyAction::SwitchCluster);
         resolver.register_default("Ctrl+c", KeyAction::Cancel);
         resolver.register_default("Ctrl+q", KeyAction::Quit);
 
@@ -105,6 +107,7 @@ impl KeybindingResolver {
         self.remap_action(&config.refresh, KeyAction::Refresh);
         self.remap_action(&config.command_palette, KeyAction::CommandPalette);
         self.remap_action(&config.update_hosts, KeyAction::UpdateHosts);
+        self.remap_action(&config.switch_cluster, KeyAction::SwitchCluster);
         self.remap_action(&config.cancel, KeyAction::Cancel);
 
         // Navigation remaps

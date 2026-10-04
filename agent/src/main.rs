@@ -3,6 +3,18 @@
 //! Reads cgroup v2 stats and queries Docker socket for container-to-pod mapping.
 //! Outputs JSON to stdout. Zero external dependencies (std only).
 //!
+//! Usage: k3dev-agent [cgroup-root]
+//!        k3dev-agent --version
+//!
+//! `cgroup-root` is the relative name of the kubelet `--cgroup-root` for this
+//! cluster (e.g. `kubepods-alpha`), used to keep per-cluster kubelets in
+//! separate cgroup subtrees. Defaults to `kubepods` when omitted. Kubelet
+//! creates a `kubepods` directory underneath its cgroup root, so the walkers
+//! descend through any `kubepods*` directory they encounter.
+//!
+//! `--version` prints `k3dev-agent {VERSION}` so the host side can detect an
+//! outdated agent baked into a prebuilt image and reinstall a fresh one.
+//!
 //! Output format:
 //! {"ts":<usec>,"containers":[{"id":"...","pod":"...","ns":"...","cpu":<usec>,"cq":<quota>,"cp":<period>,"mem":<bytes>,"ml":<bytes>},...]}
 //!
@@ -16,13 +28,32 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Agent protocol version. Bump whenever the CLI contract or output format
+/// changes so the host can replace an older agent shipped in a prebuilt image.
+const VERSION: &str = "2";
+
+/// Default kubelet cgroup root, used when no argument is given (single-cluster
+/// setups and older callers that predate the per-cluster cgroup root).
+const DEFAULT_CGROUP_ROOT: &str = "kubepods";
+
 fn main() {
+    let arg = std::env::args().nth(1);
+
+    if arg.as_deref() == Some("--version") {
+        let _ = std::io::stdout().write_all(format!("k3dev-agent {}\n", VERSION).as_bytes());
+        return;
+    }
+
+    let cgroup_root = arg
+        .filter(|a| is_safe_cgroup_root(a))
+        .unwrap_or_else(|| DEFAULT_CGROUP_ROOT.to_string());
+
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0);
 
-    let cgroups = collect_cgroups();
+    let cgroups = collect_cgroups(&cgroup_root);
     let docker_names = query_docker_containers();
 
     let json = build_json(ts, &cgroups, &docker_names);
@@ -44,25 +75,38 @@ fn is_cgroup_v2() -> bool {
     Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
 }
 
-fn collect_cgroups() -> HashMap<String, CgroupStats> {
+/// The cgroup root is interpolated into a filesystem path, so reject anything
+/// that could escape /sys/fs/cgroup or break the path.
+fn is_safe_cgroup_root(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains("..")
+        && !name.contains('\0')
+        && !name.starts_with('-')
+}
+
+fn collect_cgroups(cgroup_root: &str) -> HashMap<String, CgroupStats> {
     let mut stats = HashMap::new();
 
     if is_cgroup_v2() {
-        let base = Path::new("/sys/fs/cgroup/kubepods");
+        let base = format!("/sys/fs/cgroup/{}", cgroup_root);
+        let base = Path::new(&base);
         if base.exists() {
             walk_cgroup_dir_v2(base, &mut stats);
         }
     } else {
         // cgroup v1: cpu stats under cpu,cpuacct (or cpu), memory under memory
-        let cpu_base = if Path::new("/sys/fs/cgroup/cpu,cpuacct/kubepods").exists() {
-            Some(Path::new("/sys/fs/cgroup/cpu,cpuacct/kubepods"))
-        } else if Path::new("/sys/fs/cgroup/cpu/kubepods").exists() {
-            Some(Path::new("/sys/fs/cgroup/cpu/kubepods"))
+        let cpuacct_base = format!("/sys/fs/cgroup/cpu,cpuacct/{}", cgroup_root);
+        let cpu_only_base = format!("/sys/fs/cgroup/cpu/{}", cgroup_root);
+        let cpu_base = if Path::new(&cpuacct_base).exists() {
+            Some(cpuacct_base)
+        } else if Path::new(&cpu_only_base).exists() {
+            Some(cpu_only_base)
         } else {
             None
         };
         if let Some(base) = cpu_base {
-            walk_cgroup_dir_v1(base, &mut stats);
+            walk_cgroup_dir_v1(Path::new(&base), &mut stats);
         }
     }
 
@@ -86,11 +130,14 @@ fn walk_cgroup_dir_v2(dir: &Path, stats: &mut HashMap<String, CgroupStats>) {
             None => continue,
         };
 
-        // QoS class directories and pod directories — recurse
+        // QoS class, pod, and the inner `kubepods` directory kubelet creates
+        // under its --cgroup-root — recurse. Nothing else, so we never walk
+        // unrelated parts of the host hierarchy.
         if name == "burstable"
             || name == "besteffort"
             || name == "guaranteed"
             || name.starts_with("pod")
+            || name.starts_with("kubepods")
         {
             walk_cgroup_dir_v2(&path, stats);
         } else if path.join("cpu.stat").exists() {

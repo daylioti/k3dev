@@ -6,7 +6,7 @@
 //! - Deep snapshots (post-Traefik) for skipping wait_for_cluster_ready
 //! - Cleaning up old snapshots
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -28,23 +28,23 @@ impl K3sManager {
     }
 
     /// Calculate config hash from fields that affect cluster state
-    /// Excludes: cluster_name, speedup settings, logging config
-    pub(super) fn calculate_config_hash(&self) -> String {
-        Self::calculate_config_hash_static(&self.config)
+    /// Excludes: speedup settings, logging config
+    pub(super) fn calculate_config_hash(&self, docker_root: &str) -> String {
+        Self::calculate_config_hash_static(&self.config, docker_root)
     }
 
     /// Compute snapshot image name from config (static version)
-    pub(crate) fn compute_snapshot_image_name(config: &ClusterConfig) -> String {
+    pub(crate) fn compute_snapshot_image_name(config: &ClusterConfig, docker_root: &str) -> String {
         let version = Self::sanitize_version(&config.k3s_version);
-        let hash = Self::calculate_config_hash_static(config);
-        format!("k3dev-snapshot-{}-{}", version, hash)
+        let hash = Self::calculate_config_hash_static(config, docker_root);
+        format!("{}{}-{}", config.snapshot_prefix(), version, hash)
     }
 
     /// Get snapshot image name based on config hash
-    /// Format: k3dev-snapshot-{version}-{hash}
-    /// Example: k3dev-snapshot-v1-33-4-k3s1-a7b3c2d1
-    pub(super) fn get_snapshot_image_name(&self) -> String {
-        Self::compute_snapshot_image_name(&self.config)
+    /// Format: k3dev-snapshot-{cluster}-{version}-{hash}
+    /// Example: k3dev-snapshot-k3dev-v1-33-4-k3s1-a7b3c2d1
+    pub(super) fn get_snapshot_image_name(&self, docker_root: &str) -> String {
+        Self::compute_snapshot_image_name(&self.config, docker_root)
     }
 
     /// Check if a snapshot image is a deep snapshot (created after Traefik + hooks)
@@ -58,18 +58,26 @@ impl K3sManager {
     }
 
     /// Static version of calculate_config_hash
-    fn calculate_config_hash_static(config: &ClusterConfig) -> String {
+    fn calculate_config_hash_static(config: &ClusterConfig, docker_root: &str) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(config.cluster_name.as_bytes());
         hasher.update(config.k3s_version.as_bytes());
+        hasher.update(config.k3s_image_repo.as_bytes());
         hasher.update(config.domain.as_bytes());
         hasher.update(config.api_port.to_string().as_bytes());
         hasher.update(config.http_port.to_string().as_bytes());
         hasher.update(config.https_port.to_string().as_bytes());
+        hasher.update(config.use_router.to_string().as_bytes());
         for (host, container) in &config.additional_ports {
             hasher.update(format!("{}:{}", host, container).as_bytes());
         }
         hasher.update(Self::RANCHER_DATA_PATH.as_bytes());
-        hasher.update(Self::LOCAL_PV_STORAGE_PATH.as_bytes());
+        hasher.update(config.local_pv_storage_path(docker_root).as_bytes());
+        hasher.update(config.kubelet_root_dir(docker_root).as_bytes());
+        hasher.update(config.cgroup_root().as_bytes());
+        hasher.update(config.cluster_cidr().as_bytes());
+        hasher.update(config.service_cidr().as_bytes());
+        hasher.update(config.cluster_dns().as_bytes());
         hasher.update(b"--docker");
         hasher.update(b"--disable=metrics-server");
         hasher.update(b"--disable=servicelb");
@@ -79,7 +87,8 @@ impl K3sManager {
 
     /// Create a snapshot of the current running cluster
     pub(super) async fn create_snapshot(&self, output_tx: &mpsc::Sender<OutputLine>) -> Result<()> {
-        let snapshot_image = self.get_snapshot_image_name();
+        let docker_root = self.docker.get_docker_root_dir().await;
+        let snapshot_image = self.get_snapshot_image_name(&docker_root);
 
         let _ = output_tx
             .send(OutputLine::info(format!(
@@ -99,7 +108,7 @@ impl K3sManager {
              cp -a {} /snapshot-data/rancher && \
              cp -a {} /snapshot-data/pv",
             Self::RANCHER_DATA_PATH,
-            Self::LOCAL_PV_STORAGE_PATH
+            self.config.local_pv_storage_path(&docker_root)
         );
 
         match self
@@ -135,9 +144,13 @@ impl K3sManager {
         );
         labels.insert(
             "k3dev.config_hash".to_string(),
-            self.calculate_config_hash(),
+            self.calculate_config_hash(&docker_root),
         );
         labels.insert("k3dev.domain".to_string(), self.config.domain.clone());
+        labels.insert(
+            "k3dev.cluster".to_string(),
+            self.config.cluster_name.clone(),
+        );
 
         // Step 3: Commit the running container to an image (includes /snapshot-data/)
         match self
@@ -175,7 +188,8 @@ impl K3sManager {
         config: &ClusterConfig,
         output_tx: &mpsc::Sender<OutputLine>,
     ) -> Result<()> {
-        let snapshot_image = Self::compute_snapshot_image_name(config);
+        let docker_root = docker.get_docker_root_dir().await;
+        let snapshot_image = Self::compute_snapshot_image_name(config, &docker_root);
 
         let _ = output_tx
             .send(OutputLine::info(format!(
@@ -191,7 +205,7 @@ impl K3sManager {
              cp -a {} /snapshot-data/rancher && \
              cp -a {} /snapshot-data/pv",
             Self::RANCHER_DATA_PATH,
-            Self::LOCAL_PV_STORAGE_PATH
+            config.local_pv_storage_path(&docker_root)
         );
 
         docker
@@ -207,9 +221,10 @@ impl K3sManager {
         labels.insert("k3dev.k3s_version".to_string(), config.k3s_version.clone());
         labels.insert(
             "k3dev.config_hash".to_string(),
-            Self::calculate_config_hash_static(config),
+            Self::calculate_config_hash_static(config, &docker_root),
         );
         labels.insert("k3dev.domain".to_string(), config.domain.clone());
+        labels.insert("k3dev.cluster".to_string(), config.cluster_name.clone());
         labels.insert("k3dev.snapshot.deep".to_string(), "true".to_string());
 
         docker
@@ -252,10 +267,8 @@ impl K3sManager {
 
         // Get docker socket path, docker root, and iptables mode
         let socket_path = self.platform.docker_socket_path().await?;
-        let cgroup_driver = "cgroupfs";
         let docker_root = self.docker.get_docker_root_dir().await;
-        let pv_storage_path = Self::local_pv_storage_path(&docker_root);
-        let kubelet_root = Self::kubelet_root_dir(&docker_root);
+        let pv_storage_path = self.config.local_pv_storage_path(&docker_root);
         let iptables_mode = PlatformInfo::detect_iptables_mode();
 
         // Build port mappings
@@ -280,19 +293,15 @@ impl K3sManager {
             ports.push((relay_port, relay_port));
         }
 
-        // On macOS (Docker Desktop), bypass the proxy socket (see mod.rs for details)
-        let docker_endpoint = if cfg!(target_os = "macos") {
-            " --container-runtime-endpoint /proc/1/root/run/docker.sock"
-        } else {
-            ""
-        };
-
         #[cfg(target_os = "macos")]
         let ports = {
             let mut p = ports;
             p.push((2375, 2375));
             p
         };
+
+        // See create_cluster: the proxy needs a unix socket to forward to.
+        let use_proxy = docker_host_tcp_url().is_none();
 
         // K3s server command with snapshot data restoration
         let k3s_command = vec![
@@ -309,26 +318,17 @@ impl K3sManager {
                  fi && \
                  nsenter --mount=/proc/1/ns/mnt modprobe br_netfilter 2>/dev/null || true && \
                  sysctl -w net.bridge.bridge-nf-call-iptables=1 2>/dev/null || true && \
-                 mkdir -p /run/k3s /sys/fs/cgroup/kubepods && \
-                 /bin/k3s server \
-                 --docker{docker_endpoint} \
-                 --disable=metrics-server \
-                 --disable=servicelb \
-                 --disable-cloud-controller \
-                 --disable-network-policy \
-                 --flannel-backend=host-gw \
-                 --default-local-storage-path {pv} \
-                 --service-node-port-range 80-32767 \
-                 --kubelet-arg=root-dir={kubelet} \
-                 --kubelet-arg=cgroup-driver={cgroup} \
-                 --kube-apiserver-arg=profiling=false \
-                 --kube-apiserver-arg=enable-admission-plugins=NodeRestriction \
-                 --kube-controller-manager-arg=concurrent-deployment-syncs=1",
-                docker_endpoint = docker_endpoint,
+                 mkdir -p /run/k3s {cgroup_path} && \
+                 {proxy}{server}",
                 rancher = Self::RANCHER_DATA_PATH,
                 pv = pv_storage_path,
-                kubelet = kubelet_root,
-                cgroup = cgroup_driver
+                cgroup_path = self.config.cgroup_root_path(),
+                proxy = if use_proxy {
+                    Self::criproxy_prologue(&self.config)
+                } else {
+                    String::new()
+                },
+                server = Self::k3s_server_args(&self.config, &docker_root, use_proxy),
             ),
         ];
 
@@ -343,13 +343,13 @@ impl K3sManager {
             ),
             // Docker volume for rancher data
             (
-                Self::RANCHER_VOLUME_NAME.to_string(),
+                self.config.rancher_volume_name(),
                 Self::RANCHER_DATA_PATH.to_string(),
                 "volume".to_string(),
             ),
             // Docker volume for local PV storage
             (
-                Self::LOCAL_PV_VOLUME_NAME.to_string(),
+                self.config.local_pv_volume_name(),
                 pv_storage_path.clone(),
                 "volume".to_string(),
             ),
@@ -364,7 +364,7 @@ impl K3sManager {
                 0,
                 (
                     self.platform.docker_socket_mount_source(&socket_path),
-                    "/var/run/docker.sock".to_string(),
+                    Self::HOST_DOCKER_SOCK.to_string(),
                     String::new(),
                 ),
             );
@@ -386,7 +386,7 @@ impl K3sManager {
             entrypoint: Some(String::new()),
             command: Some(k3s_command),
             security_opt: vec!["apparmor=unconfined".to_string()],
-            labels: Default::default(),
+            labels: Self::cluster_labels(&self.config),
             auto_remove: false,
         };
 
@@ -394,9 +394,11 @@ impl K3sManager {
         let _ = output_tx
             .send(OutputLine::info("Ensuring prerequisites..."))
             .await;
+        let rancher_volume = self.config.rancher_volume_name();
+        let pv_volume = self.config.local_pv_volume_name();
         tokio::try_join!(
-            self.docker.create_volume(Self::RANCHER_VOLUME_NAME),
-            self.docker.create_volume(Self::LOCAL_PV_VOLUME_NAME),
+            self.docker.create_volume(&rancher_volume),
+            self.docker.create_volume(&pv_volume),
             self.docker.create_network(&self.config.network_name),
         )?;
 
@@ -405,6 +407,13 @@ impl K3sManager {
             .send(OutputLine::info("Starting container from snapshot..."))
             .await;
         self.docker.run_container(&run_config).await?;
+
+        // The entrypoint blocks until this lands (see create_cluster)
+        if use_proxy {
+            self.install_criproxy()
+                .await
+                .context("Failed to install CRI filtering proxy")?;
+        }
 
         // Wait for API (should be fast since cluster is pre-initialized)
         self.wait_for_api(output_tx).await?;
@@ -432,7 +441,11 @@ impl K3sManager {
 
         // Execute on_cluster_available hooks
         if self.config.hooks.has_hooks() {
-            let hook_executor = HookExecutor::new(self.config.hooks.clone());
+            let hook_executor = HookExecutor::new(
+                self.config.hooks.clone(),
+                self.config.pinned_kubeconfig(),
+                self.config.context_name(),
+            );
             hook_executor
                 .execute_hooks(HookEvent::OnClusterAvailable, output_tx.clone())
                 .await?;
@@ -448,10 +461,16 @@ impl K3sManager {
     /// Cleanup old snapshots (static version for use from background tasks)
     pub(crate) async fn cleanup_old_snapshots_static(
         docker: &DockerManager,
+        prefix: &str,
+        cluster: &str,
         current_snapshot: &str,
         output_tx: &mpsc::Sender<OutputLine>,
     ) -> Result<()> {
-        let snapshots = docker.list_images_by_pattern("k3dev-snapshot-").await?;
+        // Scoped to this cluster's prefix *and* label — the global
+        // `k3dev-snapshot-` sweep would delete every other cluster's snapshot,
+        // and the prefix alone still matches a cluster whose name extends this
+        // one ("one" vs "one-two").
+        let snapshots = docker.list_images_by_pattern(prefix, cluster).await?;
 
         if snapshots.is_empty() {
             return Ok(());
@@ -491,14 +510,21 @@ impl K3sManager {
         current_snapshot: &str,
         output_tx: &mpsc::Sender<OutputLine>,
     ) -> Result<()> {
-        Self::cleanup_old_snapshots_static(&self.docker, current_snapshot, output_tx).await
+        Self::cleanup_old_snapshots_static(
+            &self.docker,
+            &self.config.snapshot_prefix(),
+            &self.config.cluster_name,
+            current_snapshot,
+            output_tx,
+        )
+        .await
     }
 
     /// Delete all snapshot images for this cluster
     pub async fn delete_snapshots(&self, output_tx: &mpsc::Sender<OutputLine>) -> Result<()> {
         let snapshots = self
             .docker
-            .list_images_by_pattern("k3dev-snapshot-")
+            .list_images_by_pattern(&self.config.snapshot_prefix(), &self.config.cluster_name)
             .await?;
 
         if snapshots.is_empty() {

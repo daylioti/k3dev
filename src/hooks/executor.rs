@@ -13,11 +13,41 @@ use crate::ui::components::OutputLine;
 /// Executor for running hook commands
 pub struct HookExecutor {
     config: HooksConfig,
+    /// Standalone kubeconfig pinned to this cluster, if one has been written
+    kubeconfig: Option<PathBuf>,
+    /// Kubeconfig context name for this cluster
+    context: String,
 }
 
 impl HookExecutor {
-    pub fn new(config: HooksConfig) -> Self {
-        Self { config }
+    pub fn new(config: HooksConfig, kubeconfig: Option<PathBuf>, context: String) -> Self {
+        Self {
+            config,
+            kubeconfig,
+            context,
+        }
+    }
+
+    /// Environment for a hook process.
+    ///
+    /// `KUBECONFIG` and `K3DEV_CONTEXT` are injected so a hook reaches the
+    /// cluster it was fired for rather than whatever the user's current-context
+    /// points at — which may well be a context left over from a deleted
+    /// cluster. Configured env wins, so a hook can still opt out.
+    fn hook_env(&self, hook: &HookCommand) -> HashMap<String, String> {
+        let mut env: HashMap<String, String> = HashMap::new();
+
+        env.insert("K3DEV_CONTEXT".to_string(), self.context.clone());
+        if let Some(path) = &self.kubeconfig {
+            env.insert("KUBECONFIG".to_string(), path.to_string_lossy().to_string());
+        }
+
+        // Global env, then hook-specific env (most specific wins)
+        for (key, value) in self.config.env.iter().chain(hook.env.iter()) {
+            env.insert(key.clone(), expand_home(value));
+        }
+
+        env
     }
 
     /// Execute all hooks for a given event
@@ -96,17 +126,7 @@ impl HookExecutor {
             None
         };
 
-        // Merge global env with hook-specific env (hook-specific takes precedence)
-        let mut env: HashMap<String, String> = self.config.env.clone();
-        for (key, value) in &hook.env {
-            // Expand ~ in environment variable values
-            env.insert(key.clone(), expand_home(value));
-        }
-
-        // Expand ~ in global env values too
-        for value in env.values_mut() {
-            *value = expand_home(value);
-        }
+        let env = self.hook_env(hook);
 
         // Build the command (platform-aware shell)
         let mut cmd = if cfg!(windows) {
@@ -132,8 +152,16 @@ impl HookExecutor {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Under the TUI, give the hook a pty so tty prompts reach the popup
+        let pty = crate::tty::attach_pty(&mut cmd)?;
+
         // Spawn the process
         let mut child = cmd.spawn()?;
+
+        let pty_io = match pty {
+            Some(pty) => Some(pty.start_io().await),
+            None => None,
+        };
 
         // Get stdout and stderr handles
         let stdout = child.stdout.take();
@@ -173,6 +201,9 @@ impl HookExecutor {
         // Wait for output tasks to complete
         let _ = stdout_handle.await;
         let _ = stderr_handle.await;
+        if let Some(pty_io) = pty_io {
+            pty_io.finish().await;
+        }
 
         match result {
             Ok(Ok(status)) => {
@@ -218,5 +249,115 @@ mod tests {
         assert_eq!(expand_home("~/foo/bar"), format!("{}/foo/bar", home_str));
         assert_eq!(expand_home("/absolute/path"), "/absolute/path");
         assert_eq!(expand_home("relative/path"), "relative/path");
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    fn executor(kubeconfig: Option<PathBuf>) -> HookExecutor {
+        HookExecutor::new(HooksConfig::default(), kubeconfig, "k3dev".to_string())
+    }
+
+    fn hook() -> HookCommand {
+        HookCommand {
+            name: "t".to_string(),
+            command: "true".to_string(),
+            workdir: None,
+            env: HashMap::new(),
+            continue_on_error: false,
+            timeout: 30,
+        }
+    }
+
+    #[test]
+    fn injects_cluster_context_and_pinned_kubeconfig() {
+        let env = executor(Some(PathBuf::from("/state/k3dev.yaml"))).hook_env(&hook());
+
+        assert_eq!(env.get("K3DEV_CONTEXT").map(String::as_str), Some("k3dev"));
+        assert_eq!(
+            env.get("KUBECONFIG").map(String::as_str),
+            Some("/state/k3dev.yaml")
+        );
+    }
+
+    #[test]
+    fn without_a_pinned_kubeconfig_only_the_context_is_injected() {
+        let env = executor(None).hook_env(&hook());
+
+        assert_eq!(env.get("K3DEV_CONTEXT").map(String::as_str), Some("k3dev"));
+        assert!(!env.contains_key("KUBECONFIG"));
+    }
+
+    #[test]
+    fn user_env_wins_over_injected_defaults() {
+        let mut h = hook();
+        h.env
+            .insert("KUBECONFIG".to_string(), "/custom/config".to_string());
+
+        let env = executor(Some(PathBuf::from("/state/k3dev.yaml"))).hook_env(&h);
+
+        assert_eq!(
+            env.get("KUBECONFIG").map(String::as_str),
+            Some("/custom/config")
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod terminal_tests {
+    use super::*;
+    use crate::app::AppMessage;
+
+    #[tokio::test]
+    async fn tty_prompt_is_routed_through_the_attached_terminal() {
+        let _guard = crate::tty::test_guard().await;
+        let (app_tx, mut app_rx) = mpsc::channel::<AppMessage>(32);
+        crate::tty::attach(app_tx);
+
+        let hook = HookCommand {
+            name: "mfa".to_string(),
+            command:
+                "printf 'Enter code: ' > /dev/tty; read -r code < /dev/tty; echo \"got $code\""
+                    .to_string(),
+            workdir: None,
+            env: HashMap::new(),
+            continue_on_error: false,
+            timeout: 10,
+        };
+        let executor = HookExecutor::new(HooksConfig::default(), None, "k3dev".to_string());
+        let (out_tx, mut out_rx) = mpsc::channel::<OutputLine>(32);
+        let run = tokio::spawn(async move { executor.execute_hook(&hook, out_tx).await });
+
+        let input = match app_rx.recv().await {
+            Some(AppMessage::ChildTtyOpened { input }) => input,
+            _ => panic!("expected the child terminal to open first"),
+        };
+        match app_rx.recv().await {
+            Some(AppMessage::ChildTtyOutput(text)) => assert_eq!(text, "Enter code: "),
+            _ => panic!("expected the tty prompt"),
+        }
+        input.send(b"123456\r".to_vec()).await.unwrap();
+
+        run.await.unwrap().unwrap();
+        let mut lines = Vec::new();
+        while let Ok(line) = out_rx.try_recv() {
+            lines.push(line.content);
+        }
+        assert!(
+            lines.iter().any(|l| l.trim() == "got 123456"),
+            "hook never received the typed input: {lines:?}"
+        );
+        // The tty echoes the typed code before the terminal closes
+        loop {
+            match app_rx.recv().await {
+                Some(AppMessage::ChildTtyClosed) => break,
+                Some(AppMessage::ChildTtyOutput(_)) => continue,
+                _ => panic!("expected the child terminal to close"),
+            }
+        }
+
+        crate::tty::detach();
     }
 }

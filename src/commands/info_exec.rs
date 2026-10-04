@@ -17,13 +17,15 @@ use crate::k8s::{K8sClient, PodExecutor};
 ///
 /// Unlike the streaming executor used by custom commands, this buffers the
 /// entire output. Intended for short-running probes driven by info blocks.
+/// `host_env` is added to the environment of host-target commands.
 pub async fn capture_exec(
     exec: &ExecConfig,
     k8s: Option<&K8sClient>,
     docker: Option<&DockerManager>,
     timeout: Duration,
+    host_env: &[(String, String)],
 ) -> Result<String> {
-    let fut = run(exec, k8s, docker);
+    let fut = run(exec, k8s, docker, host_env);
     tokio::time::timeout(timeout, fut)
         .await
         .map_err(|_| anyhow!("timed out after {:?}", timeout))?
@@ -33,9 +35,10 @@ async fn run(
     exec: &ExecConfig,
     k8s: Option<&K8sClient>,
     docker: Option<&DockerManager>,
+    host_env: &[(String, String)],
 ) -> Result<String> {
     match &exec.target {
-        ExecutionTarget::Host => run_host(&exec.workdir, &exec.cmd).await,
+        ExecutionTarget::Host => run_host(&exec.workdir, &exec.cmd, host_env).await,
         ExecutionTarget::Docker { container } => {
             let docker = docker.ok_or_else(|| anyhow!("docker client unavailable"))?;
             run_docker(docker, container, &exec.workdir, &exec.cmd).await
@@ -61,9 +64,9 @@ async fn run(
     }
 }
 
-async fn run_host(workdir: &str, cmd: &str) -> Result<String> {
+async fn run_host(workdir: &str, cmd: &str, env: &[(String, String)]) -> Result<String> {
     let mut command = tokio::process::Command::new("sh");
-    command.arg("-c").arg(cmd);
+    command.arg("-c").arg(cmd).envs(env.iter().cloned());
     if !workdir.is_empty() {
         command.current_dir(workdir);
     }
@@ -227,5 +230,23 @@ mod tests {
     #[test]
     fn trim_output_no_limits_returns_input() {
         assert_eq!(trim_output("hello", None, None), "hello");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_exec_runs_with_the_cluster_env() {
+        let exec = ExecConfig {
+            target: ExecutionTarget::Host,
+            workdir: String::new(),
+            cmd: r#"printf %s "$KUBECONFIG""#.to_string(),
+            input: Default::default(),
+        };
+        let env = vec![("KUBECONFIG".to_string(), "/state/k3dev.yaml".to_string())];
+
+        let out = capture_exec(&exec, None, None, Duration::from_secs(5), &env)
+            .await
+            .unwrap();
+
+        assert_eq!(out, "/state/k3dev.yaml");
     }
 }

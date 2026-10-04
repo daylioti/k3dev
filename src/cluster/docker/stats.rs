@@ -60,9 +60,16 @@ pub struct ContainerStats {
 }
 
 impl DockerManager {
-    /// Get per-pod stats using cgroups v2 (much faster than Docker API)
-    /// Reads directly from /sys/fs/cgroup/kubepods for resource stats
-    pub async fn get_pod_stats(&self, prefix: &str) -> Result<Vec<ContainerStats>> {
+    /// Get per-pod stats using cgroups v2 (much faster than Docker API).
+    ///
+    /// Reads directly from the cluster's own cgroup root. Containers belonging
+    /// to another cluster on the same daemon resolve to no cgroup under that
+    /// root and are skipped, which is what keeps the panel cluster-scoped.
+    pub async fn get_pod_stats(
+        &self,
+        prefix: &str,
+        cgroup_root: &str,
+    ) -> Result<Vec<ContainerStats>> {
         use crate::cluster::platform::PlatformInfo;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -108,7 +115,7 @@ impl DockerManager {
             };
 
             // Find cgroup path for this container
-            let cgroup_path = find_container_cgroup(&full_id);
+            let cgroup_path = find_container_cgroup(&full_id, cgroup_root);
             let cgroup_path = match cgroup_path {
                 Some(p) => p,
                 None => continue,
@@ -449,13 +456,16 @@ fn calculate_cpu_percent(container_id: &str, usage_usec: u64, now_usec: u64, num
 ///   /sys/fs/cgroup/user.slice/user-<UID>.slice/user@<UID>.service/docker.service/...
 /// When the standard kubepods path isn't found, this falls back to searching
 /// rootless Docker cgroup paths using the current UID.
-fn find_container_cgroup(container_id: &str) -> Option<std::path::PathBuf> {
+fn find_container_cgroup(container_id: &str, cgroup_root: &str) -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
+
+    // `cgroup_root` is kubelet's --cgroup-root, e.g. "/kubepods-myproject"
+    let root = cgroup_root.trim_start_matches('/');
 
     match *CGROUP_VERSION {
         CgroupVersion::V2 => {
-            // Standard path: kubepods (rootful Docker with k3s)
-            let kubepods_base = PathBuf::from("/sys/fs/cgroup/kubepods");
+            // Standard path: the cluster's cgroup root (rootful Docker with k3s)
+            let kubepods_base = PathBuf::from(format!("/sys/fs/cgroup/{}", root));
             if kubepods_base.exists() {
                 if let Some(found) = search_cgroup_dir(&kubepods_base, container_id) {
                     return Some(found);
@@ -472,7 +482,7 @@ fn find_container_cgroup(container_id: &str) -> Option<std::path::PathBuf> {
         CgroupVersion::V1 => {
             // v1: try cpu,cpuacct first (common combined mount), then cpu alone
             for controller in &["cpu,cpuacct", "cpu"] {
-                let base = PathBuf::from(format!("/sys/fs/cgroup/{}/kubepods", controller));
+                let base = PathBuf::from(format!("/sys/fs/cgroup/{}/{}", controller, root));
                 if base.exists() {
                     if let Some(found) = search_cgroup_dir(&base, container_id) {
                         return Some(found);
@@ -682,9 +692,13 @@ impl DockerManager {
     pub async fn get_pod_stats_via_agent(
         &self,
         k3s_container: &str,
+        cgroup_root: &str,
     ) -> Result<Vec<ContainerStats>> {
+        // The agent walks only this cluster's cgroup subtree, so its output is
+        // already scoped even though the container sees the host hierarchy.
+        let root = cgroup_root.trim_start_matches('/');
         let json = self
-            .exec_in_container(k3s_container, &["/usr/local/bin/k3dev-agent"])
+            .exec_in_container(k3s_container, &["/usr/local/bin/k3dev-agent", root])
             .await?;
 
         let agent = parse_agent_output(&json)?;
