@@ -70,6 +70,7 @@ jobs:
             ~/.cargo/git
             target
             agent/target
+            criproxy/target
             assets
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
@@ -92,6 +93,18 @@ jobs:
           if [[ "${{ matrix.target }}" == aarch64* ]]; then
             cross build --release --target aarch64-unknown-linux-musl --manifest-path agent/Cargo.toml
             cp agent/target/aarch64-unknown-linux-musl/release/k3dev-agent assets/k3dev-agent-aarch64
+          fi
+
+          # Pre-build k3dev-criproxy for the target architecture. Under `cross`
+          # build.rs has no Docker to build it with and falls back to a
+          # placeholder; a fresh asset is newer than its sources, so build.rs
+          # leaves it alone.
+          if [[ "${{ matrix.target }}" == aarch64* ]]; then
+            cross build --release --target aarch64-unknown-linux-musl --manifest-path criproxy/Cargo.toml
+            cp criproxy/target/aarch64-unknown-linux-musl/release/k3dev-criproxy assets/k3dev-criproxy-aarch64
+          else
+            cargo build --release --target x86_64-unknown-linux-musl --manifest-path criproxy/Cargo.toml
+            cp criproxy/target/x86_64-unknown-linux-musl/release/k3dev-criproxy assets/k3dev-criproxy-x86_64
           fi
 
           # Build socat for the target architecture via Docker.
@@ -123,7 +136,7 @@ jobs:
 
           # Create placeholders for the non-target arch so include_bytes! compiles.
           for arch in x86_64 aarch64; do
-            for bin in socat k3dev-agent; do
+            for bin in socat k3dev-agent k3dev-criproxy; do
               [[ -f "assets/${bin}-${arch}" ]] || echo -n "placeholder" > "assets/${bin}-${arch}"
             done
           done
@@ -134,7 +147,7 @@ jobs:
             aarch64*) TARGET_ARCH="aarch64" ;;
             *)        TARGET_ARCH="x86_64" ;;
           esac
-          for bin in socat k3dev-agent; do
+          for bin in socat k3dev-agent k3dev-criproxy; do
             asset="assets/${bin}-${TARGET_ARCH}"
             if ! file "$asset" | grep -q ELF; then
               echo "::error::${asset} is not a valid ELF binary — build would ship a broken placeholder"
@@ -219,6 +232,7 @@ jobs:
             ~/.cargo/git
             target
             agent/target
+            criproxy/target
             assets
           key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
