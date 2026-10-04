@@ -18,9 +18,9 @@ pub use stats::ContainerStats;
 use anyhow::{anyhow, Context, Result};
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerConfig, ContainerCreateBody, HostConfig, HostConfigCgroupnsModeEnum, Mount,
-    MountBindOptions, MountBindOptionsPropagationEnum, MountTypeEnum, NetworkCreateRequest,
-    PortBinding, VolumeCreateRequest,
+    ContainerConfig, ContainerCreateBody, ContainerSummary, HostConfig, HostConfigCgroupnsModeEnum,
+    Mount, MountBindOptions, MountBindOptionsPropagationEnum, MountTypeEnum, NetworkConnectRequest,
+    NetworkCreateRequest, NetworkDisconnectRequest, PortBinding, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CommitContainerOptions, CreateContainerOptions, CreateImageOptions, InspectContainerOptions,
@@ -217,6 +217,26 @@ impl DockerManager {
         }
     }
 
+    /// Host port a container publishes for `container_port`, if any.
+    /// Reads the create-time binding, so it also answers for a stopped container.
+    pub async fn published_host_port(&self, name: &str, container_port: u16) -> Option<u16> {
+        let info = self
+            .client
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+            .ok()?;
+
+        info.host_config?
+            .port_bindings?
+            .get(&format!("{}/tcp", container_port))?
+            .as_ref()?
+            .first()?
+            .host_port
+            .as_ref()?
+            .parse()
+            .ok()
+    }
+
     /// Get container status
     pub async fn container_status(&self, name: &str) -> Option<String> {
         self.client
@@ -347,20 +367,53 @@ impl DockerManager {
     /// the pause container owns the pod's network namespace and outlives any
     /// individual workload container, making it the canonical target for
     /// network-namespace-shared sidecars (e.g. tcpdump capture).
-    pub async fn find_pod_pause_container(&self, pod: &str, namespace: &str) -> Result<String> {
+    pub async fn find_pod_pause_container(
+        &self,
+        pod: &str,
+        namespace: &str,
+        cgroup_root: &str,
+    ) -> Result<String> {
         let prefix = format!("k8s_POD_{}_{}_", pod, namespace);
         let names = self.list_containers_by_prefix(&prefix).await?;
-        names
-            .into_iter()
-            .find(|n| n.starts_with(&prefix))
-            .ok_or_else(|| {
-                anyhow!(
-                    "No pause container found for pod {}/{} (looked for prefix {})",
-                    namespace,
-                    pod,
-                    prefix
-                )
-            })
+
+        // Pod names collide freely across clusters (`kube-system/coredns-…`
+        // exists in every one), and Docker labels carry no cluster identity.
+        // The cgroup parent kubelet assigns does, so filter on it.
+        for name in names.into_iter().filter(|n| n.starts_with(&prefix)) {
+            if self.container_in_cgroup_root(&name, cgroup_root).await {
+                return Ok(name);
+            }
+        }
+
+        Err(anyhow!(
+            "No pause container found for pod {}/{} in cluster cgroup {}",
+            namespace,
+            pod,
+            cgroup_root
+        ))
+    }
+
+    /// Does this container's kubelet-assigned cgroup parent sit under `cgroup_root`?
+    /// This is the only cluster discriminator available on a shared daemon.
+    async fn container_in_cgroup_root(&self, name: &str, cgroup_root: &str) -> bool {
+        let root = format!("/{}", cgroup_root.trim_start_matches('/'));
+        match self
+            .client
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => info
+                .host_config
+                .and_then(|h| h.cgroup_parent)
+                .is_some_and(|p| {
+                    let p = format!("/{}", p.trim_start_matches('/'));
+                    p == root || p.starts_with(&format!("{}/", root))
+                }),
+            Err(e) => {
+                tracing::debug!(container = %name, error = %e, "cgroup parent lookup failed");
+                false
+            }
+        }
     }
 
     /// Execute a command in a running container
@@ -638,16 +691,107 @@ impl DockerManager {
     }
 
     /// Force-remove the given containers in parallel (no need to stop first).
-    /// Individual removal failures are ignored (best effort).
+    /// Best effort: a failed removal is logged, not fatal.
     pub async fn remove_containers(&self, names: &[String]) {
         let futures: Vec<_> = names
             .iter()
             .map(|name| async move {
-                let _ = self.remove_container(name, true).await;
+                if let Err(e) = self.remove_container(name, true).await {
+                    tracing::warn!(container = %name, error = %e, "Failed to remove container");
+                }
             })
             .collect();
 
         futures_util::future::join_all(futures).await;
+    }
+
+    /// Containers carrying every one of `labels` (`key` or `key=value` form).
+    async fn list_containers_by_labels(
+        &self,
+        labels: Vec<String>,
+        all: bool,
+    ) -> Vec<ContainerSummary> {
+        let mut filters = HashMap::new();
+        filters.insert("label".to_string(), labels);
+
+        match self
+            .client
+            .list_containers(Some(ListContainersOptions {
+                all,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+        {
+            Ok(containers) => containers,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list containers by label");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Cluster names taken from the `k3dev.cluster` label of running k3s server
+    /// containers. Used to decide whether a host-wide cleanup would hit another
+    /// cluster, and to mark clusters as up in the switcher.
+    ///
+    /// Telling the server apart from the rest is the whole job here: the CRI
+    /// proxy stamps `k3dev.cluster` on every pod container too, and those keep
+    /// running after their cluster is stopped, so the cluster label alone would
+    /// report a stopped cluster as running. Either the server role or the
+    /// `<cluster>-server` name settles it — the name also covers a container
+    /// created before the role label existed, and under-reporting here would
+    /// drop a live cluster's router route.
+    pub async fn list_cluster_servers(&self) -> Vec<String> {
+        self.list_containers_by_labels(vec!["k3dev.cluster".to_string()], false)
+            .await
+            .into_iter()
+            .filter_map(|c| {
+                let cluster = c.labels.as_ref()?.get("k3dev.cluster")?.clone();
+                Self::is_cluster_server(&c, &cluster).then_some(cluster)
+            })
+            .collect()
+    }
+
+    /// Is this listed container the k3s server of `cluster`, as opposed to one
+    /// of the pod containers carrying the same `k3dev.cluster` label?
+    ///
+    /// The role label answers it; the `<cluster>-server` name is the fallback
+    /// for a container created before that label existed. Both the "which
+    /// clusters are up" question and the pod-container sweep key on this, and
+    /// they must agree: a server counted as a pod container would be swept.
+    fn is_cluster_server(container: &ContainerSummary, cluster: &str) -> bool {
+        let is_server_role = container
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("k3dev.role"))
+            .map(String::as_str)
+            == Some("server");
+
+        let server_name = format!("{}-server", cluster);
+        let named_server = container
+            .names
+            .iter()
+            .flatten()
+            .any(|n| n.trim_start_matches('/') == server_name);
+
+        is_server_role || named_server
+    }
+
+    /// Names of one cluster's pod containers, running or not: everything the
+    /// CRI proxy labelled for the cluster, minus the cluster's own server.
+    ///
+    /// Scoped to the label on purpose - the `k8s_*` names Docker shows carry no
+    /// cluster identity, so a name sweep would reap another cluster's pods.
+    pub async fn list_cluster_pod_containers(&self, cluster: &str) -> Vec<String> {
+        self.list_containers_by_labels(vec![format!("k3dev.cluster={}", cluster)], true)
+            .await
+            .into_iter()
+            .filter(|c| !Self::is_cluster_server(c, cluster))
+            .filter_map(|c| c.names)
+            .flatten()
+            .map(|n| n.trim_start_matches('/').to_string())
+            .collect()
     }
 
     // === Network Operations ===
@@ -679,6 +823,46 @@ impl DockerManager {
     pub async fn remove_network(&self, name: &str) -> Result<()> {
         // Ignore errors - network might not exist
         let _ = self.client.remove_network(name).await;
+        Ok(())
+    }
+
+    /// Attach a container to a network (no-op if already attached)
+    pub async fn connect_network(&self, network: &str, container: &str) -> Result<()> {
+        match self
+            .client
+            .connect_network(
+                network,
+                NetworkConnectRequest {
+                    container: container.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            // 403 is Docker's "endpoint already exists on this network"
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 403, ..
+            }) => Ok(()),
+            Err(e) => Err(e)
+                .with_context(|| format!("Failed to connect {} to network {}", container, network)),
+        }
+    }
+
+    /// Detach a container from a network (no-op if not attached)
+    pub async fn disconnect_network(&self, network: &str, container: &str) -> Result<()> {
+        // Errors here are always "not attached" or "no such network" — both mean
+        // the endpoint is already gone, which is what the caller wanted.
+        let _ = self
+            .client
+            .disconnect_network(
+                network,
+                NetworkDisconnectRequest {
+                    container: container.to_string(),
+                    force: Some(true),
+                },
+            )
+            .await;
         Ok(())
     }
 
@@ -789,7 +973,7 @@ impl DockerManager {
 
     /// Get image architectures for all running k8s pod containers.
     /// Returns a map of "namespace/pod_name" → image architecture string.
-    pub async fn get_pod_image_architectures(&self) -> HashMap<String, String> {
+    pub async fn get_pod_image_architectures(&self, cgroup_root: &str) -> HashMap<String, String> {
         let containers = match self
             .client
             .list_containers(Some(ListContainersOptions {
@@ -821,6 +1005,11 @@ impl DockerManager {
 
             let image = container.image.clone().unwrap_or_default();
             if image.is_empty() {
+                continue;
+            }
+
+            // Skip pods owned by another cluster on this daemon
+            if !self.container_in_cgroup_root(&name, cgroup_root).await {
                 continue;
             }
 
@@ -896,8 +1085,13 @@ impl DockerManager {
         Ok(())
     }
 
-    /// List images matching a pattern (simple prefix match)
-    pub async fn list_images_by_pattern(&self, pattern: &str) -> Result<Vec<String>> {
+    /// List this cluster's images whose tag starts with `pattern`.
+    /// Scoped by the `k3dev.cluster` image label, not by name alone.
+    pub async fn list_images_by_pattern(
+        &self,
+        pattern: &str,
+        cluster: &str,
+    ) -> Result<Vec<String>> {
         let options = Some(ListImagesOptions {
             all: false,
             ..Default::default()
@@ -911,6 +1105,12 @@ impl DockerManager {
 
         let mut matching_images = Vec::new();
         for image in images {
+            // The name prefix alone is ambiguous: `k3dev-snapshot-one-` is also a
+            // prefix of cluster `one-two`'s images, so a sweep scoped by name
+            // would delete another cluster's snapshots. The label is exact.
+            if image.labels.get("k3dev.cluster").map(String::as_str) != Some(cluster) {
+                continue;
+            }
             for tag in &image.repo_tags {
                 if tag.starts_with(pattern) {
                     matching_images.push(tag.clone());
@@ -1187,4 +1387,50 @@ pub struct ContainerRunConfig {
     pub labels: HashMap<String, String>,
     /// Auto-remove the container when it exits
     pub auto_remove: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(name: &str, labels: &[(&str, &str)]) -> ContainerSummary {
+        ContainerSummary {
+            names: Some(vec![format!("/{}", name)]),
+            labels: Some(
+                labels
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn server_is_identified_by_role_or_name() {
+        let by_role = summary(
+            "custom-name",
+            &[("k3dev.cluster", "alpha"), ("k3dev.role", "server")],
+        );
+        assert!(DockerManager::is_cluster_server(&by_role, "alpha"));
+
+        // Containers created before the role label existed only have the name.
+        let by_name = summary("alpha-server", &[("k3dev.cluster", "alpha")]);
+        assert!(DockerManager::is_cluster_server(&by_name, "alpha"));
+    }
+
+    #[test]
+    fn pod_containers_are_not_mistaken_for_the_server() {
+        // The CRI proxy stamps the cluster label on pod containers too, so the
+        // sweep that removes them has to spare the server and nothing else.
+        let pause = summary(
+            "k8s_POD_nginx-0_default_1234_0",
+            &[("k3dev.cluster", "alpha")],
+        );
+        assert!(!DockerManager::is_cluster_server(&pause, "alpha"));
+
+        // The name fallback is scoped to the cluster being asked about.
+        let other = summary("beta-server", &[("k3dev.cluster", "beta")]);
+        assert!(!DockerManager::is_cluster_server(&other, "alpha"));
+    }
 }

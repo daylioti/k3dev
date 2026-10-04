@@ -13,10 +13,11 @@ A TUI for managing local K3s clusters in Docker.
 - **Diagnostics & Preflight Checks** - Verify the cluster is healthy or ready to start
 - **Image Pull Progress** - Byte-level progress bars for Docker image pulls
 - **Pod Operations** - Execute commands inside pods with an interactive terminal
+- **Multiple Clusters** - Run several clusters at once on the shared host Docker daemon, each on clean URLs
 - **Ingress Management** - View endpoints with health checks and `/etc/hosts` integration
 - **Custom Commands** - Hierarchical command menus with placeholders and keybind shortcuts
 - **Resource Monitoring** - CPU and memory stats for containers and pods
-- **Hooks** - Run shell commands on `on_cluster_available` / `on_services_deployed`
+- **Hooks** - Run shell commands on `on_cluster_available` / `on_services_deployed` / `on_snapshot_created`
 - **Docker Passthrough** - `k3dev docker ...` targets the cluster's Docker daemon
 - **Themes** - Fallout, Cyberpunk, and Nord
 - **Vim-style Navigation** - Customizable keybindings
@@ -140,6 +141,9 @@ hooks:
   on_services_deployed:
     - name: "Deploy"
       command: "helm install myapp ./charts/myapp"
+  on_snapshot_created:
+    - name: "Notify"
+      command: "notify-send 'k3dev snapshot ready'"
 ```
 
 ## CLI (Headless Mode)
@@ -193,6 +197,7 @@ See [docs/CLI.md](docs/CLI.md) for the full reference.
 | `Enter` | Execute |
 | `Tab` | Switch panel |
 | `H` | Update /etc/hosts |
+| `c` | Switch cluster |
 
 Vim-style number prefixes supported (e.g., `3j`).
 

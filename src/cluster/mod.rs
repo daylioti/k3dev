@@ -1,4 +1,5 @@
-mod config;
+pub(crate) mod config;
+pub(crate) mod config_registry;
 pub mod diagnostics;
 pub(crate) mod docker;
 mod ingress;
@@ -6,6 +7,8 @@ mod k3s;
 pub(crate) mod kube_ops;
 mod platform;
 mod port_forward;
+pub(crate) mod registry;
+mod router;
 mod traefik;
 
 pub use config::ClusterConfig;
@@ -18,6 +21,7 @@ pub use ingress::{
 pub use k3s::{ClusterStatus, K3sManager};
 pub use platform::{find_available_port, PlatformInfo};
 pub use port_forward::PortForwardDetector;
+pub use router::{RouterManager, ROUTER_CONTAINER};
 pub use traefik::TraefikManager;
 
 use anyhow::Result;
@@ -33,6 +37,7 @@ pub struct ClusterManager {
     config: Arc<ClusterConfig>,
     k3s: Option<K3sManager>,
     ingress: IngressManager,
+    router: RouterManager,
     platform: PlatformInfo,
 }
 
@@ -45,12 +50,14 @@ impl ClusterManager {
         let k3s = K3sManager::new(Arc::clone(&config)).await.ok();
 
         // IngressManager without sudo - auto hosts update will try non-interactive
-        let ingress = IngressManager::new();
+        let ingress = IngressManager::for_cluster(&config);
+        let router = RouterManager::new(config.router_image.clone());
 
         Ok(Self {
             config,
             k3s,
             ingress,
+            router,
             platform,
         })
     }
@@ -92,6 +99,26 @@ impl ClusterManager {
             return Ok(());
         };
 
+        // Bring the shared front router in line with what is actually running.
+        // reconcile() first so a crash mid-teardown does not leave the router
+        // advertising a cluster that no longer exists.
+        if self.config.use_router {
+            if let Some(k3s) = &self.k3s {
+                if let Err(e) = self.router.reconcile(&k3s.docker, &output_tx).await {
+                    tracing::warn!(error = %e, "Router reconcile failed");
+                }
+                if let Err(e) = self
+                    .router
+                    .ensure(&k3s.docker, &self.config, &output_tx)
+                    .await
+                {
+                    let _ = output_tx
+                        .send(OutputLine::error(format!("Router setup failed: {:#}", e)))
+                        .await;
+                }
+            }
+        }
+
         // Determine if we need to create a deep snapshot after Traefik + hooks
         let needs_deep_snapshot =
             matches!(outcome, k3s::StartOutcome::FreshCreated) && self.config.speedup.use_snapshot;
@@ -123,7 +150,11 @@ impl ClusterManager {
 
             // Execute on_services_deployed hooks
             if config.hooks.has_hooks() {
-                let hook_executor = HookExecutor::new(config.hooks.clone());
+                let hook_executor = HookExecutor::new(
+                    config.hooks.clone(),
+                    config.pinned_kubeconfig(),
+                    config.context_name(),
+                );
                 if let Err(e) = hook_executor
                     .execute_hooks(HookEvent::OnServicesDeployed, tx.clone())
                     .await
@@ -143,7 +174,9 @@ impl ClusterManager {
             if needs_deep_snapshot {
                 match DockerManager::new(socket_path) {
                     Ok(docker) => {
-                        let snapshot_image = K3sManager::compute_snapshot_image_name(&config);
+                        let docker_root = docker.get_docker_root_dir().await;
+                        let snapshot_image =
+                            K3sManager::compute_snapshot_image_name(&config, &docker_root);
 
                         if let Err(e) = K3sManager::create_deep_snapshot(
                             &config.container_name,
@@ -160,15 +193,39 @@ impl ClusterManager {
                                     e
                                 )))
                                 .await;
-                        } else if config.speedup.snapshot_auto_cleanup {
-                            if let Err(e) = K3sManager::cleanup_old_snapshots_static(
-                                &docker,
-                                &snapshot_image,
-                                &tx,
-                            )
-                            .await
-                            {
-                                tracing::warn!(error = %e, "Snapshot cleanup failed");
+                        } else {
+                            // Execute on_snapshot_created hooks
+                            if config.hooks.has_hooks() {
+                                let hook_executor = HookExecutor::new(
+                                    config.hooks.clone(),
+                                    config.pinned_kubeconfig(),
+                                    config.context_name(),
+                                );
+                                if let Err(e) = hook_executor
+                                    .execute_hooks(HookEvent::OnSnapshotCreated, tx.clone())
+                                    .await
+                                {
+                                    let _ = tx
+                                        .send(OutputLine::error(format!(
+                                            "Hook execution failed: {}",
+                                            e
+                                        )))
+                                        .await;
+                                }
+                            }
+
+                            if config.speedup.snapshot_auto_cleanup {
+                                if let Err(e) = K3sManager::cleanup_old_snapshots_static(
+                                    &docker,
+                                    &config.snapshot_prefix(),
+                                    &config.cluster_name,
+                                    &snapshot_image,
+                                    &tx,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(error = %e, "Snapshot cleanup failed");
+                                }
                             }
                         }
                     }
@@ -188,6 +245,17 @@ impl ClusterManager {
     /// Stop the cluster
     pub async fn stop(&self, output_tx: mpsc::Sender<OutputLine>) -> Result<()> {
         if let Some(k3s) = &self.k3s {
+            // Drop the router entry first so it stops advertising a backend that
+            // is about to disappear; `start` re-registers it.
+            if self.config.use_router {
+                if let Err(e) = self
+                    .router
+                    .release(&k3s.docker, &self.config, &output_tx)
+                    .await
+                {
+                    tracing::warn!(error = %e, "Router release failed");
+                }
+            }
             k3s.stop(output_tx).await?;
         }
         Ok(())
@@ -212,10 +280,22 @@ impl ClusterManager {
 
         // Delete k3s cluster
         if let Some(k3s) = &self.k3s {
+            // Must detach the router before k3s::delete removes the network,
+            // otherwise `remove_network` fails with "has active endpoints".
+            if self.config.use_router {
+                if let Err(e) = self
+                    .router
+                    .release(&k3s.docker, &self.config, &output_tx)
+                    .await
+                {
+                    tracing::warn!(error = %e, "Router release failed");
+                }
+            }
             k3s.delete(output_tx.clone(), delete_snapshots).await?;
         }
 
-        // Note: /etc/hosts entries are kept on purpose - user can manually update with 'H' key
+        // Note: /etc/hosts is left to the caller, which owns the elevated-write
+        // path (the rewrite may need root, and that must not fail the destroy).
 
         Ok(())
     }

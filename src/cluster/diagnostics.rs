@@ -22,7 +22,7 @@ use tokio::net::TcpStream;
 use crate::app::AppMessage;
 use crate::cluster::kube_ops::KubeOps;
 use crate::cluster::{
-    ClusterConfig, DockerManager, IngressHealthChecker, IngressManager, PlatformInfo,
+    ClusterConfig, DockerManager, IngressHealthChecker, IngressManager, PlatformInfo, RouterManager,
 };
 use crate::k8s::{K8sClient, PodExecutor};
 
@@ -223,6 +223,7 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             CAT_NETWORKING,
             "Host ports reachable",
         ),
+        ("cidrs_distinct", CAT_NETWORKING, "Pod/service CIDRs unique"),
         (
             "ingress_configured",
             CAT_NETWORKING,
@@ -570,7 +571,22 @@ async fn execute_preflight_test(
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "invalid port test".to_string())?;
 
-            // First check if our own k3dev container already has this port mapped
+            // In router mode the shared router owns the host HTTP/HTTPS ports
+            // and this cluster's container publishes neither, so finding them
+            // bound is the expected state, not a conflict.
+            if config.use_router && (port == config.http_port || port == config.https_port) {
+                if let Ok(docker) = docker_mgr() {
+                    let router = RouterManager::new(config.router_image.clone());
+                    if router.owns_host_port(&docker, port).await {
+                        return Ok(Some(format!(
+                            "in use by {}",
+                            crate::cluster::ROUTER_CONTAINER
+                        )));
+                    }
+                }
+            }
+
+            // Then check if our own k3dev container already has this port mapped
             if let Ok(docker) = docker_mgr() {
                 if let Ok(info) = docker
                     .client
@@ -640,7 +656,7 @@ async fn execute_preflight_test(
             }
         }
         "pre_certs_dir" => {
-            let certs_dir = ClusterConfig::certs_dir();
+            let certs_dir = config.certs_dir();
             if certs_dir.exists() {
                 Ok(Some(format!("{}", certs_dir.display())))
             } else {
@@ -840,7 +856,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "nodes_ready" => {
-            let mut kube = KubeOps::new();
+            let mut kube = KubeOps::for_cluster(config);
             let nodes = kube
                 .list_nodes()
                 .await
@@ -904,7 +920,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "traefik_service" => {
-            let mut kube = KubeOps::new();
+            let mut kube = KubeOps::for_cluster(config);
             if kube.service_exists("traefik", "kube-system").await {
                 Ok(None)
             } else {
@@ -978,6 +994,17 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 "127.0.0.1".to_string()
             };
 
+            // In router mode HTTP/HTTPS are owned by the shared k3dev-router,
+            // not by this cluster's container — so this check means "the router
+            // is listening", and it must also be actually up.
+            if config.use_router {
+                let docker = docker_mgr()?;
+                let router = RouterManager::new(config.router_image.clone());
+                if !router.is_healthy(&docker).await {
+                    return Err(format!("{} not running", crate::cluster::ROUTER_CONTAINER));
+                }
+            }
+
             let ports: Vec<(u16, &str)> = vec![
                 (config.http_port, "HTTP"),
                 (config.https_port, "HTTPS"),
@@ -1005,8 +1032,33 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 Err(format!("unreachable: {}", failed.join(", ")))
             }
         }
+        "cidrs_distinct" => {
+            // Two clusters sharing an index share their pod, service and DNS
+            // CIDRs. k3dev allocates indices uniquely, so this only fires when
+            // `cluster_index` was pinned by hand in a config file.
+            let clashes: Vec<String> = crate::cluster::registry::all()
+                .into_iter()
+                .filter(|(name, idx)| *idx == config.cluster_index && name != &config.cluster_name)
+                .map(|(name, _)| name)
+                .collect();
+
+            if clashes.is_empty() {
+                Ok(Some(format!(
+                    "index {} → pods {}, services {}",
+                    config.cluster_index,
+                    config.cluster_cidr(),
+                    config.service_cidr()
+                )))
+            } else {
+                Err(format!(
+                    "cluster_index {} also used by: {}",
+                    config.cluster_index,
+                    clashes.join(", ")
+                ))
+            }
+        }
         "ingress_configured" => {
-            let mut ingress = IngressManager::with_domain(config.domain.clone());
+            let mut ingress = IngressManager::for_cluster(config);
             let entries = ingress
                 .get_ingress_entries()
                 .await
@@ -1018,7 +1070,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "hosts_uptodate" => {
-            let mut ingress = IngressManager::with_domain(config.domain.clone());
+            let mut ingress = IngressManager::for_cluster(config);
             let missing = ingress
                 .get_missing_hosts()
                 .await
@@ -1031,7 +1083,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "ingress_healthy" => {
-            let mut ingress = IngressManager::with_domain(config.domain.clone());
+            let mut ingress = IngressManager::for_cluster(config);
             let entries = ingress
                 .get_ingress_entries()
                 .await
@@ -1052,7 +1104,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             }
         }
         "tls_cert_valid" => {
-            let certs_dir = ClusterConfig::certs_dir();
+            let certs_dir = config.certs_dir();
             let cert_path = certs_dir.join("local-cert.pem");
             let key_path = certs_dir.join("local-key.pem");
 
@@ -1730,7 +1782,7 @@ mod tests {
     #[test]
     fn test_build_test_list() {
         let tests = build_test_list();
-        assert_eq!(tests.len(), 30);
+        assert_eq!(tests.len(), 31);
         assert!(tests.iter().all(|t| t.status == DiagnosticStatus::Pending));
     }
 

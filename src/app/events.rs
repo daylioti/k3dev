@@ -96,6 +96,22 @@ impl App {
 
         // Handle output popup mode (modal)
         if self.mode == AppMode::OutputPopup {
+            // A child is waiting on its tty: keys are input, not popup controls
+            if let Some(input) = &self.tty_input {
+                match code {
+                    KeyCode::Esc => self.mode = AppMode::Normal,
+                    KeyCode::Up | KeyCode::PageUp => self.output_popup.scroll_up(),
+                    KeyCode::Down | KeyCode::PageDown => self.output_popup.scroll_down(20),
+                    _ => {
+                        if let Some(bytes) =
+                            crate::ui::components::shell_view::key_to_bytes(code, modifiers)
+                        {
+                            let _ = input.try_send(bytes);
+                        }
+                    }
+                }
+                return;
+            }
             match code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.mode = AppMode::Normal;
@@ -150,6 +166,32 @@ impl App {
                     self.command_palette.move_up();
                 }
                 KeyCode::Char(c) => self.command_palette.handle_char(c),
+                _ => {}
+            }
+            return;
+        }
+
+        // Handle cluster switcher mode (modal)
+        if self.mode == AppMode::ClusterSwitch {
+            match code {
+                KeyCode::Esc => self.close_cluster_switcher(),
+                KeyCode::Enter => self.confirm_cluster_switch(),
+                KeyCode::Up => self.cluster_switcher.move_up(),
+                KeyCode::Down => self.cluster_switcher.move_down(),
+                KeyCode::Backspace => self.cluster_switcher.handle_backspace(),
+                KeyCode::Char('j') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.cluster_switcher.move_down();
+                }
+                KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.cluster_switcher.move_up();
+                }
+                KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.cluster_switcher.move_down();
+                }
+                KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.cluster_switcher.move_up();
+                }
+                KeyCode::Char(c) => self.cluster_switcher.handle_char(c),
                 _ => {}
             }
             return;
@@ -252,6 +294,9 @@ impl App {
                 KeyAction::CommandPalette => {
                     self.command_palette.reset();
                     self.mode = AppMode::CommandPalette;
+                }
+                KeyAction::SwitchCluster => {
+                    self.open_cluster_switcher();
                 }
                 KeyAction::MoveUp => {
                     self.handle_up();
@@ -423,6 +468,9 @@ impl App {
             KeyAction::UpdateHosts => {
                 self.trigger_manual_hosts_update();
             }
+            KeyAction::SwitchCluster => {
+                self.open_cluster_switcher();
+            }
             KeyAction::MoveUp => {
                 for _ in 0..count {
                     self.handle_up();
@@ -479,11 +527,13 @@ impl App {
 
         // Check if click is in action bar
         if y >= layout.action_bar.y && y < layout.action_bar.y + layout.action_bar.height {
+            let bar_x = x.saturating_sub(layout.action_bar.x) as usize;
+            if self.action_bar.badge_hit(bar_x) {
+                self.open_cluster_switcher();
+                return;
+            }
             self.focus = FocusArea::ActionBar;
-            if let Some(action_index) = self
-                .action_bar
-                .get_action_at_x(x.saturating_sub(layout.action_bar.x) as usize)
-            {
+            if let Some(action_index) = self.action_bar.get_action_at_x(bar_x) {
                 self.action_bar.select_index(action_index);
                 if let Some(action) = self.action_bar.selected_action() {
                     self.execute_cluster_action(action);
@@ -508,6 +558,34 @@ impl App {
                             self.execute_command(cmd);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Bracketed paste: deliver the text where typing would go.
+    pub(super) fn handle_paste(&mut self, text: String) {
+        match self.mode {
+            AppMode::Shell => {
+                if let Some(session) = &self.shell_session {
+                    session.write(text.as_bytes());
+                }
+            }
+            AppMode::OutputPopup => {
+                if let Some(input) = &self.tty_input {
+                    let _ = input.try_send(text.into_bytes());
+                }
+            }
+            // Pasting into the menu would fire a keybinding per character
+            AppMode::Normal => {}
+            _ => {
+                for c in text.chars() {
+                    let code = match c {
+                        '\n' | '\r' => KeyCode::Enter,
+                        '\t' => KeyCode::Tab,
+                        c => KeyCode::Char(c),
+                    };
+                    self.handle_key(code, KeyModifiers::NONE);
                 }
             }
         }

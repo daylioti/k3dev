@@ -31,6 +31,9 @@ impl CaptureTarget {
 #[derive(Debug, Clone)]
 pub struct CaptureSpec {
     pub target: CaptureTarget,
+    /// Kubelet cgroup root of the owning cluster, used to disambiguate pods
+    /// with the same namespace/name on a shared Docker daemon.
+    pub cgroup_root: String,
     /// Absolute path to the .pcap file to write.
     pub output_path: PathBuf,
     /// Sidecar image (e.g. "nicolaka/netshoot").

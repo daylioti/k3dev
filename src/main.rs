@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -21,9 +21,10 @@ mod hooks;
 mod k8s;
 mod keybindings;
 mod logging;
+mod tty;
 mod ui;
 
-use app::App;
+use app::{App, RunOutcome};
 use ui::components::ClusterAction;
 
 #[derive(Parser)]
@@ -202,7 +203,12 @@ impl CliCommand {
 fn restore_terminal() {
     let _ = disable_raw_mode();
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        stdout,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     let _ = stdout.flush();
 }
 
@@ -327,7 +333,12 @@ async fn main() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -337,7 +348,8 @@ async fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
 
@@ -468,10 +480,23 @@ fn parse_socat_port(ps_output: &str) -> Option<u16> {
     None
 }
 
+/// Run the TUI, rebuilding the App whenever the user switches cluster.
+///
+/// A cluster is defined by its whole config file (menu, hooks, info blocks,
+/// keybindings, theme), so switching rebuilds `App` from scratch rather than
+/// mutating it. The terminal stays in raw/alternate-screen mode across the
+/// swap, so there is no flicker.
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     config_path: Option<&str>,
 ) -> Result<()> {
-    let mut app = App::new(config_path).await?;
-    app.run(terminal).await
+    let mut path = config_path.map(str::to_string);
+
+    loop {
+        let mut app = App::new(path.as_deref()).await?;
+        match app.run(terminal).await? {
+            RunOutcome::Quit => return Ok(()),
+            RunOutcome::Switch(next) => path = Some(next.to_string_lossy().into_owned()),
+        }
+    }
 }

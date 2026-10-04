@@ -226,11 +226,21 @@ pub async fn run_bench(config_path: Option<&str>) -> BenchReport {
     let docker_res = async {
         let docker = DockerManager::from_default_socket()?;
         match docker
-            .get_pod_stats_via_agent(&cluster_config.container_name)
+            .get_pod_stats_via_agent(
+                &cluster_config.container_name,
+                &cluster_config.cgroup_root(),
+            )
             .await
         {
             Ok(s) => Ok(s),
-            Err(_) => docker.get_pod_stats(&cluster_config.container_name).await,
+            Err(_) => {
+                docker
+                    .get_pod_stats(
+                        &cluster_config.container_name,
+                        &cluster_config.cgroup_root(),
+                    )
+                    .await
+            }
         }
     }
     .await;

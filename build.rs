@@ -21,6 +21,7 @@ fn main() {
     let project_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let assets_dir = project_dir.join("assets");
     let agent_dir = project_dir.join("agent");
+    let criproxy_dir = project_dir.join("criproxy");
 
     std::fs::create_dir_all(&assets_dir).unwrap();
 
@@ -30,6 +31,7 @@ fn main() {
 
     for arch in &arches {
         let agent_path = assets_dir.join(format!("k3dev-agent-{}", arch));
+        let criproxy_path = assets_dir.join(format!("k3dev-criproxy-{}", arch));
         let socat_path = assets_dir.join(format!("socat-{}", arch));
 
         if *arch == host_arch {
@@ -38,14 +40,25 @@ fn main() {
                 acquire_socat(&assets_dir, arch);
             }
 
-            // Agent: build from source (it's part of this repo)
-            if needs_build(&agent_path) {
-                build_agent(&agent_dir, &assets_dir, arch);
+            // Agent: build from source (it's part of this repo). Unlike socat,
+            // its source lives here and changes, so a valid ELF is not enough —
+            // rebuild whenever the source is newer than the asset.
+            if needs_build(&agent_path) || helper_source_is_newer(&agent_dir, &agent_path) {
+                build_helper(&agent_dir, &assets_dir, arch, "k3dev-agent");
+            }
+
+            // CRI filtering proxy: same story as the agent
+            if needs_build(&criproxy_path) || helper_source_is_newer(&criproxy_dir, &criproxy_path)
+            {
+                build_helper(&criproxy_dir, &assets_dir, arch, "k3dev-criproxy");
             }
         } else {
             // Create placeholder for non-host arch (guarded by #[cfg(target_arch)])
             if !agent_path.exists() {
                 std::fs::write(&agent_path, "placeholder").unwrap();
+            }
+            if !criproxy_path.exists() {
+                std::fs::write(&criproxy_path, "placeholder").unwrap();
             }
             if !socat_path.exists() {
                 std::fs::write(&socat_path, "placeholder").unwrap();
@@ -54,11 +67,14 @@ fn main() {
 
         // Rerun if assets change
         println!("cargo:rerun-if-changed={}", agent_path.display());
+        println!("cargo:rerun-if-changed={}", criproxy_path.display());
         println!("cargo:rerun-if-changed={}", socat_path.display());
     }
 
     println!("cargo:rerun-if-changed=agent/src/main.rs");
     println!("cargo:rerun-if-changed=agent/Cargo.toml");
+    println!("cargo:rerun-if-changed=criproxy/src/main.rs");
+    println!("cargo:rerun-if-changed=criproxy/Cargo.toml");
 
     emit_version(&project_dir);
 }
@@ -105,6 +121,22 @@ fn git_describe(dir: &Path) -> Option<String> {
 }
 
 /// Check if a binary needs to be (re)built: missing, placeholder, or not a valid ELF.
+/// Is any helper source file newer than the built asset?
+fn helper_source_is_newer(src_dir: &Path, asset: &Path) -> bool {
+    let Ok(asset_mtime) = std::fs::metadata(asset).and_then(|m| m.modified()) else {
+        return true;
+    };
+
+    for file in ["src/main.rs", "Cargo.toml"] {
+        if let Ok(src_mtime) = std::fs::metadata(src_dir.join(file)).and_then(|m| m.modified()) {
+            if src_mtime > asset_mtime {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn needs_build(path: &Path) -> bool {
     let Ok(data) = std::fs::read(path) else {
         return true;
@@ -304,14 +336,16 @@ fn try_native_build_socat(assets_dir: &Path, arch: &str) -> bool {
 // k3dev-agent: Docker build → native musl build → placeholder
 // ---------------------------------------------------------------------------
 
-fn build_agent(agent_dir: &Path, assets_dir: &Path, arch: &str) {
+/// Build one of this repo's helper binaries (k3dev-agent, k3dev-criproxy) as a
+/// static musl executable and drop it in assets/.
+fn build_helper(src_dir: &Path, assets_dir: &Path, arch: &str, bin: &str) {
     let target = format!("{}-unknown-linux-musl", arch);
-    let dest = assets_dir.join(format!("k3dev-agent-{}", arch));
+    let dest = assets_dir.join(format!("{}-{}", bin, arch));
 
-    println!("cargo:warning=Building k3dev-agent for {} ...", arch);
+    println!("cargo:warning=Building {} for {} ...", bin, arch);
 
     // Try Docker-based build (works on macOS and Linux without musl toolchain)
-    if try_docker_build_agent(agent_dir, assets_dir, arch, &target) {
+    if try_docker_build_helper(src_dir, assets_dir, arch, bin) {
         return;
     }
 
@@ -327,20 +361,20 @@ fn build_agent(agent_dir: &Path, assets_dir: &Path, arch: &str) {
             "--target",
             &target,
             "--manifest-path",
-            agent_dir.join("Cargo.toml").to_str().unwrap(),
+            src_dir.join("Cargo.toml").to_str().unwrap(),
         ])
         .status();
 
     if let Ok(s) = status {
         if s.success() {
-            let built = agent_dir
+            let built = src_dir
                 .join("target")
                 .join(&target)
                 .join("release")
-                .join("k3dev-agent");
+                .join(bin);
             if built.exists() {
                 std::fs::copy(&built, &dest).unwrap();
-                println!("cargo:warning=Built k3dev-agent-{} (native musl)", arch);
+                println!("cargo:warning=Built {}-{} (native musl)", bin, arch);
                 return;
             }
         }
@@ -349,18 +383,18 @@ fn build_agent(agent_dir: &Path, assets_dir: &Path, arch: &str) {
     // Create placeholder as last resort (e.g. macOS CI without Docker)
     std::fs::write(&dest, "placeholder").unwrap();
     println!(
-        "cargo:warning=Could not build k3dev-agent-{}. Created placeholder.",
-        arch
+        "cargo:warning=Could not build {}-{}. Created placeholder.",
+        bin, arch
     );
     println!("cargo:warning=Install Docker or musl-tools to build real binaries.");
 }
 
-fn try_docker_build_agent(agent_dir: &Path, assets_dir: &Path, arch: &str, _target: &str) -> bool {
+fn try_docker_build_helper(src_dir: &Path, assets_dir: &Path, arch: &str, bin: &str) -> bool {
     if !docker_available() {
         return false;
     }
 
-    let dest = assets_dir.join(format!("k3dev-agent-{}", arch));
+    let dest = assets_dir.join(format!("{}-{}", bin, arch));
     let platform = match arch {
         "aarch64" => "linux/arm64",
         "x86_64" => "linux/amd64",
@@ -374,7 +408,7 @@ fn try_docker_build_agent(agent_dir: &Path, assets_dir: &Path, arch: &str, _targ
             "--platform",
             platform,
             "-v",
-            &format!("{}:/work", agent_dir.display()),
+            &format!("{}:/work", src_dir.display()),
             "-v",
             &format!("{}:/out", assets_dir.display()),
             "-w",
@@ -385,16 +419,17 @@ fn try_docker_build_agent(agent_dir: &Path, assets_dir: &Path, arch: &str, _targ
             &format!(
                 "apk add -q musl-dev && \
                  cargo build --release && \
-                 strip target/release/k3dev-agent && \
-                 cp target/release/k3dev-agent /out/k3dev-agent-{}",
-                arch
+                 strip target/release/{bin} && \
+                 cp target/release/{bin} /out/{bin}-{arch}",
+                bin = bin,
+                arch = arch
             ),
         ])
         .status();
 
     if let Ok(s) = status {
         if s.success() && dest.exists() && !needs_build(&dest) {
-            println!("cargo:warning=Built k3dev-agent-{} (Docker)", arch);
+            println!("cargo:warning=Built {}-{} (Docker)", bin, arch);
             return true;
         }
     }

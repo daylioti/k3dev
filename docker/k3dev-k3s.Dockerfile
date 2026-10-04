@@ -2,16 +2,20 @@
 #
 # Layers k3dev's helper binaries onto the upstream rancher/k3s image so a fresh
 # cluster comes up with them already present (no runtime `docker cp` injection):
-#   - socat        : Docker API relay
-#   - k3dev-agent  : in-container CPU/mem stats collector
+#   - socat          : Docker API relay
+#   - k3dev-agent    : in-container CPU/mem stats collector
+#   - k3dev-criproxy : Docker API filtering proxy that scopes cri-dockerd to one
+#                      cluster, so concurrent clusters on the shared host daemon
+#                      don't garbage-collect each other's pods
 #
 # Built multi-arch (linux/amd64, linux/arm64) by .github/workflows/build-k3s-images.yml.
 # The image tag mirrors the upstream rancher/k3s tag exactly (e.g. v1.35.2-k3s1),
 # so only the registry/repo changes for consumers.
 #
 # Build context must contain the helper binaries named by Docker's TARGETARCH:
-#   socat-amd64        socat-arm64
-#   k3dev-agent-amd64  k3dev-agent-arm64
+#   socat-amd64           socat-arm64
+#   k3dev-agent-amd64     k3dev-agent-arm64
+#   k3dev-criproxy-amd64  k3dev-criproxy-arm64
 
 ARG K3S_VERSION
 FROM rancher/k3s:${K3S_VERSION}
@@ -21,3 +25,4 @@ ARG TARGETARCH
 
 COPY --chmod=0755 socat-${TARGETARCH}       /usr/local/bin/socat
 COPY --chmod=0755 k3dev-agent-${TARGETARCH} /usr/local/bin/k3dev-agent
+COPY --chmod=0755 k3dev-criproxy-${TARGETARCH} /usr/local/bin/k3dev-criproxy

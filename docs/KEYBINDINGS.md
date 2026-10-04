@@ -16,6 +16,7 @@ This document provides a quick reference for all k3dev keyboard shortcuts.
 | `r` | Refresh data |
 | `:` | Open command palette |
 | `H` | Update /etc/hosts with ingress entries |
+| `c` | Switch to another cluster |
 
 ### Navigation
 
@@ -113,6 +114,7 @@ Supported modifiers:
 | `refresh` | `r` | Refresh all data |
 | `command_palette` | `:` | Open command palette |
 | `update_hosts` | `H` | Update /etc/hosts file |
+| `switch_cluster` | `c` | Open the cluster switcher |
 | `cancel` | `Ctrl+c` | Cancel running operation |
 | `move_up` | `k` | Navigate up |
 | `move_down` | `j` | Navigate down |

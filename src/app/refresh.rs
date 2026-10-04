@@ -72,12 +72,12 @@ impl App {
         }
 
         let message_tx = self.message_tx.clone();
-        let domain = self.cluster_config.domain.clone();
+        let config = Arc::clone(&self.cluster_config);
         let timeout = self.refresh_config.ingress_timeout;
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let mut ingress_manager = IngressManager::with_domain(domain);
+                let mut ingress_manager = IngressManager::for_cluster(&config);
                 ingress_manager.get_ingress_entries().await
             })
             .await;
@@ -122,12 +122,12 @@ impl App {
         }
 
         let message_tx = self.message_tx.clone();
-        let domain = self.cluster_config.domain.clone();
+        let config = Arc::clone(&self.cluster_config);
         let timeout = self.refresh_config.ingress_timeout;
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                let mut ingress_manager = IngressManager::with_domain(domain);
+                let mut ingress_manager = IngressManager::for_cluster(&config);
                 ingress_manager.get_missing_hosts().await
             })
             .await;
@@ -161,14 +161,18 @@ impl App {
         };
         let message_tx = self.message_tx.clone();
         let container_name = self.cluster_config.container_name.clone();
+        let cgroup_root = self.cluster_config.cgroup_root();
         let timeout = self.refresh_config.docker_stats_timeout;
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
                 // Try agent first, fall back to direct cgroup reads
-                match docker.get_pod_stats_via_agent(&container_name).await {
+                match docker
+                    .get_pod_stats_via_agent(&container_name, &cgroup_root)
+                    .await
+                {
                     Ok(stats) => Ok::<_, anyhow::Error>(stats),
-                    Err(_) => docker.get_pod_stats(&container_name).await,
+                    Err(_) => docker.get_pod_stats(&container_name, &cgroup_root).await,
                 }
             })
             .await;
@@ -289,14 +293,17 @@ impl App {
         };
         let cached_k8s = self.k8s_client.clone();
         let message_tx = self.message_tx.clone();
+        let config = Arc::clone(&self.cluster_config);
         let kubeconfig = self.cluster_config.kubeconfig.clone();
         let context = self.cluster_config.context.clone();
         let timeout = self.refresh_config.volume_timeout;
-        let storage_path = crate::cluster::K3sManager::LOCAL_PV_STORAGE_PATH.to_string();
         let container_name = self.cluster_config.container_name.clone();
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
+                let docker_root = docker.get_docker_root_dir().await;
+                let storage_path = config.local_pv_storage_path(&docker_root);
+
                 // 1. Get volume stats via docker exec + container mounts (PVC dirs, sizes, pod mapping)
                 let volume_stats = docker
                     .get_volume_stats(&container_name, &storage_path)
@@ -414,11 +421,12 @@ impl App {
             None => return,
         };
         let message_tx = self.message_tx.clone();
+        let cgroup_root = self.cluster_config.cgroup_root();
         let timeout = self.refresh_config.docker_stats_timeout;
 
         tokio::spawn(async move {
             let result = tokio::time::timeout(timeout, async {
-                Ok::<_, anyhow::Error>(docker.get_pod_image_architectures().await)
+                Ok::<_, anyhow::Error>(docker.get_pod_image_architectures(&cgroup_root).await)
             })
             .await;
 
@@ -508,6 +516,7 @@ impl App {
 
         let k8s_client = self.k8s_client.clone();
         let message_tx = self.message_tx.clone();
+        let cluster_config = Arc::clone(&self.cluster_config);
 
         tokio::spawn(async move {
             // Build a DockerManager on-demand for checks that need it (mirrors
@@ -519,8 +528,11 @@ impl App {
                 }
                 _ => None,
             };
+            let env = cluster_config.host_command_env();
             let (visible, error) =
-                match check_visible(&check, k8s_client.as_ref(), docker.as_ref(), timeout).await {
+                match check_visible(&check, k8s_client.as_ref(), docker.as_ref(), timeout, &env)
+                    .await
+                {
                     Ok(v) => (v, None),
                     Err(e) => (false, Some(e.to_string())),
                 };
@@ -543,27 +555,36 @@ impl App {
             .min(std::time::Duration::from_secs(60));
         let k8s_client = self.k8s_client.clone();
         let message_tx = self.message_tx.clone();
+        let cluster_config = Arc::clone(&self.cluster_config);
 
         tokio::spawn(async move {
             let docker = match &exec.target {
                 ExecutionTarget::Docker { .. } => DockerManager::from_default_socket().ok(),
                 _ => None,
             };
-            let result =
-                match capture_exec(&exec, k8s_client.as_ref(), docker.as_ref(), timeout).await {
-                    Ok(raw) => {
-                        let cleaned = strip_ansi(&raw);
-                        let trimmed = trim_output(&cleaned, max_lines, max_length);
-                        InfoBlockResult {
-                            output: trimmed,
-                            status: InfoBlockStatus::Ok,
-                        }
+            let env = cluster_config.host_command_env();
+            let result = match capture_exec(
+                &exec,
+                k8s_client.as_ref(),
+                docker.as_ref(),
+                timeout,
+                &env,
+            )
+            .await
+            {
+                Ok(raw) => {
+                    let cleaned = strip_ansi(&raw);
+                    let trimmed = trim_output(&cleaned, max_lines, max_length);
+                    InfoBlockResult {
+                        output: trimmed,
+                        status: InfoBlockStatus::Ok,
                     }
-                    Err(e) => InfoBlockResult {
-                        output: String::new(),
-                        status: InfoBlockStatus::Error(e.to_string()),
-                    },
-                };
+                }
+                Err(e) => InfoBlockResult {
+                    output: String::new(),
+                    status: InfoBlockStatus::Error(e.to_string()),
+                },
+            };
             let _ = message_tx
                 .send(AppMessage::InfoBlockUpdated { index, result })
                 .await;

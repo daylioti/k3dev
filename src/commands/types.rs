@@ -24,6 +24,7 @@ pub enum PaletteCommandId {
     // Application commands
     AppRefresh,
     AppUpdateHosts,
+    AppSwitchCluster,
     AppHelp,
     AppQuit,
 
@@ -49,6 +50,7 @@ impl PaletteCommandId {
             Self::ClusterPreflightCheck => "cluster:preflight-check",
             Self::AppRefresh => "app:refresh",
             Self::AppUpdateHosts => "app:update-hosts",
+            Self::AppSwitchCluster => "app:switch-cluster",
             Self::AppHelp => "app:help",
             Self::AppQuit => "app:quit",
             Self::NavFocusMenu => "nav:focus-menu",

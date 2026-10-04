@@ -16,6 +16,7 @@ use ratatui::{
     Terminal,
 };
 use std::io::Stdout;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -32,8 +33,9 @@ use crate::k8s::PendingPodInfo;
 use crate::k8s::{K8sClient, ShellSessionHandle};
 use crate::keybindings::KeybindingResolver;
 use crate::ui::components::{
-    ActionBar, ClusterAction, CommandPalette, ConfirmPopup, DetailTab, DiagnosticsOverlay,
-    HelpOverlay, InputForm, Menu, Output, OutputPopup, PodDetailPanel, PodStats,
+    ActionBar, ClusterAction, ClusterSwitcher, CommandPalette, ConfirmPopup, DetailTab,
+    DiagnosticsOverlay, HelpOverlay, InputForm, Menu, Output, OutputPopup, PodDetailPanel,
+    PodStats,
 };
 use crate::ui::{AppLayout, Styles};
 use std::collections::{HashMap, HashSet};
@@ -99,6 +101,17 @@ pub enum AppMode {
     ConfirmDestroy,
     Diagnostics,
     Shell,
+    ClusterSwitch,
+}
+
+/// Why [`App::run`] returned.
+///
+/// Switching clusters swaps the entire config — menu, hooks, info blocks,
+/// keybindings, theme — so the App is rebuilt rather than mutated in place.
+/// `main` owns the terminal and loops on this.
+pub enum RunOutcome {
+    Quit,
+    Switch(PathBuf),
 }
 
 /// Main application
@@ -120,6 +133,7 @@ pub struct App {
     input_form: InputForm,
     help_overlay: HelpOverlay,
     command_palette: CommandPalette,
+    cluster_switcher: ClusterSwitcher,
     confirm_popup: ConfirmPopup,
     diagnostics_overlay: DiagnosticsOverlay,
     pod_detail_panel: PodDetailPanel,
@@ -167,6 +181,9 @@ pub struct App {
 
     // Interactive shell session
     shell_session: Option<ShellSessionHandle>,
+
+    // Input side of the pty of the child currently talking to the terminal
+    tty_input: Option<mpsc::Sender<Vec<u8>>>,
     shell_area_size: (u16, u16),
 
     // Pending command to send to shell once session is ready
@@ -175,6 +192,9 @@ pub struct App {
     // Async channels
     message_tx: mpsc::Sender<AppMessage>,
     message_rx: mpsc::Receiver<AppMessage>,
+
+    // Config file to reopen the app against, set by the cluster switcher
+    switch_to: Option<PathBuf>,
 
     // Cancellation
     cancel_token: Option<CancellationToken>,
@@ -253,6 +273,7 @@ impl App {
         let k8s_client: Option<K8sClient> = None;
 
         let (message_tx, message_rx) = mpsc::channel(100);
+        crate::tty::attach(message_tx.clone());
         let theme = config.theme;
 
         let mut menu = Menu::with_theme(theme);
@@ -339,11 +360,19 @@ impl App {
         command_palette.load_custom_commands(&config.commands, &hidden_command_paths);
 
         let mut action_bar = ActionBar::with_theme(theme);
-        let cluster_name = context
-            .clone()
-            .or_else(|| Some(cluster_config.container_name.clone()));
-        action_bar.set_cluster_name(cluster_name);
-        action_bar.set_config_path(config_file_path);
+        action_bar.set_cluster_name(Some(cluster_config.cluster_name.clone()));
+        action_bar.set_config_path(config_file_path.clone());
+
+        // Remember which config file defines this cluster, so the switcher can
+        // reopen it later from any working directory.
+        if let Some(path) = &config_file_path {
+            crate::cluster::config_registry::record(
+                &cluster_config.cluster_name,
+                path,
+                &cluster_config.domain,
+                cluster_config.api_port,
+            );
+        }
 
         Ok(Self {
             config,
@@ -358,6 +387,7 @@ impl App {
             input_form: InputForm::with_theme(theme),
             help_overlay,
             command_palette,
+            cluster_switcher: ClusterSwitcher::with_theme(theme),
             confirm_popup: ConfirmPopup::with_theme(theme),
             diagnostics_overlay: DiagnosticsOverlay::with_theme(theme),
             pod_detail_panel: PodDetailPanel::with_theme(theme),
@@ -381,10 +411,12 @@ impl App {
             image_arch_cache: HashMap::new(),
             image_arch_check_pending: false,
             shell_session: None,
+            tty_input: None,
             shell_area_size: (0, 0),
             pending_shell_command: None,
             message_tx,
             message_rx,
+            switch_to: None,
             cancel_token: None,
             scheduler,
             keybinding_resolver,
@@ -478,7 +510,10 @@ impl App {
     }
 
     /// Run the application event loop
-    pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    pub async fn run(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<RunOutcome> {
         // Initial data load
         self.spawn_status_check();
         self.spawn_version_check();
@@ -513,6 +548,7 @@ impl App {
                 match event::read()? {
                     Event::Key(key) => self.handle_key(key.code, key.modifiers),
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    Event::Paste(text) => self.handle_paste(text),
                     _ => {}
                 }
             }
@@ -597,7 +633,10 @@ impl App {
             }
         }
 
-        Ok(())
+        Ok(match self.switch_to.take() {
+            Some(path) => RunOutcome::Switch(path),
+            None => RunOutcome::Quit,
+        })
     }
 
     /// Headless reproduction of the TUI's startup → "pods visible" sequence,
@@ -832,6 +871,9 @@ impl App {
         }
         if self.mode == AppMode::Diagnostics {
             self.diagnostics_overlay.render(frame, frame.area());
+        }
+        if self.mode == AppMode::ClusterSwitch {
+            self.cluster_switcher.render(frame, frame.area());
         }
     }
 

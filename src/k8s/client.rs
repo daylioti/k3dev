@@ -67,18 +67,33 @@ pub struct K8sClient {
 }
 
 impl K8sClient {
-    /// Create a new K8s client
+    /// Create a new K8s client.
+    ///
+    /// A context alone is enough to select a cluster — it is resolved against
+    /// the default `~/.kube/config`. Falling back to `Config::infer()` whenever
+    /// no explicit kubeconfig path was given would follow whatever
+    /// `current-context` happens to be, which with several k3dev clusters means
+    /// talking to the wrong one.
     pub async fn new(kubeconfig: Option<&str>, context: Option<&str>) -> Result<Self> {
-        let config = if let Some(path) = kubeconfig.filter(|s| !s.is_empty()) {
-            let expanded = expand_home(Path::new(path))?;
+        let path = kubeconfig.filter(|s| !s.is_empty());
+        let context = context.filter(|s| !s.is_empty());
+
+        let config = if path.is_none() && context.is_none() {
+            Config::infer().await?
+        } else {
+            let expanded = match path {
+                Some(p) => expand_home(Path::new(p))?,
+                None => dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?
+                    .join(".kube")
+                    .join("config"),
+            };
             let kubeconfig_data = Kubeconfig::read_from(&expanded)?;
             let config_options = KubeConfigOptions {
-                context: context.filter(|s| !s.is_empty()).map(String::from),
+                context: context.map(String::from),
                 ..Default::default()
             };
             Config::from_custom_kubeconfig(kubeconfig_data, &config_options).await?
-        } else {
-            Config::infer().await?
         };
 
         let client = Client::try_from(config)?;

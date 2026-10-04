@@ -23,16 +23,25 @@ cluster:
 
 # ---- K3s infrastructure (the cluster this tool manages) --------------------
 infrastructure:
-  cluster_name: "k3dev"        # used for container ({name}-server) + network ({name}-net)
-  domain: "local.k8s.dev"      # default domain for ingresses
+  cluster_name: "k3dev"        # namespaces everything: container ({name}-server),
+                               # network ({name}-net), volumes, kubelet root, cgroup
+                               # root, snapshots, /etc/hosts marker, kube context
+  cluster_index: null          # optional; pins the index used to derive pod/service
+                               # CIDRs. Omit and k3dev allocates + persists one in
+                               # ~/.k3dev/clusters.json
+  domain: "local.k8s.dev"      # default domain for ingresses; must be unique per cluster
   k3s_version: "latest"        # k3s image tag; pin e.g. "v1.35.2-k3s1" for a fixed version
   k3s_image_repo: "ghcr.io/daylioti/k3dev-k3s"  # image repo; tag is k3s_version. See note below.
-  api_port: 6443
-  http_port: 80
+  api_port: 6443               # published directly; must be unique per cluster
+  http_port: 80                # host port the shared router listens on
   https_port: 443
   additional_ports:            # extra host:container port mappings
     - "2345:2345"
     - "8080:8080"
+
+  router:                      # shared front router (see "Running several clusters")
+    enabled: true
+    image: "traefik:v3.3"
 
   speedup:                     # snapshot-based fast startup (see note below)
     use_snapshot: true         # first start ~30-60s (creates snapshot); later ~5-10s
@@ -150,7 +159,7 @@ keybindings:
 # ---- Lifecycle hooks -------------------------------------------------------
 hooks:
   env:                         # env vars exported to every hook command
-    KUBECONFIG: "~/.kube/config"
+    MY_VAR: "value"
 
   on_cluster_available:        # after k3s API responds
     - name: "Wait for nodes"
@@ -166,7 +175,26 @@ hooks:
       command: "helm upgrade --install myapp ./charts/myapp"
       workdir: "~/projects/myapp"
       continue_on_error: true
+
+  on_snapshot_created:         # after a snapshot image is committed
+    - name: "Notify"
+      command: "notify-send 'k3dev snapshot ready'"
+      continue_on_error: true
 ```
+
+Every hook is run with `KUBECONFIG` pointing at a standalone kubeconfig pinned
+to the cluster the hook fired for, and `K3DEV_CONTEXT` set to that cluster's
+context name. A bare `kubectl` in a hook therefore talks to the right cluster
+without depending on your global `current-context` — which k3dev deliberately
+never changes, and which may still point at a context left behind by a deleted
+cluster. Setting `KUBECONFIG` yourself in `hooks.env` overrides this and gives
+up that guarantee.
+
+`on_snapshot_created` fires only when a snapshot is actually written — after the
+shallow snapshot taken right after a fresh cluster comes up, and after the deep
+snapshot taken once Traefik and the `on_services_deployed` hooks have finished.
+Starting from an existing snapshot does not fire it. A failing hook here is
+reported but never fails cluster startup, since the cluster is already running.
 
 ## K3s image (`k3s_image_repo`)
 
@@ -174,7 +202,7 @@ The cluster image is `{k3s_image_repo}:{k3s_version}`. The default repo,
 `ghcr.io/daylioti/k3dev-k3s`, is a k3dev-published rebuild of `rancher/k3s` with the
 `socat` and `k3dev-agent` helpers baked in, so a fresh cluster comes up without
 runtime binary injection. Tags mirror the upstream `rancher/k3s` tags exactly
-(e.g. `v1.35.2-k3s1`), and images are published for `linux/amd64` and `linux/arm64`.
+(e.g. `v1.36.4-k3s1`), and images are published for `linux/amd64` and `linux/arm64`.
 
 `k3s_version` defaults to `latest`, which tracks the newest k3s release published to
 the repo. Note that Docker only resolves a tag when the image is missing locally, so
@@ -192,7 +220,7 @@ for the latest patch of the newest four k3s minor lines.
 
 ## Command target types
 
-- **`host`** — runs in your local shell; use `workdir` to set the directory.
+- **`host`** — runs in your local shell; use `workdir` to set the directory. Like hooks, it gets `KUBECONFIG` (the cluster's pinned kubeconfig) and `K3DEV_CONTEXT`, so a bare `kubectl` reaches this cluster whatever your `current-context` is. The same applies to host-target info blocks and `visible:` checks.
 - **`docker`** — `docker exec` into a running container on the host daemon; requires `container`.
 - **`kubernetes`** — `kubectl exec` style; pod is located by `selector` OR `pod_name` (one required). Optional `namespace` (defaults to current) and `container` (defaults to first). This is the implicit default when `type:` is omitted.
 
@@ -232,3 +260,123 @@ visible: { type: pod, ..., interval: "10s" }                # override re-check 
 - Keybindings reference & key-format rules — [docs/KEYBINDINGS.md](KEYBINDINGS.md)
 - CLI flags and headless subcommands — [docs/CLI.md](CLI.md)
 - Starter example config — [configs/k3dev.example.yml](../configs/k3dev.example.yml)
+
+## Running several clusters at once
+
+Several k3dev clusters can be up and serving simultaneously on the same host
+Docker daemon, so pods keep running images built with plain `docker build`.
+
+Give each cluster its own config file and start them with `-c`:
+
+```bash
+k3dev -c ./projecta.yml start
+k3dev -c ./projectb.yml start
+```
+
+Each config must differ in:
+
+| Field | Why |
+|---|---|
+| `cluster_name` | Namespaces the container, network, volumes, kubelet root-dir, cgroup root, snapshot images, `/etc/hosts` marker and kubeconfig context. |
+| `domain` | Host header / SNI is the only thing the shared router can route on, so two clusters must never claim the same domain. |
+| `api_port` | Published directly on the host; it can be neither Host- nor SNI-routed. |
+| `additional_ports` | Raw host publishes — they collide like any other port. |
+
+`http_port` / `https_port` are the **host** ports the shared `k3dev-router`
+container listens on, and are normally 80/443 for every cluster. The in-cluster
+Traefik NodePorts stay 80/443 regardless.
+
+### The shared router
+
+With `infrastructure.router.enabled: true` (the default) a single
+`k3dev-router` container owns host `:80`/`:443`, attaches to every cluster's
+Docker network, and forwards by Host header (HTTP) or SNI (HTTPS, with TLS
+passthrough so each cluster's own Traefik still terminates TLS against the
+`~/.k3dev/ca` chain). Cluster containers publish no HTTP ports of their own.
+This is what lets every cluster keep clean URLs — `https://app.projecta.dev`
+with no port suffix.
+
+Set `router.enabled: false` to go back to publishing `http_port`/`https_port`
+straight from the cluster container. Only one cluster can then own 80/443, and
+the rest need distinct ports and lose clean URLs.
+
+### Networking
+
+Each cluster gets a persisted index (`~/.k3dev/clusters.json`, or pin it with
+`cluster_index`) that derives `--cluster-cidr=10.{42+2i}.0.0/16`,
+`--service-cidr=10.{43+2i}.0.0/16` and a matching `--cluster-dns`. Index 0
+reproduces the k3s defaults exactly. Pod networking is namespaced inside each
+container, so overlapping ranges would not break anything, but distinct ones
+keep diagnostics honest and leave room for host routes.
+
+### Switching cluster in the TUI
+
+Press `c` (or click the `[name ▾]` badge at the top left, or pick
+"Switch Cluster" from the command palette) to switch the running TUI to another
+cluster. The overlay lists every cluster, its domain, its API port and whether
+it is currently up, filtered as you type.
+
+A cluster is defined by its whole config file — menu, hooks, info blocks,
+keybindings, theme — not just a kube context, so switching reopens the TUI
+against the target's config rather than repointing the current one. The
+cluster → config-file map is built automatically: every config the TUI opens is
+remembered in `~/.k3dev/configs.json`. A cluster that is running but was never
+opened in the TUI is listed as `no config` and cannot be switched to until you
+open it once with `k3dev -c <file>`.
+
+Deleting `~/.k3dev/configs.json` only empties the switcher list; it has no
+effect on the clusters themselves.
+
+### Kubeconfig
+
+`~/.kube/config` is **merged**, never overwritten: each cluster contributes a
+cluster/user/context all named after `cluster_name`, and any unrelated contexts
+are left alone. `kubectl config get-contexts` lists them all;
+`kubectl --context projecta ...` targets one.
+
+### How clusters stay out of each other's way
+
+Every cluster runs k3s with `--docker`, so its kubelet drives its own embedded
+cri-dockerd against the **shared host Docker daemon** — which is what lets pods
+run images built with a plain `docker build`. Left alone, each kubelet would
+enumerate the other cluster's pod containers, find their pod UIDs unknown, and
+garbage-collect them, including running sandboxes.
+
+k3dev inserts `k3dev-criproxy` between cri-dockerd and dockerd. It stamps a
+`k3dev.cluster` label on every container the cluster creates and filters
+container listings by that label, so each kubelet only ever sees its own pods.
+The binary is baked into the `ghcr.io/daylioti/k3dev-k3s` image and uploaded at
+startup otherwise; nothing needs configuring.
+
+Beyond the CRI, each cluster gets its own Docker volumes, kubelet root-dir
+(kubelet's manager-state files are flat and unkeyed), and kubelet cgroup root
+(`/kubepods-{cluster_name}` — kubelets reconcile away pod cgroups they don't
+recognize).
+
+### Known limitations
+
+- A TCP `DOCKER_HOST` (Colima/OrbStack in TCP mode) bypasses the unix-socket
+  proxy, so that setup supports one cluster at a time.
+- Whichever cluster starts second retunes host-wide `nf_conntrack_max`. k3dev
+  sets no conntrack values, so all clusters use identical defaults and this is a
+  non-event unless you override them per cluster.
+- Image garbage collection is disabled (`image-gc-high-threshold=100`): one
+  kubelet must not remove an image another cluster is using. Image lifecycle is
+  the host's job — use `docker rmi`.
+- There is no cross-cluster pod-to-pod routing.
+
+### Migration from a single-cluster install
+
+Volume and kubelet-root names are now per-cluster, which orphans state written
+by older versions. Once, before upgrading:
+
+```bash
+k3dev delete                       # or: docker volume rm k3s-rancher-data k3s-local-pv-data
+docker rmi $(docker images -q --filter 'reference=k3dev-snapshot-*')
+```
+
+The first start after upgrading rebuilds the snapshot. Snapshot images written
+by older versions carry no `k3dev.cluster` label, so the now per-cluster
+snapshot cleanup (including `destroy --all`) never matches them — hence the
+one-off `docker rmi`. Stale unbracketed `# k3dev-ingress` lines in
+`/etc/hosts` are cleaned up automatically on the next hosts update.

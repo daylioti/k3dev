@@ -7,7 +7,9 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 
 use super::{ConfigValidator, ValidationWarning};
-use crate::config::types::{CommandEntry, ExecutionTarget, InputDefinition, InputSpec};
+use crate::config::types::{
+    CommandEntry, ExecutionTarget, InfrastructureConfig, InputDefinition, InputSpec,
+};
 
 /// Lazy-compiled regex for extracting @placeholder names
 static PLACEHOLDER_REGEX: Lazy<Regex> =
@@ -238,14 +240,15 @@ impl<'a> ConfigValidator<'a> {
         let infra = &self.config.infrastructure;
 
         // Check for privileged ports
-        if infra.http_port < 1024 && infra.http_port != 80 {
+        let defaults = InfrastructureConfig::default();
+        if infra.http_port < 1024 && infra.http_port != defaults.http_port {
             self.result.add_warning(ValidationWarning::SuspiciousPort {
                 port: infra.http_port,
                 reason: "non-standard privileged port for HTTP".to_string(),
             });
         }
 
-        if infra.https_port < 1024 && infra.https_port != 443 {
+        if infra.https_port < 1024 && infra.https_port != defaults.https_port {
             self.result.add_warning(ValidationWarning::SuspiciousPort {
                 port: infra.https_port,
                 reason: "non-standard privileged port for HTTPS".to_string(),
@@ -268,12 +271,15 @@ impl<'a> ConfigValidator<'a> {
         .into_iter()
         .collect();
 
+        // Compare against the shipped defaults, not hardcoded literals: with
+        // several clusters every secondary one necessarily uses non-default
+        // ports and would otherwise warn on every load.
         for port in [infra.http_port, infra.https_port, infra.api_port] {
             if let Some(service) = common_conflicts.get(&port) {
                 // Only warn if it's not the expected port
-                if (port == infra.http_port && port != 80)
-                    || (port == infra.https_port && port != 443)
-                    || (port == infra.api_port && port != 6443)
+                if (port == infra.http_port && port != defaults.http_port)
+                    || (port == infra.https_port && port != defaults.https_port)
+                    || (port == infra.api_port && port != defaults.api_port)
                 {
                     self.result.add_warning(ValidationWarning::SuspiciousPort {
                         port,

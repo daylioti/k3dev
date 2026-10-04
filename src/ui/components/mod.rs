@@ -1,4 +1,5 @@
 mod action_bar;
+mod cluster_switcher;
 mod command_palette;
 mod confirm_popup;
 mod diagnostics_overlay;
@@ -12,6 +13,7 @@ mod pod_stats;
 pub mod shell_view;
 
 pub use action_bar::{ActionBar, ClusterAction};
+pub use cluster_switcher::{ClusterSwitcher, SwitcherEntry};
 pub use command_palette::CommandPalette;
 pub use confirm_popup::ConfirmPopup;
 pub use diagnostics_overlay::DiagnosticsOverlay;

@@ -1,0 +1,118 @@
+# k3dev multi-cluster test config — cluster "one".
+#
+# Start all three at once:
+#   k3dev -c tests/clusters/one.yml start
+#   k3dev -c tests/clusters/two.yml start
+#   k3dev -c tests/clusters/three.yml start
+#
+# Each must differ in cluster_name, domain and api_port. http_port/https_port
+# stay 80/443 for every cluster — the shared k3dev-router owns those host ports
+# and picks a backend by Host header (HTTP) or SNI (HTTPS).
+
+infrastructure:
+  cluster_name: one
+  domain: one.dev
+  k3s_version: v1.36.3-k3s1
+
+  # Published directly — the API port cannot be Host- or SNI-routed.
+  api_port: 6451
+
+  # Host ports for the shared router; identical across clusters on purpose.
+  http_port: 80
+  https_port: 443
+
+  # Emptied deliberately: the defaults (2345, 8309) are raw host publishes and
+  # would collide as soon as a second cluster starts.
+  additional_ports: []
+
+  router:
+    enabled: true
+
+hooks:
+  # Fires once Traefik is up, so the Ingress below is served immediately.
+  on_services_deployed:
+    - name: "Deploy nginx"
+      timeout: 180
+      command: |
+        set -e
+        kubectl --context one apply -f - <<'MANIFEST'
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: demo
+        ---
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: nginx-index
+          namespace: demo
+        data:
+          index.html: |
+            <!doctype html>
+            <title>one</title>
+            <h1>cluster one</h1>
+            <p>served from nginx at one.dev</p>
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: nginx
+          namespace: demo
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: nginx
+          template:
+            metadata:
+              labels:
+                app: nginx
+            spec:
+              containers:
+                - name: nginx
+                  image: nginx:1.27-alpine
+                  ports:
+                    - containerPort: 80
+                  volumeMounts:
+                    - name: index
+                      mountPath: /usr/share/nginx/html
+              volumes:
+                - name: index
+                  configMap:
+                    name: nginx-index
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: nginx
+          namespace: demo
+        spec:
+          selector:
+            app: nginx
+          ports:
+            - port: 80
+              targetPort: 80
+        ---
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: nginx
+          namespace: demo
+        spec:
+          rules:
+            - host: nginx.one.dev
+              http:
+                paths:
+                  - path: /
+                    pathType: Prefix
+                    backend:
+                      service:
+                        name: nginx
+                        port:
+                          number: 80
+        MANIFEST
+        kubectl --context one -n demo rollout status deploy/nginx --timeout=150s
+
+logging:
+  enabled: true
+  file: "/tmp/k3dev-{cluster_name}.log"

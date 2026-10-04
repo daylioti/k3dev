@@ -16,7 +16,7 @@ use crate::config::{
     get_exec_placeholders, CommandEntry, ExecutionTarget, InputDefinition, RefreshTask,
 };
 use crate::k8s::PodExecutor;
-use crate::ui::components::{ClusterAction, DetailTab};
+use crate::ui::components::{ClusterAction, DetailTab, OutputLine, SwitcherEntry};
 
 use super::{App, AppMessage, AppMode, FocusArea};
 
@@ -58,12 +58,94 @@ impl App {
                     .mark_run_multiple(&[RefreshTask::IngressRefresh, RefreshTask::HostsCheck]);
             }
             PaletteCommandId::AppUpdateHosts => self.trigger_manual_hosts_update(),
+            PaletteCommandId::AppSwitchCluster => self.open_cluster_switcher(),
             PaletteCommandId::AppHelp => self.mode = AppMode::Help,
             PaletteCommandId::AppQuit => self.should_quit = true,
             PaletteCommandId::NavFocusMenu => self.focus = FocusArea::Content,
             PaletteCommandId::NavFocusActions => self.focus = FocusArea::ActionBar,
             _ => {}
         }
+    }
+
+    /// Open the cluster switcher, seeded from the recorded cluster→config map.
+    ///
+    /// Docker is queried in the background for which clusters are actually up;
+    /// the overlay renders immediately and fills the status column when the
+    /// answer arrives.
+    pub(super) fn open_cluster_switcher(&mut self) {
+        let current = self.cluster_config.cluster_name.clone();
+
+        let mut recorded: Vec<_> = crate::cluster::config_registry::all().into_iter().collect();
+        // Most recently opened first — the cluster you were just on is the one
+        // you are most likely to bounce back to.
+        recorded.sort_by(|a, b| b.1.last_used.cmp(&a.1.last_used));
+
+        let entries: Vec<SwitcherEntry> = recorded
+            .into_iter()
+            .map(|(name, entry)| SwitcherEntry {
+                current: name == current,
+                name,
+                domain: entry.domain,
+                api_port: entry.api_port,
+                config_path: Some(entry.config_path),
+                running: false,
+            })
+            .collect();
+
+        self.cluster_switcher.set_entries(entries);
+        self.mode = AppMode::ClusterSwitch;
+
+        if let Some(docker) = self.ensure_docker_manager() {
+            let tx = self.message_tx.clone();
+            tokio::spawn(async move {
+                let running = docker.list_cluster_servers().await;
+                let _ = tx.send(AppMessage::RunningClustersLoaded(running)).await;
+            });
+        }
+    }
+
+    /// Confirm the switcher selection: validate the target config, then ask the
+    /// run loop to tear this App down and rebuild from it.
+    pub(super) fn confirm_cluster_switch(&mut self) {
+        let Some(entry) = self.cluster_switcher.selected() else {
+            return;
+        };
+
+        if entry.current {
+            self.close_cluster_switcher();
+            return;
+        }
+
+        let Some(path) = entry.config_path.clone() else {
+            let name = entry.name.clone();
+            self.cluster_switcher.set_message(format!(
+                "No config recorded — open '{}' with k3dev -c <file>",
+                name
+            ));
+            return;
+        };
+
+        // Parse the target config before tearing anything down, so a typo in a
+        // YAML file cannot drop the user out of the TUI.
+        let name = entry.name.clone();
+        if let Err(e) = crate::config::ConfigLoader::new(path.to_str()).load() {
+            tracing::warn!(cluster = %name, "cluster switch rejected: {:#}", e);
+            self.cluster_switcher
+                .set_message(format!("Cannot open '{}': {}", name, e));
+            return;
+        }
+
+        self.close_cluster_switcher();
+        if let Some(token) = self.cancel_token.take() {
+            token.cancel();
+        }
+        self.switch_to = Some(path);
+        self.should_quit = true;
+    }
+
+    pub(super) fn close_cluster_switcher(&mut self) {
+        self.cluster_switcher.reset();
+        self.mode = AppMode::Normal;
     }
 
     /// Execute a custom command by path (e.g., "Group Name/Command Name")
@@ -185,6 +267,9 @@ impl App {
 
         tokio::spawn(async move {
             ctx.execute(move |_output_tx| async move {
+                let hosts_config = Arc::clone(&cluster_config);
+                let hosts_tx = tx.clone();
+
                 let mut manager = ClusterManager::new(cluster_config)
                     .await
                     .map_err(|e| format!("Manager error: {}", e))?;
@@ -201,6 +286,26 @@ impl App {
                         unreachable!()
                     }
                 };
+
+                // A destroyed cluster resolves nowhere, so its /etc/hosts lines
+                // have to go with it. The cluster is already gone at this point:
+                // anything blocking the rewrite is news, not a failed destroy.
+                if matches!(action, ClusterAction::Destroy { .. }) && action_result.is_ok() {
+                    let mut ingress_manager = IngressManager::for_cluster(&hosts_config);
+                    let note = match ingress_manager.update_hosts(Some(hosts_tx.clone())).await {
+                        Ok(HostsUpdateResult::NeedsSudo { .. }) => Some(
+                            "/etc/hosts still lists this cluster — run the /etc/hosts update as root to drop its entries".to_string(),
+                        ),
+                        Ok(HostsUpdateResult::ReadOnly { .. }) => Some(
+                            "/etc/hosts is read-only — drop this cluster's entries in your system config".to_string(),
+                        ),
+                        Ok(_) => None,
+                        Err(e) => Some(format!("Skipped /etc/hosts update: {}", e)),
+                    };
+                    if let Some(note) = note {
+                        let _ = hosts_tx.send(OutputLine::info(note)).await;
+                    }
+                }
 
                 action_result.map_err(|e| format!("Error: {}", e))
             })
@@ -369,14 +474,18 @@ impl App {
         let command = exec.cmd.clone();
         let workdir = exec.workdir.clone();
         let title = format!("Host: {}", cmd.name);
+        let cluster_config = Arc::clone(&self.cluster_config);
 
         self.start_popup_command(title);
         let timeout_duration = self.refresh_config.cluster_operation_timeout;
         let (ctx, output_tx) = CommandContext::new(self.message_tx.clone(), timeout_duration);
 
         tokio::spawn(async move {
-            ctx.execute(move |tx| async move { run_host_command(&command, &workdir, tx).await })
-                .await;
+            let env = cluster_config.host_command_env();
+            ctx.execute(
+                move |tx| async move { run_host_command(&command, &workdir, &env, tx).await },
+            )
+            .await;
             drop(output_tx);
         });
     }
@@ -432,11 +541,11 @@ impl App {
         let timeout = self.refresh_config.manual_hosts_timeout;
         let (ctx, tx) = CommandContext::new(self.message_tx.clone(), timeout);
         let message_tx = self.message_tx.clone();
-        let domain = self.cluster_config.domain.clone();
+        let config = std::sync::Arc::clone(&self.cluster_config);
 
         tokio::spawn(async move {
             ctx.execute(move |_output_tx| async move {
-                let mut ingress_manager = IngressManager::with_domain(domain);
+                let mut ingress_manager = IngressManager::for_cluster(&config);
                 let result = ingress_manager
                     .update_hosts(Some(tx))
                     .await
@@ -585,6 +694,7 @@ impl App {
             crate::capture::default_output_path(&self.config.capture.output_dir, &target);
         let spec = crate::capture::CaptureSpec {
             target,
+            cgroup_root: self.cluster_config.cgroup_root(),
             output_path: output_path.clone(),
             image: self.config.capture.image.clone(),
             iface: self.config.capture.iface.clone(),
@@ -978,9 +1088,11 @@ fn matches_target(target: &KubernetesTargetOwned, pod: &crate::ui::components::P
 }
 
 /// Run a host-side shell command, streaming combined stdout+stderr to the popup.
+/// `env` is added to the command's environment.
 async fn run_host_command(
     command: &str,
     workdir: &str,
+    env: &[(String, String)],
     output_tx: tokio::sync::mpsc::Sender<crate::ui::components::OutputLine>,
 ) -> Result<(), String> {
     use std::process::Stdio;
@@ -988,16 +1100,26 @@ async fn run_host_command(
     use tokio::process::Command;
 
     let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command);
+    cmd.arg("-c").arg(command).envs(env.iter().cloned());
     if !workdir.is_empty() {
         cmd.current_dir(workdir);
     }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    // Under the TUI, give the command a pty. Tools such as the AWS CLI prompt
+    // for MFA on /dev/tty, which would otherwise be the terminal the TUI is
+    // drawing on, painting the prompt over the interface.
+    let pty = crate::tty::attach_pty(&mut cmd).map_err(|e| e.to_string())?;
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn host command: {}", e))?;
+
+    let pty_io = match pty {
+        Some(pty) => Some(pty.start_io().await),
+        None => None,
+    };
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1033,6 +1155,9 @@ async fn run_host_command(
 
     let _ = stdout_handle.await;
     let _ = stderr_handle.await;
+    if let Some(pty_io) = pty_io {
+        pty_io.finish().await;
+    }
 
     if status.success() {
         Ok(())
@@ -1074,5 +1199,114 @@ async fn run_docker_command(
             Ok(())
         }
         Err(e) => Err(format!("docker exec failed: {}", e)),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod host_tty_tests {
+    use super::*;
+    use tokio::time::{timeout, Duration};
+
+    /// A host command that prompts on /dev/tty must reach the popup, not the
+    /// terminal the TUI is drawing on.
+    #[tokio::test]
+    async fn a_host_command_prompting_on_the_tty_is_routed_to_the_app() {
+        let _guard = crate::tty::test_guard().await;
+        let (app_tx, mut app_rx) = tokio::sync::mpsc::channel::<AppMessage>(32);
+        crate::tty::attach(app_tx);
+
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(32);
+        let run = tokio::spawn(async move {
+            run_host_command(
+                "printf 'Enter MFA code: ' > /dev/tty; read -r code < /dev/tty; echo \"got $code\"",
+                "",
+                &[],
+                out_tx,
+            )
+            .await
+        });
+
+        let opened = timeout(Duration::from_secs(5), app_rx.recv())
+            .await
+            .expect("the command never opened a terminal");
+        let input = match opened {
+            Some(AppMessage::ChildTtyOpened { input }) => input,
+            _ => panic!("expected the child terminal to open first"),
+        };
+
+        let mut prompt = String::new();
+        while !prompt.contains("Enter MFA code:") {
+            match timeout(Duration::from_secs(5), app_rx.recv()).await {
+                Ok(Some(AppMessage::ChildTtyOutput(text))) => prompt.push_str(&text),
+                _ => panic!("the tty prompt never arrived, saw: {prompt:?}"),
+            }
+        }
+
+        input.send(b"123456\r".to_vec()).await.unwrap();
+        timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the command never finished")
+            .unwrap()
+            .unwrap();
+
+        crate::tty::detach();
+    }
+
+    /// As when a script runs in a real terminal, a process it leaves running
+    /// in the background (`xdg-open … &`) must outlive it — the pty hanging up
+    /// when the command exits must not take the process down with it.
+    #[tokio::test]
+    async fn a_background_process_outlives_the_host_command() {
+        let _guard = crate::tty::test_guard().await;
+        let (app_tx, _app_rx) = tokio::sync::mpsc::channel::<AppMessage>(32);
+        crate::tty::attach(app_tx);
+
+        let marker = std::env::temp_dir().join(format!("k3dev-bg-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(32);
+        run_host_command(
+            &format!(
+                "(sh -c 'sleep 0.3; touch {}' >/dev/null 2>&1 &)",
+                marker.display()
+            ),
+            "",
+            &[],
+            out_tx,
+        )
+        .await
+        .unwrap();
+
+        let mut survived = false;
+        for _ in 0..40 {
+            if marker.exists() {
+                survived = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        crate::tty::detach();
+        let _ = std::fs::remove_file(&marker);
+        assert!(survived, "the background process died with the command");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod host_env_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_host_command_runs_with_the_cluster_env() {
+        // Hold the terminal so a concurrently attached tty test can't claim
+        // this command's output.
+        let _guard = crate::tty::test_guard().await;
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(32);
+        let env = vec![("KUBECONFIG".to_string(), "/state/k3dev.yaml".to_string())];
+
+        run_host_command(r#"echo "$KUBECONFIG""#, "", &env, out_tx)
+            .await
+            .unwrap();
+
+        let line = out_rx.recv().await.expect("the command printed nothing");
+        assert_eq!(line.content, "/state/k3dev.yaml");
     }
 }

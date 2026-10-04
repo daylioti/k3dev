@@ -11,6 +11,9 @@ use ratatui::{
 use crate::ui::styles::Styles;
 use crate::ui::theme::Theme;
 
+/// Width of the focus-stripe prefix rendered before everything else ("▌ " / "  ")
+const PREFIX_WIDTH: usize = 2;
+
 /// Cluster action definition
 #[derive(Debug, Clone)]
 pub struct Action {
@@ -216,12 +219,27 @@ impl ActionBar {
         }
     }
 
+    /// Rendered width of the cluster badge ("[name ▾] "), 0 when unset
+    fn badge_width(&self) -> usize {
+        self.cluster_name
+            .as_ref()
+            .map(|n| n.chars().count() + 5)
+            .unwrap_or(0)
+    }
+
+    /// Whether an x position falls on the cluster badge
+    pub fn badge_hit(&self, x: usize) -> bool {
+        let width = self.badge_width();
+        width > 0 && x >= PREFIX_WIDTH && x < PREFIX_WIDTH + width
+    }
+
     /// Get action index at x position (for mouse click handling)
     /// Returns the action index if click is within an action button
     pub fn get_action_at_x(&self, x: usize) -> Option<usize> {
         // Each action is: icon (1-2 chars) + space + label + separator " │ " (3 chars)
         // Approximate: "▶ Start │ " = ~10 chars per action
-        let mut pos = 3; // Start after focus-stripe prefix ("▌ " or "  ")
+        // Actions start after the focus stripe and the cluster badge
+        let mut pos = PREFIX_WIDTH + self.badge_width();
         for (i, action) in self.actions.iter().enumerate() {
             if !action.enabled {
                 continue;
@@ -253,14 +271,14 @@ impl ActionBar {
             spans.push(Span::raw("  "));
         }
 
-        // Add cluster name badge if available
+        // Cluster badge — doubles as the cluster switcher's click target
         if let Some(name) = &self.cluster_name {
             let badge_style = if focused {
                 self.styles.title
             } else {
                 self.styles.muted_text
             };
-            spans.push(Span::styled(format!("[{}] ", name), badge_style));
+            spans.push(Span::styled(format!("[{} ▾] ", name), badge_style));
         }
 
         let last_visible = self.actions.iter().rposition(|a| a.enabled).unwrap_or(0);
@@ -306,11 +324,13 @@ impl ActionBar {
             }
         }
 
+        let actions_width: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let line = Line::from(spans);
         let paragraph = Paragraph::new(line);
         frame.render_widget(paragraph, area);
 
-        // Render config path right-aligned
+        // Render config path right-aligned, in whatever columns the badge and
+        // actions leave free — a long path used to paint straight over them.
         if let Some(path) = &self.config_path {
             let path_display = path.to_string_lossy();
             let home = dirs::home_dir();
@@ -321,9 +341,33 @@ impl ActionBar {
                     .unwrap_or_else(|| path_display.to_string()),
                 None => path_display.to_string(),
             };
-            let config_line = Line::from(Span::styled(short_path, self.styles.muted_text));
-            let config_paragraph = Paragraph::new(config_line).alignment(Alignment::Right);
-            frame.render_widget(config_paragraph, area);
+
+            let available = (area.width as usize).saturating_sub(actions_width + 1);
+            if available >= 8 {
+                let len = short_path.chars().count();
+                let display = if len > available {
+                    // Keep the tail: the filename identifies the cluster
+                    format!(
+                        "\u{2026}{}",
+                        short_path
+                            .chars()
+                            .skip(len - available + 1)
+                            .collect::<String>()
+                    )
+                } else {
+                    short_path
+                };
+                let config_area = Rect::new(
+                    area.x + actions_width as u16,
+                    area.y,
+                    (available + 1) as u16,
+                    area.height,
+                );
+                let config_paragraph =
+                    Paragraph::new(Line::from(Span::styled(display, self.styles.muted_text)))
+                        .alignment(Alignment::Right);
+                frame.render_widget(config_paragraph, config_area);
+            }
         }
     }
 

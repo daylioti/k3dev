@@ -1,6 +1,6 @@
 name: Build k3s images
 
-# Builds custom multi-arch k3s images (rancher/k3s + socat + k3dev-agent baked in)
+# Builds custom multi-arch k3s images (rancher/k3s + socat + k3dev-agent + k3dev-criproxy baked in)
 # and pushes them to GitHub Container Registry (ghcr.io).
 #
 # Versions are auto-discovered: the latest patch of the newest 4 k3s minor lines
@@ -124,14 +124,17 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Build k3dev-agent (amd64 + arm64)
+      - name: Build k3dev helper binaries (amd64 + arm64)
         run: |
           set -euo pipefail
           mkdir -p helpers
-          cross build --release --target x86_64-unknown-linux-musl  --manifest-path agent/Cargo.toml
-          cross build --release --target aarch64-unknown-linux-musl --manifest-path agent/Cargo.toml
-          cp agent/target/x86_64-unknown-linux-musl/release/k3dev-agent  helpers/k3dev-agent-amd64
-          cp agent/target/aarch64-unknown-linux-musl/release/k3dev-agent helpers/k3dev-agent-arm64
+          for crate in agent criproxy; do
+            bin="k3dev-${crate}"
+            cross build --release --target x86_64-unknown-linux-musl  --manifest-path "${crate}/Cargo.toml"
+            cross build --release --target aarch64-unknown-linux-musl --manifest-path "${crate}/Cargo.toml"
+            cp "${crate}/target/x86_64-unknown-linux-musl/release/${bin}"  "helpers/${bin}-amd64"
+            cp "${crate}/target/aarch64-unknown-linux-musl/release/${bin}" "helpers/${bin}-arm64"
+          done
 
       - name: Build socat (amd64 + arm64)
         run: |
@@ -171,7 +174,9 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh helpers
-          for f in k3dev-agent-amd64 k3dev-agent-arm64 socat-amd64 socat-arm64; do
+          for f in k3dev-agent-amd64 k3dev-agent-arm64 \
+                   k3dev-criproxy-amd64 k3dev-criproxy-arm64 \
+                   socat-amd64 socat-arm64; do
             file "helpers/$f" | grep -q ELF || { echo "::error::helpers/$f is not an ELF binary"; exit 1; }
           done
 

@@ -149,6 +149,13 @@ impl CommandPalette {
                 description: Some("Add missing ingress hosts to /etc/hosts".to_string()),
             },
             PaletteCommand {
+                id: PaletteCommandId::AppSwitchCluster,
+                name: "Switch Cluster".to_string(),
+                shortcut: Some("c".to_string()),
+                category: CommandCategory::Application,
+                description: Some("Reopen the TUI against another cluster's config".to_string()),
+            },
+            PaletteCommand {
                 id: PaletteCommandId::AppHelp,
                 name: "Show Help".to_string(),
                 shortcut: Some("?".to_string()),
