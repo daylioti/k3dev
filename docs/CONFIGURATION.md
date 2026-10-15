@@ -348,6 +348,12 @@ container listings by that label, so each kubelet only ever sees its own pods.
 The binary is baked into the `ghcr.io/daylioti/k3dev-k3s` image and uploaded at
 startup otherwise; nothing needs configuring.
 
+The proxy also sets pod containers to Docker's `json-file` log driver, rotated
+at 10 MiB × 5 files (kubelet's own defaults). `kubectl logs` reads the log file
+Docker records for a container, and Docker records one only for `json-file`:
+under any other default, such as Docker Desktop's `local`, every `kubectl logs`
+would fail.
+
 Beyond the CRI, each cluster gets its own Docker volumes, kubelet root-dir
 (kubelet's manager-state files are flat and unkeyed), and kubelet cgroup root
 (`/kubepods-{cluster_name}` — kubelets reconcile away pod cgroups they don't
@@ -356,7 +362,8 @@ recognize).
 ### Known limitations
 
 - A TCP `DOCKER_HOST` (Colima/OrbStack in TCP mode) bypasses the unix-socket
-  proxy, so that setup supports one cluster at a time.
+  proxy, so that setup supports one cluster at a time, and `kubectl logs` works
+  only if the daemon's default log driver is `json-file`.
 - Whichever cluster starts second retunes host-wide `nf_conntrack_max`. k3dev
   sets no conntrack values, so all clusters use identical defaults and this is a
   non-event unless you override them per cluster.

@@ -16,6 +16,9 @@
 //! with a `k3dev.cluster` label, and every listing/event stream is filtered
 //! down to that label, so cri-dockerd can only ever see its own cluster.
 //!
+//! Container creates that leave logging to the daemon are also switched to the
+//! json-file driver, the only one cri-dockerd can serve `kubectl logs` from.
+//!
 //! Usage: k3dev-criproxy --listen <path> --upstream <path> --cluster <name>
 //!        k3dev-criproxy --version
 //!
@@ -33,10 +36,19 @@ use std::time::Duration;
 
 /// Proxy protocol version, printed by `--version` so the host side can detect
 /// an outdated binary baked into a prebuilt image and reinstall a fresh one.
-const VERSION: &str = "1";
+const VERSION: &str = "2";
 
 /// Label stamped on created containers and matched on listings/events.
 const LABEL_KEY: &str = "k3dev.cluster";
+
+/// The only Docker log driver that records a `LogPath`, which cri-dockerd
+/// links as the pod's `0.log` under /var/log/pods for kubelet to read.
+const POD_LOG_DRIVER: &str = "json-file";
+
+/// Rotation for `POD_LOG_DRIVER`: kubelet's own containerLogMaxSize and
+/// containerLogMaxFiles defaults. kubelet cannot rotate logs through
+/// cri-dockerd, so Docker's rotation is the only limit on a pod's log size.
+const POD_LOG_OPTS: [(&str, &str); 2] = [("max-size", "10m"), ("max-file", "5")];
 
 /// Hard cap on the request head; a client that never sends `\r\n\r\n` must not
 /// be able to grow the buffer without bound.
@@ -249,7 +261,8 @@ fn build_request(
     }
     let path = target.split('?').next().unwrap_or(target);
 
-    // Rule 1: stamp the cluster label onto created containers.
+    // Rule 1: stamp the cluster label onto created containers, and give them a
+    // log driver kubelet can read.
     if method.eq_ignore_ascii_case("POST") && path_matches(path, "/containers/create") {
         return rewrite_create(client, &line, &headers, rest, cluster);
     }
@@ -273,7 +286,7 @@ fn build_request(
     Ok(out)
 }
 
-/// `POST /containers/create`: buffer the body, add the cluster label, re-emit.
+/// `POST /containers/create`: buffer the body, rewrite it, re-emit.
 fn rewrite_create(
     client: &mut UnixStream,
     line: &str,
@@ -307,7 +320,7 @@ fn rewrite_create(
 
     let (body, leftover) = read_body(client, rest, len)?;
 
-    let mut out = match insert_label(&body, LABEL_KEY, cluster) {
+    let mut out = match rewrite_create_body(&body, cluster) {
         Some(new_body) => {
             let mut out = render_head(line, headers, Some(new_body.len()));
             out.extend_from_slice(&new_body);
@@ -630,11 +643,11 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 // --- Minimal JSON ---
 
-/// Just enough JSON for two jobs: adding a label to a container-create body and
+/// Just enough JSON for two jobs: rewriting a container-create body and
 /// reading/writing the `filters` query parameter. `Num` keeps its original text
 /// so numbers round-trip exactly, and `Obj` is an ordered `Vec` so key order is
-/// preserved - the body we forward differs from the one we received in exactly
-/// one place.
+/// preserved - the body we forward differs from the one we received only where
+/// a rewrite rule changed it.
 #[derive(Debug, Clone, PartialEq)]
 enum Json {
     Null,
@@ -645,35 +658,91 @@ enum Json {
     Obj(Vec<(String, Json)>),
 }
 
-/// Add `key: value` to the top-level `Labels` object, creating `Labels` when
-/// absent. Returns `None` if the body is not a JSON object.
-fn insert_label(body: &[u8], key: &str, value: &str) -> Option<Vec<u8>> {
+/// Apply the container-create rules to a request body: stamp the cluster label
+/// and default the log driver. Returns `None` if the body is not a JSON object.
+fn rewrite_create_body(body: &[u8], cluster: &str) -> Option<Vec<u8>> {
     let mut json = parse_json(body)?;
     let Json::Obj(fields) = &mut json else {
         return None;
     };
 
-    let idx = match fields.iter().position(|(k, _)| k == "Labels") {
+    insert_label(fields, LABEL_KEY, cluster);
+    default_log_config(fields);
+
+    Some(serialize(&json).into_bytes())
+}
+
+/// Add `key: value` to the top-level `Labels` object, creating `Labels` when
+/// absent.
+fn insert_label(fields: &mut Vec<(String, Json)>, key: &str, value: &str) {
+    let Some(labels) = object_field(fields, "Labels") else {
+        return;
+    };
+    match labels.iter_mut().find(|(k, _)| k == key) {
+        Some((_, v)) => *v = Json::Str(value.to_string()),
+        None => labels.push((key.to_string(), Json::Str(value.to_string()))),
+    }
+}
+
+/// Set `HostConfig.LogConfig` to `POD_LOG_DRIVER` when the client left logging
+/// to the daemon.
+///
+/// cri-dockerd never sets a log driver, so pod containers get the daemon's
+/// default. Under any default but json-file (Docker Desktop's is `local`) they
+/// have no `LogPath`, cri-dockerd has no file to link as the pod's log, and
+/// every `kubectl logs` fails. A driver or options the client did choose are
+/// left alone.
+fn default_log_config(fields: &mut Vec<(String, Json)>) {
+    let Some(host_config) = object_field(fields, "HostConfig") else {
+        return;
+    };
+    let Some(log_config) = object_field(host_config, "LogConfig") else {
+        return;
+    };
+
+    // Go clients send `{"Type":"","Config":null}` when nothing was chosen.
+    let chosen = log_config.iter().any(|(k, v)| match (k.as_str(), v) {
+        ("Type", Json::Str(driver)) => !driver.is_empty(),
+        ("Config", Json::Obj(opts)) => !opts.is_empty(),
+        _ => false,
+    });
+    if chosen {
+        return;
+    }
+
+    let opts = POD_LOG_OPTS
+        .iter()
+        .map(|(k, v)| (k.to_string(), Json::Str(v.to_string())))
+        .collect();
+    *log_config = vec![
+        ("Type".to_string(), Json::Str(POD_LOG_DRIVER.to_string())),
+        ("Config".to_string(), Json::Obj(opts)),
+    ];
+}
+
+/// The object under `key`, created when the key is absent or `null` (what
+/// Docker clients send for an empty field). `None` when it holds anything
+/// else: that body is malformed, and dockerd should reject it as sent.
+fn object_field<'a>(
+    fields: &'a mut Vec<(String, Json)>,
+    key: &str,
+) -> Option<&'a mut Vec<(String, Json)>> {
+    let idx = match fields.iter().position(|(k, _)| k == key) {
         Some(i) => i,
         None => {
-            fields.push(("Labels".to_string(), Json::Obj(Vec::new())));
+            fields.push((key.to_string(), Json::Null));
             fields.len() - 1
         }
     };
 
-    // `"Labels": null` is what Docker clients send when there are none.
     let slot = &mut fields[idx].1;
-    if !matches!(slot, Json::Obj(_)) {
+    if matches!(slot, Json::Null) {
         *slot = Json::Obj(Vec::new());
     }
-    if let Json::Obj(labels) = slot {
-        match labels.iter_mut().find(|(k, _)| k == key) {
-            Some((_, v)) => *v = Json::Str(value.to_string()),
-            None => labels.push((key.to_string(), Json::Str(value.to_string()))),
-        }
+    match slot {
+        Json::Obj(inner) => Some(inner),
+        _ => None,
     }
-
-    Some(serialize(&json).into_bytes())
 }
 
 fn parse_json(input: &[u8]) -> Option<Json> {
@@ -973,54 +1042,138 @@ mod tests {
         assert!(parse_args(&[]).is_none());
     }
 
+    /// Apply one create-body rule to a JSON object and re-serialize it.
+    fn apply(body: &str, rule: impl FnOnce(&mut Vec<(String, Json)>)) -> String {
+        let Some(Json::Obj(mut fields)) = parse_json(body.as_bytes()) else {
+            panic!("test body is not a JSON object: {}", body);
+        };
+        rule(&mut fields);
+        serialize(&Json::Obj(fields))
+    }
+
+    fn label(fields: &mut Vec<(String, Json)>) {
+        insert_label(fields, "k3dev.cluster", "alpha");
+    }
+
+    const JSON_FILE_LOGS: &str =
+        r#"{"Type":"json-file","Config":{"max-size":"10m","max-file":"5"}}"#;
+
     // --- Label insertion ---
 
     #[test]
     fn inserts_label_into_existing_labels() {
-        let body = br#"{"Image":"nginx","Labels":{"a":"b"},"Tty":false}"#;
-        let out = insert_label(body, "k3dev.cluster", "alpha").expect("rewritten");
         assert_eq!(
-            String::from_utf8(out).unwrap(),
+            apply(r#"{"Image":"nginx","Labels":{"a":"b"},"Tty":false}"#, label),
             r#"{"Image":"nginx","Labels":{"a":"b","k3dev.cluster":"alpha"},"Tty":false}"#
         );
     }
 
     #[test]
     fn inserts_label_when_labels_absent() {
-        let body = br#"{"Image":"nginx"}"#;
-        let out = insert_label(body, "k3dev.cluster", "alpha").expect("rewritten");
         assert_eq!(
-            String::from_utf8(out).unwrap(),
+            apply(r#"{"Image":"nginx"}"#, label),
             r#"{"Image":"nginx","Labels":{"k3dev.cluster":"alpha"}}"#
         );
     }
 
     #[test]
     fn replaces_null_labels_and_overwrites_existing_key() {
-        let out = insert_label(br#"{"Labels":null}"#, "k3dev.cluster", "alpha").unwrap();
         assert_eq!(
-            String::from_utf8(out).unwrap(),
+            apply(r#"{"Labels":null}"#, label),
             r#"{"Labels":{"k3dev.cluster":"alpha"}}"#
         );
+        assert_eq!(
+            apply(r#"{"Labels":{"k3dev.cluster":"old"}}"#, label),
+            r#"{"Labels":{"k3dev.cluster":"alpha"}}"#
+        );
+    }
 
-        let out = insert_label(
-            br#"{"Labels":{"k3dev.cluster":"old"}}"#,
-            "k3dev.cluster",
-            "new",
+    // --- Log driver default ---
+
+    #[test]
+    fn defaults_log_config_when_client_chose_nothing() {
+        // What cri-dockerd sends: Go's zero value for LogConfig.
+        assert_eq!(
+            apply(
+                r#"{"HostConfig":{"Binds":null,"LogConfig":{"Type":"","Config":null}}}"#,
+                default_log_config
+            ),
+            format!(
+                r#"{{"HostConfig":{{"Binds":null,"LogConfig":{}}}}}"#,
+                JSON_FILE_LOGS
+            )
+        );
+        assert_eq!(
+            apply(
+                r#"{"HostConfig":{"LogConfig":{"Type":"","Config":{}}}}"#,
+                default_log_config
+            ),
+            format!(r#"{{"HostConfig":{{"LogConfig":{}}}}}"#, JSON_FILE_LOGS)
+        );
+    }
+
+    #[test]
+    fn defaults_log_config_when_absent_or_null() {
+        let expected = format!(r#"{{"HostConfig":{{"LogConfig":{}}}}}"#, JSON_FILE_LOGS);
+        assert_eq!(apply(r#"{}"#, default_log_config), expected);
+        assert_eq!(
+            apply(r#"{"HostConfig":null}"#, default_log_config),
+            expected
+        );
+        assert_eq!(
+            apply(r#"{"HostConfig":{"LogConfig":null}}"#, default_log_config),
+            expected
+        );
+    }
+
+    #[test]
+    fn keeps_a_log_driver_or_options_the_client_chose() {
+        for body in [
+            r#"{"HostConfig":{"LogConfig":{"Type":"local","Config":null}}}"#,
+            r#"{"HostConfig":{"LogConfig":{"Type":"json-file","Config":{"max-size":"1g"}}}}"#,
+            // Options for the daemon's default driver, whatever that is.
+            r#"{"HostConfig":{"LogConfig":{"Type":"","Config":{"max-size":"1m"}}}}"#,
+        ] {
+            assert_eq!(apply(body, default_log_config), body);
+        }
+    }
+
+    #[test]
+    fn leaves_malformed_fields_for_dockerd_to_reject() {
+        for body in [
+            r#"{"HostConfig":"bogus"}"#,
+            r#"{"HostConfig":{"LogConfig":[1]}}"#,
+        ] {
+            assert_eq!(apply(body, default_log_config), body);
+        }
+        assert_eq!(
+            apply(r#"{"Labels":"bogus"}"#, label),
+            r#"{"Labels":"bogus"}"#
+        );
+    }
+
+    #[test]
+    fn rewrites_a_create_body_with_both_rules() {
+        let out = rewrite_create_body(
+            br#"{"Image":"nginx","Labels":null,"HostConfig":{"LogConfig":{"Type":"","Config":null}}}"#,
+            "alpha",
         )
-        .unwrap();
+        .expect("rewritten");
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            r#"{"Labels":{"k3dev.cluster":"new"}}"#
+            format!(
+                r#"{{"Image":"nginx","Labels":{{"k3dev.cluster":"alpha"}},"HostConfig":{{"LogConfig":{}}}}}"#,
+                JSON_FILE_LOGS
+            )
         );
     }
 
     #[test]
     fn refuses_bodies_that_are_not_objects() {
-        assert!(insert_label(b"[1,2]", "k", "v").is_none());
-        assert!(insert_label(b"not json", "k", "v").is_none());
-        assert!(insert_label(br#"{"a":1"#, "k", "v").is_none());
-        assert!(insert_label(br#"{"a":1} trailing"#, "k", "v").is_none());
+        assert!(rewrite_create_body(b"[1,2]", "alpha").is_none());
+        assert!(rewrite_create_body(b"not json", "alpha").is_none());
+        assert!(rewrite_create_body(br#"{"a":1"#, "alpha").is_none());
+        assert!(rewrite_create_body(br#"{"a":1} trailing"#, "alpha").is_none());
     }
 
     // --- JSON round trip ---

@@ -59,8 +59,11 @@ impl K3sManager {
     /// is replaced instead of silently reported as present.
     pub(crate) const AGENT_VERSION: &'static str = "2";
 
-    /// CLI contract version of the embedded k3dev-criproxy
-    pub(crate) const CRIPROXY_VERSION: &'static str = "1";
+    /// Version of the embedded k3dev-criproxy. Bump in lockstep with
+    /// `criproxy/src/main.rs::VERSION` whenever the proxy changes, so clusters
+    /// replace the copy they already have. An integer: the container
+    /// entrypoint compares it numerically.
+    pub(crate) const CRIPROXY_VERSION: &'static str = "2";
 
     /// Socket cri-dockerd talks to — served by k3dev-criproxy
     pub(crate) const PROXY_DOCKER_SOCK: &'static str = "/var/run/docker.sock";
@@ -90,14 +93,25 @@ impl K3sManager {
     /// filters container listings by it, so each kubelet only ever sees its own.
     ///
     /// The binary is uploaded right after the container starts, so wait for it;
-    /// the restart loop keeps CRI alive if the proxy ever dies.
+    /// the restart loop keeps CRI alive if the proxy ever dies. An image or a
+    /// snapshot can carry an older proxy, and once running it would not be
+    /// replaced by the upload, so wait for at least this k3dev's version. A
+    /// newer one still starts: a later k3dev may have updated the binary.
+    ///
+    /// After 30s, any proxy on disk is started rather than none: an older
+    /// k3dev starting this container uploads its own, older proxy, and an
+    /// outdated proxy beats a cluster that never comes up.
     pub(crate) fn criproxy_prologue(config: &ClusterConfig) -> String {
         format!(
-            "while [ ! -x /usr/local/bin/k3dev-criproxy ]; do sleep 0.2; done; \
+            "i=0; until v=$(/usr/local/bin/k3dev-criproxy --version 2>/dev/null) && \
+               [ \"${{v#k3dev-criproxy }}\" -ge {version} ] 2>/dev/null || \
+               {{ [ $i -ge 150 ] && [ -x /usr/local/bin/k3dev-criproxy ]; }}; \
+             do sleep 0.2; i=$((i+1)); done; \
              (while true; do /usr/local/bin/k3dev-criproxy \
                --listen {listen} --upstream {upstream} --cluster {cluster}; \
                sleep 1; done) & \
              while [ ! -S {listen} ]; do sleep 0.1; done; ",
+            version = Self::CRIPROXY_VERSION,
             listen = Self::PROXY_DOCKER_SOCK,
             upstream = Self::upstream_docker_sock(),
             cluster = config.cluster_name,
@@ -261,6 +275,15 @@ impl K3sManager {
             let _ = output_tx
                 .send(OutputLine::info("Cluster is already running"))
                 .await;
+            // The proxy is only replaced while the container is stopped.
+            if docker_host_tcp_url().is_none() && self.criproxy_outdated().await {
+                let _ = output_tx
+                    .send(OutputLine::warning(
+                        "This cluster runs an older CRI filtering proxy; \
+                         run `k3dev restart` to update it",
+                    ))
+                    .await;
+            }
             return Ok(StartOutcome::AlreadyRunning);
         }
 
@@ -302,13 +325,28 @@ impl K3sManager {
             // sandbox netns whose veth peer died with the previous server
             // container. Remove them so kubelet builds fresh ones.
             self.sweep_pod_containers(&output_tx).await;
+            // The entrypoint starts whichever proxy is on disk, and a running
+            // proxy is not replaced by a later upload. Update it while the
+            // container is stopped, so a cluster created by an older k3dev
+            // does not keep running an outdated one.
+            if docker_host_tcp_url().is_none() {
+                if let Err(e) = self.upload_criproxy().await {
+                    tracing::warn!(error = %e, "Failed to update CRI filtering proxy before start");
+                    let _ = output_tx
+                        .send(OutputLine::warning(format!(
+                            "Could not update the CRI filtering proxy, starting with the installed one: {:#}",
+                            e
+                        )))
+                        .await;
+                }
+            }
             self.docker
                 .start_container(&self.config.container_name)
                 .await?;
 
-            // A start interrupted before the CRI proxy was uploaded leaves the
-            // entrypoint waiting for it; upload it now instead of timing out on
-            // the API. A no-op when the expected version is already there.
+            // Verify the proxy, and install it if the upload above did not
+            // land: the entrypoint waits for it, so the API would time out
+            // instead. A no-op when the expected version is already there.
             if docker_host_tcp_url().is_none() {
                 self.install_criproxy()
                     .await
@@ -1300,8 +1338,27 @@ mod tests {
         let prologue = K3sManager::criproxy_prologue(&config);
 
         assert!(prologue.contains("--cluster alpha"));
+        // An older proxy baked into the image or a snapshot must not start:
+        // the shell compares the version numerically.
+        let version: u32 = K3sManager::CRIPROXY_VERSION
+            .parse()
+            .expect("CRIPROXY_VERSION is an integer");
+        assert!(prologue.contains(&format!("\"${{v#k3dev-criproxy }}\" -ge {} ]", version)));
+        // ...but only for a while, so an older k3dev can still start it.
+        assert!(prologue.contains("[ $i -ge 150 ] && [ -x /usr/local/bin/k3dev-criproxy ]"));
         // k3s must not come up before the filtered socket exists, or its
         // cri-dockerd connects straight to the unfiltered daemon.
         assert!(prologue.contains(&format!("while [ ! -S {} ]", K3sManager::PROXY_DOCKER_SOCK)));
+    }
+
+    #[test]
+    fn criproxy_version_matches_the_proxy_source() {
+        // A mismatch would make every start wait out the prologue's gate and
+        // then fail the post-start version check.
+        let source = include_str!("../../../criproxy/src/main.rs");
+        assert!(source.contains(&format!(
+            "const VERSION: &str = \"{}\";",
+            K3sManager::CRIPROXY_VERSION
+        )));
     }
 }
