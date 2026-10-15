@@ -19,6 +19,12 @@ use crate::cluster::kube_ops::KubeOps;
 use crate::cluster::platform::PlatformInfo;
 use crate::ui::components::OutputLine;
 
+#[cfg(target_arch = "x86_64")]
+const CRIPROXY_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-criproxy-x86_64");
+
+#[cfg(target_arch = "aarch64")]
+const CRIPROXY_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-criproxy-aarch64");
+
 impl K3sManager {
     /// Wait for k3s API to become accessible
     /// Uses async HTTP client with exponential backoff for faster detection
@@ -165,12 +171,6 @@ impl K3sManager {
     /// container entrypoint waits for it — so it is uploaded straight after the
     /// container starts rather than after the API comes up.
     pub(super) async fn install_criproxy(&self) -> Result<()> {
-        #[cfg(target_arch = "x86_64")]
-        const CRIPROXY_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-criproxy-x86_64");
-
-        #[cfg(target_arch = "aarch64")]
-        const CRIPROXY_BINARY: &[u8] = include_bytes!("../../../assets/k3dev-criproxy-aarch64");
-
         let expected = format!("k3dev-criproxy {}", Self::CRIPROXY_VERSION);
         if let Ok(out) = self
             .docker
@@ -214,6 +214,49 @@ impl K3sManager {
         }
 
         Ok(())
+    }
+
+    /// Upload the embedded k3dev-criproxy into a stopped container.
+    ///
+    /// Nothing can run in it to report the installed version, so the binary is
+    /// always replaced.
+    pub(super) async fn upload_criproxy(&self) -> Result<()> {
+        // A build without the cross-compiled helpers embeds a text placeholder;
+        // never put that over a working proxy.
+        if !CRIPROXY_BINARY.starts_with(b"\x7fELF") {
+            return Err(anyhow!(
+                "this k3dev build embeds a placeholder instead of k3dev-criproxy"
+            ));
+        }
+        self.docker
+            .copy_to_container(
+                &self.config.container_name,
+                "k3dev-criproxy",
+                CRIPROXY_BINARY,
+                "/usr/local/bin",
+            )
+            .await
+    }
+
+    /// Whether the running container's k3dev-criproxy is older than the one
+    /// this k3dev embeds. Unknown counts as not outdated.
+    pub(super) async fn criproxy_outdated(&self) -> bool {
+        let Ok(out) = self
+            .docker
+            .exec_in_container(
+                &self.config.container_name,
+                &["/usr/local/bin/k3dev-criproxy", "--version"],
+            )
+            .await
+        else {
+            return false;
+        };
+        let installed = out
+            .trim()
+            .strip_prefix("k3dev-criproxy ")
+            .and_then(|v| v.parse::<u32>().ok());
+        let embedded = Self::CRIPROXY_VERSION.parse::<u32>().ok();
+        matches!((installed, embedded), (Some(i), Some(e)) if i < e)
     }
 
     /// Install a binary into the container via bollard upload (tar stream).
