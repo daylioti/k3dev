@@ -436,7 +436,7 @@ async fn update_hosts_reporting(cluster_config: Arc<ClusterConfig>) -> Result<i3
 
     match result {
         HostsUpdateResult::NoUpdateNeeded => {
-            println!("\x1b[32m✓ /etc/hosts is already up to date\x1b[0m");
+            println!("\x1b[32m✓ This cluster's /etc/hosts entries are up to date\x1b[0m");
             Ok(0)
         }
         HostsUpdateResult::WrittenDirectly { count } => {

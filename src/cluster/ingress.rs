@@ -76,6 +76,53 @@ fn rewrite_hosts(
     (content, new_entries)
 }
 
+/// Whether a rewrite is this cluster's to ask for
+#[derive(Debug, PartialEq)]
+enum HostsChange {
+    /// This cluster's lines already match `entries`. Only harmless legacy
+    /// lines, or the position of the block among other clusters' blocks,
+    /// would change.
+    None { legacy_lines: usize },
+    /// This cluster's lines have to change, or a legacy line overrides one
+    Own,
+}
+
+/// Decide from this cluster's own lines, not from the whole file: the rewrite
+/// also drops legacy lines and moves this cluster's block to the end, and
+/// neither is worth asking for root on every start and destroy.
+fn hosts_change(current: &str, marker: &str, entries: &[String]) -> HostsChange {
+    let mut own: Vec<&str> = current
+        .lines()
+        .filter(|line| line.contains(marker))
+        .map(str::trim)
+        .collect();
+    own.sort_unstable();
+    if own != entries {
+        return HostsChange::Own;
+    }
+
+    // The first line naming a host wins, and legacy lines sit above this
+    // cluster's block: one that sends this cluster's host elsewhere has to go.
+    let legacy: Vec<&str> = current.lines().filter(|l| is_legacy_marker(l)).collect();
+    let overridden = entries.iter().any(|entry| {
+        let mut words = entry.split_whitespace();
+        let (Some(ip), Some(host)) = (words.next(), words.next()) else {
+            return false;
+        };
+        legacy.iter().any(|line| {
+            let mut words = line.split_whitespace();
+            words.next() != Some(ip) && words.take_while(|w| !w.starts_with('#')).any(|w| w == host)
+        })
+    });
+    if overridden {
+        HostsChange::Own
+    } else {
+        HostsChange::None {
+            legacy_lines: legacy.len(),
+        }
+    }
+}
+
 /// Health status for an ingress endpoint
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IngressHealthStatus {
@@ -350,9 +397,18 @@ impl IngressManager {
     ) -> Result<HostsUpdateResult> {
         let hosts = self.get_ingress_hosts().await?;
 
-        // Read current /etc/hosts
+        // Read current /etc/hosts. Only a missing file counts as empty: the
+        // rewrite keeps every line it read, so treating an unreadable file as
+        // empty would replace it with this cluster's lines alone.
         let hosts_path = hosts_file_path();
-        let current_content = fs::read_to_string(&hosts_path).await.unwrap_or_default();
+        let current_content = match fs::read_to_string(&hosts_path).await {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("Failed to read {}", hosts_path.display())))
+            }
+        };
 
         let (final_content, new_entries) = rewrite_hosts(
             &current_content,
@@ -361,36 +417,51 @@ impl IngressManager {
             &hosts,
         );
 
-        if hosts.is_empty() {
-            // Nothing to publish for this cluster, but the file may still carry
-            // its lines from an earlier run: rewriting strips them, which is how
-            // a destroyed cluster stops resolving.
-            if final_content == current_content {
+        if let HostsChange::None { legacy_lines } =
+            hosts_change(&current_content, &self.hosts_marker, &new_entries)
+        {
+            // Lines from the single-cluster k3dev belong to no cluster, so none
+            // asks for root over them: drop them only if the file is writable
+            // anyway.
+            if legacy_lines > 0 {
+                let note = if fs::write(&hosts_path, &final_content).await.is_ok() {
+                    format!(
+                        "Removed {} /etc/hosts lines left by an older k3dev",
+                        legacy_lines
+                    )
+                } else {
+                    format!(
+                        "/etc/hosts has {} lines from an older k3dev, ending in \
+                         `# k3dev-ingress`. They stay because the file isn't writable; \
+                         delete them by hand to drop them",
+                        legacy_lines
+                    )
+                };
                 if let Some(tx) = &output_tx {
-                    let _ = tx.send(OutputLine::info("No ingress hosts found")).await;
+                    let _ = tx.send(OutputLine::info(note)).await;
                 }
-                return Ok(HostsUpdateResult::NoUpdateNeeded);
             }
+            if let Some(tx) = &output_tx {
+                let message = if hosts.is_empty() {
+                    "No ingress hosts found"
+                } else {
+                    "All hosts already in /etc/hosts, skipping update"
+                };
+                let _ = tx.send(OutputLine::info(message)).await;
+            }
+            return Ok(HostsUpdateResult::NoUpdateNeeded);
+        }
+
+        if hosts.is_empty() {
+            // Nothing to publish, but the file still carries this cluster's
+            // lines from an earlier run: rewriting strips them, which is how a
+            // destroyed cluster stops resolving.
             if let Some(tx) = &output_tx {
                 let _ = tx
                     .send(OutputLine::info(
                         "No ingress hosts left, removing this cluster's /etc/hosts entries",
                     ))
                     .await;
-            }
-        } else {
-            // Check if update is needed - check ALL hosts in /etc/hosts
-            let hosts_set: HashSet<String> = hosts.iter().cloned().collect();
-            let etc_hosts = self.get_all_hosts_from_etc_hosts().await;
-            if hosts_set.is_subset(&etc_hosts) && final_content == current_content {
-                if let Some(tx) = &output_tx {
-                    let _ = tx
-                        .send(OutputLine::info(
-                            "All hosts already in /etc/hosts, skipping update",
-                        ))
-                        .await;
-                }
-                return Ok(HostsUpdateResult::NoUpdateNeeded);
             }
         }
 
@@ -479,7 +550,7 @@ impl IngressManager {
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_hosts;
+    use super::{hosts_change, rewrite_hosts, HostsChange};
 
     const MINE: &str = "# k3dev-ingress[alpha]";
     const THEIRS: &str = "# k3dev-ingress[beta]";
@@ -547,5 +618,75 @@ mod tests {
         assert_eq!(once, twice);
         // Entries are sorted, so the file order never flaps between runs
         assert!(once.find("a.alpha.dev") < once.find("b.alpha.dev"));
+    }
+
+    const LEGACY: &str = "127.0.0.1 localhost\n\
+                          127.0.0.1 app.local.dev # k3dev-ingress\n\
+                          127.0.0.1 traefik.local.dev # k3dev-ingress\n";
+
+    #[test]
+    fn legacy_lines_alone_are_not_this_clusters_change() {
+        // A cluster that never had lines, destroyed or started on a host that
+        // still has the single-cluster k3dev's lines
+        assert_eq!(
+            hosts_change(LEGACY, MINE, &[]),
+            HostsChange::None { legacy_lines: 2 }
+        );
+
+        let (_, entries) = rewrite_hosts(LEGACY, MINE, "127.0.0.1", &hosts(&["app.alpha.dev"]));
+        let current = format!("{LEGACY}127.0.0.1 app.alpha.dev {MINE}\n");
+        assert_eq!(
+            hosts_change(&current, MINE, &entries),
+            HostsChange::None { legacy_lines: 2 }
+        );
+    }
+
+    #[test]
+    fn this_clusters_own_lines_decide() {
+        let current = format!("{LEGACY}127.0.0.1 app.alpha.dev {MINE}\n");
+        // Destroyed: its line has to go
+        assert_eq!(hosts_change(&current, MINE, &[]), HostsChange::Own);
+
+        // A new host: its line has to be added
+        let (_, entries) = rewrite_hosts(
+            &current,
+            MINE,
+            "127.0.0.1",
+            &hosts(&["app.alpha.dev", "api.alpha.dev"]),
+        );
+        assert_eq!(hosts_change(&current, MINE, &entries), HostsChange::Own);
+    }
+
+    #[test]
+    fn a_legacy_line_overriding_this_clusters_host_must_go() {
+        // The legacy line comes first, so app.alpha.dev resolves to 10.0.0.5
+        let (_, entries) = rewrite_hosts("", MINE, "127.0.0.1", &hosts(&["app.alpha.dev"]));
+        let current =
+            format!("10.0.0.5 app.alpha.dev # k3dev-ingress\n127.0.0.1 app.alpha.dev {MINE}\n");
+        assert_eq!(hosts_change(&current, MINE, &entries), HostsChange::Own);
+
+        // Pointing at the same address it is only redundant
+        let current =
+            format!("127.0.0.1 app.alpha.dev # k3dev-ingress\n127.0.0.1 app.alpha.dev {MINE}\n");
+        assert_eq!(
+            hosts_change(&current, MINE, &entries),
+            HostsChange::None { legacy_lines: 1 }
+        );
+    }
+
+    #[test]
+    fn another_clusters_block_after_this_one_is_no_change() {
+        // Each rewrite moves the cluster's block to the end, so whole-file
+        // equality would rewrite on every start once two clusters have blocks
+        let current = format!(
+            "127.0.0.1 localhost\n127.0.0.1 app.alpha.dev {MINE}\n127.0.0.1 app.beta.dev {THEIRS}\n"
+        );
+        let (rewritten, entries) =
+            rewrite_hosts(&current, MINE, "127.0.0.1", &hosts(&["app.alpha.dev"]));
+        assert_ne!(rewritten, current);
+        assert_eq!(
+            hosts_change(&current, MINE, &entries),
+            HostsChange::None { legacy_lines: 0 }
+        );
     }
 }
