@@ -356,128 +356,43 @@ async fn main() -> Result<()> {
     result
 }
 
-/// Run docker CLI with DOCKER_HOST pointing to the raw Docker daemon socket relay.
-/// On macOS, Docker Desktop's proxy filters container visibility. This command
-/// starts a socat relay (if not running) and passes all args to `docker`.
+/// Run the docker CLI against the daemon the clusters run on.
+///
+/// Docker Desktop's host socket hides the pod containers cri-dockerd creates,
+/// so on macOS the CLI goes through a shared relay to the VM's raw socket.
+/// Elsewhere, and for a TCP or remote endpoint, the CLI already talks to that
+/// daemon directly and gets the args unchanged.
 async fn run_docker_passthrough(args: &[String], config_path: Option<&str>) -> Result<i32> {
-    let loader = config::ConfigLoader::new(config_path);
-    let config = loader.load().unwrap_or_default();
-    let cluster_config = cluster::ClusterConfig::from(config.infrastructure);
+    let mut command = std::process::Command::new("docker");
+    command.args(args);
 
-    // Check container is running
-    let docker = cluster::DockerManager::from_default_socket()?;
-    let running = docker
-        .container_running(&cluster_config.container_name)
-        .await;
-    if !running {
-        eprintln!("Cluster is not running. Start it first with: k3dev start");
-        return Ok(1);
+    #[cfg(target_os = "macos")]
+    if cluster::docker_relay::needed() {
+        let loader = config::ConfigLoader::new(config_path);
+        let config = loader.load().unwrap_or_default();
+        let cluster_config = cluster::ClusterConfig::from(config.infrastructure);
+
+        let docker = cluster::DockerManager::from_default_socket()?;
+        if !docker
+            .container_running(&cluster_config.container_name)
+            .await
+        {
+            eprintln!("Cluster is not running. Start it first with: k3dev start");
+            return Ok(1);
+        }
+
+        let relay_port =
+            cluster::docker_relay::ensure(&docker, &cluster_config.k3s_image()).await?;
+        command.env("DOCKER_HOST", format!("tcp://127.0.0.1:{}", relay_port));
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = config_path;
 
-    // Find the relay port — check if socat is already listening on a port
-    let relay_port = find_or_start_docker_relay(&docker, &cluster_config.container_name).await?;
-
-    // Pass through to docker CLI
-    let status = std::process::Command::new("docker")
-        .args(args)
-        .env("DOCKER_HOST", format!("tcp://localhost:{}", relay_port))
+    let status = command
         .status()
         .map_err(|e| anyhow::anyhow!("Failed to run docker: {}", e))?;
 
     Ok(status.code().unwrap_or(1))
-}
-
-/// Find an existing socat relay or start a new one. Returns the host port.
-async fn find_or_start_docker_relay(
-    docker: &cluster::DockerManager,
-    container_name: &str,
-) -> Result<u16> {
-    // Check if socat is already running on any port
-    let ps_output = docker
-        .exec_in_container(
-            container_name,
-            &[
-                "sh",
-                "-c",
-                "ps aux 2>/dev/null | grep 'socat TCP-LISTEN' | grep -v grep",
-            ],
-        )
-        .await
-        .unwrap_or_default();
-
-    if let Some(port) = parse_socat_port(&ps_output) {
-        return Ok(port);
-    }
-
-    // Discover which port was published for the relay by inspecting the container
-    let port = discover_published_relay_port(docker, container_name)
-        .await
-        .unwrap_or_else(|| cluster::find_available_port(2375).unwrap_or(2375));
-
-    // Ensure socat binary exists — install if missing via bollard upload
-    let socat_check = docker
-        .exec_in_container(container_name, &["ls", "/usr/local/bin/socat"])
-        .await;
-    if socat_check.is_err() {
-        #[cfg(target_arch = "aarch64")]
-        const SOCAT_BINARY: &[u8] = include_bytes!("../assets/socat-aarch64");
-        #[cfg(target_arch = "x86_64")]
-        const SOCAT_BINARY: &[u8] = include_bytes!("../assets/socat-x86_64");
-
-        let _ = docker
-            .exec_in_container(container_name, &["mkdir", "-p", "/usr/local/bin"])
-            .await;
-        docker
-            .copy_to_container(container_name, "socat", SOCAT_BINARY, "/usr/local/bin")
-            .await?;
-    }
-
-    // Start socat relay via bollard detached exec
-    docker
-        .exec_detached(
-            container_name,
-            &[
-                "/usr/local/bin/socat",
-                &format!("TCP-LISTEN:{},fork,reuseaddr,bind=0.0.0.0", port),
-                "UNIX-CONNECT:/proc/1/root/run/docker.sock",
-            ],
-        )
-        .await?;
-
-    // Brief wait for socat to bind
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    Ok(port)
-}
-
-/// Discover the published relay port by inspecting container port bindings.
-/// Looks for a published port in the 2375-2474 range (Docker API relay).
-async fn discover_published_relay_port(
-    docker: &cluster::DockerManager,
-    container_name: &str,
-) -> Option<u16> {
-    let ports = docker.get_container_ports(container_name).await.ok()?;
-    for container_port in 2375..2475u16 {
-        if let Some(&host_port) = ports.get(&container_port) {
-            return Some(host_port);
-        }
-    }
-    None
-}
-
-/// Parse the listening port from socat process listing
-fn parse_socat_port(ps_output: &str) -> Option<u16> {
-    // Look for "TCP-LISTEN:NNNN" in process listing
-    for line in ps_output.lines() {
-        if let Some(idx) = line.find("TCP-LISTEN:") {
-            let after = &line[idx + 11..];
-            let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(port) = port_str.parse::<u16>() {
-                return Some(port);
-            }
-        }
-    }
-    None
 }
 
 /// Run the TUI, rebuilding the App whenever the user switches cluster.

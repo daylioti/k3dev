@@ -76,6 +76,13 @@ k3dev docker images
 k3dev docker logs -f <container>
 ```
 
+On macOS, Docker Desktop's socket hides the clusters' pod containers, so
+`k3dev docker` goes through a shared `k3dev-docker-relay` container to the VM's
+raw Docker socket. The relay serves every cluster, listens on a Docker-assigned
+port bound to `127.0.0.1` only, and is removed once no cluster is running. On
+Linux, or with a TCP or remote Docker endpoint, `docker` runs directly with your
+own environment.
+
 ## Examples
 
 ```bash

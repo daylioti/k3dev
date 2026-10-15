@@ -538,35 +538,12 @@ impl DockerManager {
         Ok(())
     }
 
-    /// Execute a command in a container without waiting for it to finish (detached).
-    /// Achieves the same effect as `docker exec -d` by not attaching stdout/stderr.
-    pub async fn exec_detached(&self, container: &str, command: &[&str]) -> Result<()> {
-        let exec = self
-            .client
-            .create_exec(
-                container,
-                CreateExecOptions {
-                    cmd: Some(command.to_vec()),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    ..Default::default()
-                },
-            )
-            .await
-            .context("Failed to create detached exec")?;
-
-        // Start and immediately drop — the process runs in the background
-        let _ = self
-            .client
-            .start_exec(&exec.id, Some(StartExecOptions::default()))
-            .await
-            .context("Failed to start detached exec")?;
-
-        Ok(())
-    }
-
     /// Get published port bindings for a container.
     /// Returns a map of container_port -> host_port.
+    ///
+    /// Reads the live bindings, so it also resolves ports Docker allocated.
+    /// Only the macOS Docker relay needs that.
+    #[cfg(target_os = "macos")]
     pub async fn get_container_ports(
         &self,
         container: &str,
@@ -1140,8 +1117,16 @@ impl DockerManager {
 
     // === Container Run Operations ===
 
-    /// Run a new container
-    pub async fn run_container(&self, config: &ContainerRunConfig) -> Result<()> {
+    /// Exposed ports and their host bindings for `config.ports`.
+    ///
+    /// A host port of 0 is left out of the binding so Docker allocates one:
+    /// probing for a free port from here is racy, and on macOS the probe can't
+    /// see ports Docker Desktop holds on the wildcard address.
+    #[allow(clippy::type_complexity)]
+    fn port_bindings(
+        config: &ContainerRunConfig,
+    ) -> (Vec<String>, HashMap<String, Option<Vec<PortBinding>>>) {
+        let host_ip = config.host_ip.as_deref().unwrap_or("0.0.0.0");
         let mut exposed_ports: Vec<String> = Vec::new();
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
@@ -1151,11 +1136,18 @@ impl DockerManager {
             port_bindings.insert(
                 container_port,
                 Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
-                    host_port: Some(host.to_string()),
+                    host_ip: Some(host_ip.to_string()),
+                    host_port: (*host != 0).then(|| host.to_string()),
                 }]),
             );
         }
+
+        (exposed_ports, port_bindings)
+    }
+
+    /// Run a new container
+    pub async fn run_container(&self, config: &ContainerRunConfig) -> Result<()> {
+        let (exposed_ports, port_bindings) = Self::port_bindings(config);
 
         let env: Vec<String> = config
             .env
@@ -1373,7 +1365,10 @@ pub struct ContainerRunConfig {
     pub image: String,
     pub detach: bool,
     pub privileged: bool,
+    /// (host, container) pairs; a host port of 0 lets Docker pick a free one
     pub ports: Vec<(u16, u16)>,
+    /// Host address the published ports bind to (`None` = all interfaces)
+    pub host_ip: Option<String>,
     pub volumes: Vec<(String, String, String)>, // (src, dst, options)
     pub env: Vec<(String, String)>,
     pub network: Option<String>,
@@ -1432,5 +1427,36 @@ mod tests {
         // The name fallback is scoped to the cluster being asked about.
         let other = summary("beta-server", &[("k3dev.cluster", "beta")]);
         assert!(!DockerManager::is_cluster_server(&other, "alpha"));
+    }
+
+    fn binding(config: &ContainerRunConfig, container_port: u16) -> PortBinding {
+        let (exposed, bindings) = DockerManager::port_bindings(config);
+        let key = format!("{}/tcp", container_port);
+        assert!(exposed.contains(&key));
+        bindings[&key].as_ref().unwrap()[0].clone()
+    }
+
+    #[test]
+    fn ports_publish_on_all_interfaces_by_default() {
+        let config = ContainerRunConfig {
+            ports: vec![(6451, 6443)],
+            ..Default::default()
+        };
+        let b = binding(&config, 6443);
+        assert_eq!(b.host_ip.as_deref(), Some("0.0.0.0"));
+        assert_eq!(b.host_port.as_deref(), Some("6451"));
+    }
+
+    #[test]
+    fn host_ip_and_docker_assigned_port() {
+        let config = ContainerRunConfig {
+            ports: vec![(0, 2375)],
+            host_ip: Some("127.0.0.1".to_string()),
+            ..Default::default()
+        };
+        let b = binding(&config, 2375);
+        assert_eq!(b.host_ip.as_deref(), Some("127.0.0.1"));
+        // No host port: Docker allocates a free one
+        assert_eq!(b.host_port, None);
     }
 }

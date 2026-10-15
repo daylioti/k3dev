@@ -579,13 +579,3 @@ impl PlatformInfo {
         missing
     }
 }
-
-/// Find an available TCP port starting from the given port.
-pub fn find_available_port(start: u16) -> anyhow::Result<u16> {
-    for port in start..start + 100 {
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return Ok(port);
-        }
-    }
-    anyhow::bail!("No available port found in range {}-{}", start, start + 100)
-}
