@@ -14,11 +14,15 @@ reviews:
   # block into each PR description, which the release workflow harvests into the
   # GitHub Release notes (see scripts/coderabbit-release-notes.sh).
   high_level_summary: true
-  review_status: true
+  # Quiet while automatic reviews are off: no "review skipped" comments.
+  review_status: false
   poem: false
   collapse_walkthrough: false
   auto_review:
-    enabled: true
+    # Disabled: CodeRabbit no longer reviews PRs on its own. A review can still
+    # be requested on a PR with `@coderabbitai review`; set this back to true to
+    # restore automatic reviews.
+    enabled: false
     drafts: false
     base_branches:
       - main
@@ -65,7 +69,8 @@ reviews:
       enabled: true
 
 chat:
-  auto_reply: true
+  # Only answer when mentioned, consistent with automatic reviews being off.
+  auto_reply: false
 
 knowledge_base:
   learnings:
