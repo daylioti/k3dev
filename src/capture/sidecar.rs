@@ -61,7 +61,6 @@ pub fn build_capture_config(
         detach: true,
         privileged: true,
         ports: Vec::new(),
-        host_ip: None,
         volumes: Vec::new(),
         env: Vec::new(),
         network: Some(format!("container:{}", target_container_id)),

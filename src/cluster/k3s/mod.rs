@@ -497,19 +497,7 @@ impl K3sManager {
 
         // Build port mappings. The `k3dev docker` relay is not one of them: it
         // is a single container shared by every cluster (see docker_relay).
-        let ports: Vec<(u16, u16)> = self
-            .config
-            .port_mappings()
-            .iter()
-            .filter_map(|p| {
-                let parts: Vec<&str> = p.split(':').collect();
-                if parts.len() == 2 {
-                    Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let ports = self.config.port_mappings(PlatformInfo::is_docker_remote());
 
         // K3s server command
         // Note: metrics-server is disabled because we use Docker API for metrics
@@ -603,7 +591,6 @@ impl K3sManager {
             detach: true,
             privileged: true,
             ports,
-            host_ip: None,
             volumes,
             env,
             network: Some(self.config.network_name.clone()),

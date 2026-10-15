@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use super::docker::PortMapping;
 use crate::config::{HooksConfig, InfrastructureConfig, SpeedupConfig};
 
 /// In-cluster Traefik NodePort for HTTP. Distinct from `http_port`, which is
@@ -289,22 +290,31 @@ impl ClusterConfig {
         format!("10.{}.0.10", 43 + 2 * self.cluster_index)
     }
 
-    /// Get all port mappings as docker format strings.
+    /// The ports the cluster container publishes.
     ///
     /// The API port is always published directly (it cannot be Host- or
     /// SNI-routed). HTTP/HTTPS are published only when the shared router is
     /// disabled — otherwise the router owns host :80/:443 and reaches each
     /// cluster over its Docker network.
-    pub fn port_mappings(&self) -> Vec<String> {
-        let mut ports = vec![format!("{}:6443", self.api_port)];
+    ///
+    /// The kubeconfig points at the Docker host: 127.0.0.1 when Docker is
+    /// local, so the API port binds loopback only and stays off the network.
+    /// With a remote Docker host the kubeconfig names that host, so the port
+    /// has to be reachable on its interfaces.
+    pub fn port_mappings(&self, docker_remote: bool) -> Vec<PortMapping> {
+        let mut ports = vec![if docker_remote {
+            PortMapping::new(self.api_port, 6443)
+        } else {
+            PortMapping::loopback(self.api_port, 6443)
+        }];
 
         if !self.use_router {
-            ports.push(format!("{}:{}", self.http_port, NODEPORT_HTTP));
-            ports.push(format!("{}:{}", self.https_port, NODEPORT_HTTPS));
+            ports.push(PortMapping::new(self.http_port, NODEPORT_HTTP));
+            ports.push(PortMapping::new(self.https_port, NODEPORT_HTTPS));
         }
 
         for (host, container) in &self.additional_ports {
-            ports.push(format!("{}:{}", host, container));
+            ports.push(PortMapping::new(*host, *container));
         }
 
         ports
@@ -466,7 +476,10 @@ mod tests {
             additional_ports: vec![],
             ..Default::default()
         };
-        assert_eq!(with_router.port_mappings(), vec!["6443:6443".to_string()]);
+        assert_eq!(
+            with_router.port_mappings(false),
+            vec![PortMapping::loopback(6443, 6443)]
+        );
 
         let direct = ClusterConfig {
             use_router: false,
@@ -475,8 +488,27 @@ mod tests {
             ..Default::default()
         };
         // Host port maps onto the in-cluster NodePort, which never changes
-        assert!(direct.port_mappings().contains(&"8080:80".to_string()));
-        assert!(direct.port_mappings().contains(&"443:443".to_string()));
+        let ports = direct.port_mappings(false);
+        assert!(ports.contains(&PortMapping::new(8080, 80)));
+        assert!(ports.contains(&PortMapping::new(443, 443)));
+    }
+
+    #[test]
+    fn api_port_binds_loopback_unless_docker_is_remote() {
+        let config = ClusterConfig {
+            use_router: false,
+            api_port: 6451,
+            additional_ports: vec![(2345, 2345)],
+            ..Default::default()
+        };
+        let local = config.port_mappings(false);
+        assert_eq!(local[0], PortMapping::loopback(6451, 6443));
+        // Only the API port: ingress and extra ports stay reachable as before
+        assert!(local[1..].iter().all(|port| !port.loopback));
+
+        let remote = config.port_mappings(true);
+        assert!(remote.iter().all(|port| !port.loopback));
+        assert_eq!(remote[0], PortMapping::new(6451, 6443));
     }
 
     #[test]
@@ -490,9 +522,8 @@ mod tests {
                 additional_ports: vec![(2345, 2345)],
                 ..Default::default()
             };
-            for mapping in config.port_mappings() {
-                let host: u16 = mapping.split(':').next().unwrap().parse().unwrap();
-                assert_eq!(config.port_settings(host).len(), 1, "{}", mapping);
+            for mapping in config.port_mappings(false) {
+                assert_eq!(config.port_settings(mapping.host).len(), 1, "{:?}", mapping);
             }
         }
     }

@@ -1198,18 +1198,22 @@ impl DockerManager {
     fn port_bindings(
         config: &ContainerRunConfig,
     ) -> (Vec<String>, HashMap<String, Option<Vec<PortBinding>>>) {
-        let host_ip = config.host_ip.as_deref().unwrap_or("0.0.0.0");
         let mut exposed_ports: Vec<String> = Vec::new();
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
-        for (host, container) in &config.ports {
-            let container_port = format!("{}/tcp", container);
+        for port in &config.ports {
+            let container_port = format!("{}/tcp", port.container);
+            let host_ip = if port.loopback {
+                "127.0.0.1"
+            } else {
+                "0.0.0.0"
+            };
             exposed_ports.push(container_port.clone());
             port_bindings.insert(
                 container_port,
                 Some(vec![PortBinding {
                     host_ip: Some(host_ip.to_string()),
-                    host_port: (*host != 0).then(|| host.to_string()),
+                    host_port: (port.host != 0).then(|| port.host.to_string()),
                 }]),
             );
         }
@@ -1384,6 +1388,36 @@ pub struct MountSource {
     pub source: String,
 }
 
+/// A container port published on the host
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMapping {
+    /// Host port; 0 lets Docker pick a free one
+    pub host: u16,
+    pub container: u16,
+    /// Bind only the host's loopback address instead of every interface
+    pub loopback: bool,
+}
+
+impl PortMapping {
+    /// Published on every host interface
+    pub fn new(host: u16, container: u16) -> Self {
+        Self {
+            host,
+            container,
+            loopback: false,
+        }
+    }
+
+    /// Published on the host's loopback address only
+    pub fn loopback(host: u16, container: u16) -> Self {
+        Self {
+            host,
+            container,
+            loopback: true,
+        }
+    }
+}
+
 /// Configuration for running a Docker container
 #[derive(Debug, Clone, Default)]
 pub struct ContainerRunConfig {
@@ -1392,10 +1426,7 @@ pub struct ContainerRunConfig {
     pub image: String,
     pub detach: bool,
     pub privileged: bool,
-    /// (host, container) pairs; a host port of 0 lets Docker pick a free one
-    pub ports: Vec<(u16, u16)>,
-    /// Host address the published ports bind to (`None` = all interfaces)
-    pub host_ip: Option<String>,
+    pub ports: Vec<PortMapping>,
     pub volumes: Vec<(String, String, String)>, // (src, dst, options)
     pub env: Vec<(String, String)>,
     pub network: Option<String>,
@@ -1695,7 +1726,7 @@ mod tests {
     #[test]
     fn ports_publish_on_all_interfaces_by_default() {
         let config = ContainerRunConfig {
-            ports: vec![(6451, 6443)],
+            ports: vec![PortMapping::new(6451, 6443)],
             ..Default::default()
         };
         let b = binding(&config, 6443);
@@ -1704,10 +1735,9 @@ mod tests {
     }
 
     #[test]
-    fn host_ip_and_docker_assigned_port() {
+    fn loopback_and_docker_assigned_port() {
         let config = ContainerRunConfig {
-            ports: vec![(0, 2375)],
-            host_ip: Some("127.0.0.1".to_string()),
+            ports: vec![PortMapping::loopback(0, 2375)],
             ..Default::default()
         };
         let b = binding(&config, 2375);

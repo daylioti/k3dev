@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use super::docker::{ContainerRunConfig, DockerManager};
+use super::docker::{ContainerRunConfig, DockerManager, PortMapping};
 use super::platform::{docker_host_tcp_url, PlatformInfo};
 
 /// Name of the shared relay container
@@ -124,8 +124,7 @@ async fn create(docker: &DockerManager, image: &str) -> Result<()> {
         // Opening another process's root through /proc takes ptrace rights
         privileged: true,
         pid_host: true,
-        ports: vec![(0, RELAY_PORT)],
-        host_ip: Some("127.0.0.1".to_string()),
+        ports: vec![PortMapping::loopback(0, RELAY_PORT)],
         entrypoint: Some(String::new()),
         command: Some(relay_command()),
         labels,
