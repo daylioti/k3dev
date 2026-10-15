@@ -35,7 +35,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::config::ClusterConfig;
-use super::docker::{ContainerRunConfig, DockerManager};
+use super::docker::{name_port_settings, ContainerRunConfig, DockerManager};
 use super::kube_ops::KubeOps;
 use super::platform::{docker_host_tcp_url, PlatformInfo};
 use crate::config::HookEvent;
@@ -616,7 +616,10 @@ impl K3sManager {
             auto_remove: false,
         };
 
-        self.docker.run_container(&run_config).await?;
+        self.docker
+            .run_container(&run_config)
+            .await
+            .map_err(|e| name_port_settings(e, |port| self.config.port_settings(port)))?;
 
         // The container's entrypoint blocks until this lands, so it has to be
         // uploaded before anything waits on the API.
