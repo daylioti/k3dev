@@ -397,9 +397,10 @@ impl K3sManager {
 
         // The entrypoint blocks until this lands (see create_cluster)
         if use_proxy {
-            self.install_criproxy()
-                .await
-                .context("Failed to install CRI filtering proxy")?;
+            if let Err(e) = self.install_criproxy().await {
+                self.discard_container().await;
+                return Err(e).context("Failed to install CRI filtering proxy");
+            }
         }
 
         // Wait for API (should be fast since cluster is pre-initialized)
