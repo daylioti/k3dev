@@ -5,7 +5,7 @@ use tokio::fs;
 use tokio::sync::mpsc;
 
 use super::config::{ClusterConfig, NODEPORT_HTTP, NODEPORT_HTTPS};
-use super::docker::{name_port_settings, ContainerRunConfig, DockerManager};
+use super::docker::{name_port_settings, ContainerRunConfig, DockerManager, PortMapping};
 use crate::ui::components::OutputLine;
 
 /// Name of the shared front-router container
@@ -149,10 +149,9 @@ impl RouterManager {
             detach: true,
             privileged: false,
             ports: vec![
-                (config.http_port, ENTRYPOINT_HTTP),
-                (config.https_port, ENTRYPOINT_HTTPS),
+                PortMapping::new(config.http_port, ENTRYPOINT_HTTP),
+                PortMapping::new(config.https_port, ENTRYPOINT_HTTPS),
             ],
-            host_ip: None,
             volumes: vec![(
                 Self::dynamic_dir().to_string_lossy().to_string(),
                 DYNAMIC_DIR_IN_CONTAINER.to_string(),

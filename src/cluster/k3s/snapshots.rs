@@ -272,19 +272,7 @@ impl K3sManager {
         let iptables_mode = PlatformInfo::detect_iptables_mode();
 
         // Build port mappings (no relay port, see create_cluster)
-        let ports: Vec<(u16, u16)> = self
-            .config
-            .port_mappings()
-            .iter()
-            .filter_map(|p| {
-                let parts: Vec<&str> = p.split(':').collect();
-                if parts.len() == 2 {
-                    Some((parts[0].parse().ok()?, parts[1].parse().ok()?))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let ports = self.config.port_mappings(PlatformInfo::is_docker_remote());
 
         // See create_cluster: the proxy needs a unix socket to forward to.
         let use_proxy = docker_host_tcp_url().is_none();
@@ -364,7 +352,6 @@ impl K3sManager {
             detach: true,
             privileged: true,
             ports,
-            host_ip: None,
             volumes,
             env,
             network: Some(self.config.network_name.clone()),
