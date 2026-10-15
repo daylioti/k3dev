@@ -409,9 +409,9 @@ impl K3sManager {
         let pv_storage_path = self.config.local_pv_storage_path(&docker_root);
         let iptables_mode = PlatformInfo::detect_iptables_mode();
 
-        // Build port mappings
-        #[allow(unused_mut)]
-        let mut ports: Vec<(u16, u16)> = self
+        // Build port mappings. The `k3dev docker` relay is not one of them: it
+        // is a single container shared by every cluster (see docker_relay).
+        let ports: Vec<(u16, u16)> = self
             .config
             .port_mappings()
             .iter()
@@ -424,15 +424,6 @@ impl K3sManager {
                 }
             })
             .collect();
-
-        // On macOS, publish a port for the Docker API relay (socat) so
-        // `k3dev docker` can access the raw Docker daemon from the host.
-        // Find an available host port starting from 2375.
-        #[cfg(target_os = "macos")]
-        {
-            let relay_port = crate::cluster::platform::find_available_port(2375).unwrap_or(2375);
-            ports.push((relay_port, relay_port));
-        }
 
         // K3s server command
         // Note: metrics-server is disabled because we use Docker API for metrics
@@ -526,6 +517,7 @@ impl K3sManager {
             detach: true,
             privileged: true,
             ports,
+            host_ip: None,
             volumes,
             env,
             network: Some(self.config.network_name.clone()),

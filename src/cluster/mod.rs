@@ -2,6 +2,8 @@ pub(crate) mod config;
 pub(crate) mod config_registry;
 pub mod diagnostics;
 pub(crate) mod docker;
+#[cfg(target_os = "macos")]
+pub mod docker_relay;
 mod ingress;
 mod k3s;
 pub(crate) mod kube_ops;
@@ -19,7 +21,7 @@ pub use ingress::{
     HostsUpdateResult, IngressEntry, IngressHealthChecker, IngressHealthStatus, IngressManager,
 };
 pub use k3s::{ClusterStatus, K3sManager};
-pub use platform::{find_available_port, PlatformInfo};
+pub use platform::PlatformInfo;
 pub use port_forward::PortForwardDetector;
 pub use router::{RouterManager, ROUTER_CONTAINER};
 pub use traefik::TraefikManager;
@@ -257,6 +259,8 @@ impl ClusterManager {
                 }
             }
             k3s.stop(output_tx).await?;
+            #[cfg(target_os = "macos")]
+            docker_relay::remove_if_idle(&k3s.docker).await;
         }
         Ok(())
     }
@@ -292,6 +296,8 @@ impl ClusterManager {
                 }
             }
             k3s.delete(output_tx.clone(), delete_snapshots).await?;
+            #[cfg(target_os = "macos")]
+            docker_relay::remove_if_idle(&k3s.docker).await;
         }
 
         // Note: /etc/hosts is left to the caller, which owns the elevated-write

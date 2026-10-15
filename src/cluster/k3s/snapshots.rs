@@ -271,9 +271,8 @@ impl K3sManager {
         let pv_storage_path = self.config.local_pv_storage_path(&docker_root);
         let iptables_mode = PlatformInfo::detect_iptables_mode();
 
-        // Build port mappings
-        #[allow(unused_mut)]
-        let mut ports: Vec<(u16, u16)> = self
+        // Build port mappings (no relay port, see create_cluster)
+        let ports: Vec<(u16, u16)> = self
             .config
             .port_mappings()
             .iter()
@@ -286,19 +285,6 @@ impl K3sManager {
                 }
             })
             .collect();
-
-        #[cfg(target_os = "macos")]
-        {
-            let relay_port = crate::cluster::platform::find_available_port(2375).unwrap_or(2375);
-            ports.push((relay_port, relay_port));
-        }
-
-        #[cfg(target_os = "macos")]
-        let ports = {
-            let mut p = ports;
-            p.push((2375, 2375));
-            p
-        };
 
         // See create_cluster: the proxy needs a unix socket to forward to.
         let use_proxy = docker_host_tcp_url().is_none();
@@ -378,6 +364,7 @@ impl K3sManager {
             detach: true,
             privileged: true,
             ports,
+            host_ip: None,
             volumes,
             env,
             network: Some(self.config.network_name.clone()),

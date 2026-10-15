@@ -152,6 +152,7 @@ impl RouterManager {
                 (config.http_port, ENTRYPOINT_HTTP),
                 (config.https_port, ENTRYPOINT_HTTPS),
             ],
+            host_ip: None,
             volumes: vec![(
                 Self::dynamic_dir().to_string_lossy().to_string(),
                 DYNAMIC_DIR_IN_CONTAINER.to_string(),
