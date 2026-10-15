@@ -220,7 +220,10 @@ impl K8sClient {
     pub async fn describe_pod(&self, namespace: &str, name: &str) -> Result<String> {
         let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
         let pod = pods.get(name).await?;
+        Ok(Self::format_pod_description(&pod))
+    }
 
+    fn format_pod_description(pod: &Pod) -> String {
         let mut output = String::new();
 
         // Basic info
@@ -252,9 +255,14 @@ impl K8sClient {
                 "IP:           {}\n",
                 status.pod_ip.as_deref().unwrap_or("N/A")
             ));
+            // The scheduler records its placement in spec.nodeName;
+            // status.nominatedNodeName is only set while a pod waits on preemption.
             output.push_str(&format!(
                 "Node:         {}\n",
-                status.nominated_node_name.as_deref().unwrap_or("N/A")
+                pod.spec
+                    .as_ref()
+                    .and_then(|spec| spec.node_name.as_deref())
+                    .unwrap_or("N/A")
             ));
             output.push_str(&format!(
                 "Start Time:   {}\n",
@@ -314,11 +322,6 @@ impl K8sClient {
 
         // Spec info
         if let Some(spec) = &pod.spec {
-            output.push_str(&format!(
-                "\nNode Name:    {}\n",
-                spec.node_name.as_deref().unwrap_or("N/A")
-            ));
-
             // Containers
             output.push_str("\nContainer Specs:\n");
             for container in &spec.containers {
@@ -346,7 +349,7 @@ impl K8sClient {
             }
         }
 
-        Ok(output)
+        output
     }
 
     /// Delete a pod
@@ -562,4 +565,37 @@ fn parse_k8s_quantity(quantity: &str) -> u64 {
     }
     // Plain number (bytes)
     quantity.parse::<u64>().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::K8sClient;
+    use k8s_openapi::api::core::v1::{Pod, PodSpec, PodStatus};
+
+    fn pod(node_name: Option<&str>) -> Pod {
+        Pod {
+            spec: Some(PodSpec {
+                node_name: node_name.map(String::from),
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some("Running".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn describe_shows_the_scheduled_node() {
+        let output = K8sClient::format_pod_description(&pod(Some("one-server")));
+        assert!(output.contains("Node:         one-server\n"), "{output}");
+        assert!(!output.contains("Node Name"), "{output}");
+    }
+
+    #[test]
+    fn describe_shows_na_for_an_unscheduled_pod() {
+        let output = K8sClient::format_pod_description(&pod(None));
+        assert!(output.contains("Node:         N/A\n"), "{output}");
+    }
 }
