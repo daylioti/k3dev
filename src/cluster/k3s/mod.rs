@@ -167,6 +167,21 @@ impl K3sManager {
         labels
     }
 
+    /// Remove this cluster's container when a start cannot finish setting it up.
+    ///
+    /// Its entrypoint waits for the CRI proxy, so a container left behind here
+    /// would be picked up by the next start as an existing cluster and hang on
+    /// the API. Cluster state lives in the named volumes, which are kept.
+    async fn discard_container(&self) {
+        if let Err(e) = self
+            .docker
+            .remove_container(&self.config.container_name, true)
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to remove unfinished cluster container");
+        }
+    }
+
     pub async fn new(config: Arc<ClusterConfig>) -> Result<Self> {
         let platform = PlatformInfo::detect()?;
         let socket_path = platform.docker_socket_path().await?;
@@ -249,12 +264,36 @@ impl K3sManager {
             return Ok(StartOutcome::AlreadyRunning);
         }
 
-        // Check if container exists but stopped
-        if self
+        // A container that was created but never started is what a failed or
+        // interrupted start leaves behind. Its networking was never set up, so
+        // it cannot be resumed; the cluster state is in the named volumes, so
+        // drop the container and create a new one below.
+        let mut exists = self
             .docker
             .container_exists(&self.config.container_name)
-            .await
+            .await;
+        if exists
+            && self
+                .docker
+                .container_status(&self.config.container_name)
+                .await
+                .as_deref()
+                == Some("created")
         {
+            let _ = output_tx
+                .send(OutputLine::warning(
+                    "Cluster container was never started (an earlier start failed), recreating it...",
+                ))
+                .await;
+            self.docker
+                .remove_container(&self.config.container_name, true)
+                .await
+                .context("Failed to remove the unfinished cluster container")?;
+            exists = false;
+        }
+
+        // Check if container exists but stopped
+        if exists {
             let _ = output_tx
                 .send(OutputLine::info("Starting existing cluster container..."))
                 .await;
@@ -266,6 +305,15 @@ impl K3sManager {
             self.docker
                 .start_container(&self.config.container_name)
                 .await?;
+
+            // A start interrupted before the CRI proxy was uploaded leaves the
+            // entrypoint waiting for it; upload it now instead of timing out on
+            // the API. A no-op when the expected version is already there.
+            if docker_host_tcp_url().is_none() {
+                self.install_criproxy()
+                    .await
+                    .context("Failed to install CRI filtering proxy")?;
+            }
             self.wait_for_api(&output_tx).await?;
 
             // Refresh kubeconfig before hooks run: a container created by an
@@ -546,9 +594,10 @@ impl K3sManager {
             let _ = output_tx
                 .send(OutputLine::info("Installing CRI filtering proxy..."))
                 .await;
-            self.install_criproxy()
-                .await
-                .context("Failed to install CRI filtering proxy")?;
+            if let Err(e) = self.install_criproxy().await {
+                self.discard_container().await;
+                return Err(e).context("Failed to install CRI filtering proxy");
+            }
         }
 
         // Wait for k3s API

@@ -1289,7 +1289,8 @@ impl DockerManager {
             .with_context(|| format!("Failed to create container {}", config.name))?;
 
         if config.detach {
-            self.client
+            let started = self
+                .client
                 .start_container(&config.name, None::<StartContainerOptions>)
                 .await
                 .map_err(|e| {
@@ -1346,7 +1347,21 @@ impl DockerManager {
                     } else {
                         anyhow!(e).context(format!("Failed to start container {}", config.name))
                     }
-                })?;
+                });
+
+            // A container whose first start failed never had its networking set
+            // up. Left behind, it blocks the name, and a later plain start
+            // brings it up without its ports or network, so remove it.
+            if let Err(e) = started {
+                if let Err(rm) = self.remove_container(&config.name, true).await {
+                    tracing::warn!(
+                        container = %config.name,
+                        error = %rm,
+                        "Failed to remove container after failed start"
+                    );
+                }
+                return Err(e);
+            }
         }
 
         Ok(())
