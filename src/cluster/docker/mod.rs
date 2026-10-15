@@ -259,11 +259,83 @@ impl DockerManager {
     }
 
     /// Start a stopped container
+    ///
+    /// Docker publishes host ports at start, so this is where a port conflict
+    /// surfaces; it comes back as a [`PortBindError`].
     pub async fn start_container(&self, name: &str) -> Result<()> {
-        self.client
+        match self
+            .client
             .start_container(name, None::<StartContainerOptions>)
             .await
-            .with_context(|| format!("Failed to start container {}", name))
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.start_error(name, e).await),
+        }
+    }
+
+    /// Explain a failed start, naming the port and its holder on a port conflict
+    async fn start_error(&self, name: &str, err: bollard::errors::Error) -> anyhow::Error {
+        // Docker Desktop ends its message with a newline
+        let docker_error = err.to_string().trim_end().to_string();
+        let Some(failure) = parse_bind_failure(&docker_error) else {
+            return anyhow!(err).context(format!("Failed to start container {}", name));
+        };
+
+        // A container that publishes the port twice collides with itself, and
+        // the full list is all there is to go on when Docker names no port.
+        let own = self.published_host_ports(name).await;
+        let reused = failure
+            .host_port
+            .is_some_and(|port| own.iter().filter(|p| **p == port).count() > 1);
+        let holder = match failure.host_port {
+            Some(port) if !reused => self.container_publishing(port, name).await,
+            _ => None,
+        };
+        let mut published = own;
+        published.dedup();
+
+        anyhow::Error::new(PortBindError {
+            container: name.to_string(),
+            host_port: failure.host_port,
+            denied: failure.denied,
+            reused,
+            holder,
+            published,
+            settings: Vec::new(),
+            macos: cfg!(target_os = "macos"),
+            docker_error,
+        })
+    }
+
+    /// Running container, other than `except`, that publishes host port `port`
+    async fn container_publishing(&self, port: u16, except: &str) -> Option<String> {
+        let containers = self
+            .client
+            .list_containers(Some(ListContainersOptions::default()))
+            .await
+            .ok()?;
+        publisher_of(&containers, port, except)
+    }
+
+    /// Host ports a container asks Docker to publish, sorted, one per binding
+    async fn published_host_ports(&self, name: &str) -> Vec<u16> {
+        let bindings = self
+            .client
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+            .ok()
+            .and_then(|info| info.host_config)
+            .and_then(|host| host.port_bindings)
+            .unwrap_or_default();
+        let mut ports: Vec<u16> = bindings
+            .into_values()
+            .flatten()
+            .flatten()
+            .filter_map(|b| b.host_port?.parse().ok())
+            .filter(|port| *port != 0)
+            .collect();
+        ports.sort_unstable();
+        ports
     }
 
     /// Stop a running container
@@ -1281,70 +1353,10 @@ impl DockerManager {
             .with_context(|| format!("Failed to create container {}", config.name))?;
 
         if config.detach {
-            let started = self
-                .client
-                .start_container(&config.name, None::<StartContainerOptions>)
-                .await
-                .map_err(|e| {
-                    let err_msg = e.to_string().to_lowercase();
-                    let is_port_error = err_msg.contains("bind")
-                        || err_msg.contains("address already in use")
-                        || err_msg.contains("permission denied")
-                        || err_msg.contains("port is already allocated");
-
-                    if is_port_error {
-                        let privileged_ports: Vec<String> = config
-                            .ports
-                            .iter()
-                            .filter(|(host, _)| *host < 1024)
-                            .map(|(host, container)| format!("{}:{}", host, container))
-                            .collect();
-
-                        let mut context_msg = format!(
-                            "Failed to start container '{}': port binding error.\n\n\
-                             Error: {}\n\n",
-                            config.name, e
-                        );
-
-                        if !privileged_ports.is_empty() {
-                            context_msg.push_str(&format!(
-                                "Privileged ports configured: {}\n\n",
-                                privileged_ports.join(", ")
-                            ));
-                        }
-
-                        if cfg!(target_os = "macos") {
-                            context_msg.push_str(
-                                "On macOS, binding to ports below 1024 (like 80/443) requires \
-                                 Docker Desktop's privileged port mapping.\n\n\
-                                 To fix:\n\
-                                 - Open Docker Desktop → Settings → Advanced → \
-                                   Enable privileged port mapping\n\
-                                 - Or configure alternative ports in k3dev.yml:\n\
-                                   http_port: 8080\n\
-                                   https_port: 8443\n",
-                            );
-                        } else {
-                            context_msg.push_str(
-                                "Possible causes:\n\
-                                 - Another process is already using the port(s)\n\
-                                 - Insufficient permissions to bind to ports below 1024\n\n\
-                                 To fix, configure alternative ports in k3dev.yml:\n\
-                                   http_port: 8080\n\
-                                   https_port: 8443\n",
-                            );
-                        }
-
-                        anyhow!(context_msg)
-                    } else {
-                        anyhow!(e).context(format!("Failed to start container {}", config.name))
-                    }
-                });
-
             // A container whose first start failed never had its networking set
             // up. Left behind, it blocks the name, and a later plain start
             // brings it up without its ports or network, so remove it.
-            if let Err(e) = started {
+            if let Err(e) = self.start_container(&config.name).await {
                 if let Err(rm) = self.remove_container(&config.name, true).await {
                     tracing::warn!(
                         container = %config.name,
@@ -1399,9 +1411,238 @@ pub struct ContainerRunConfig {
     pub auto_remove: bool,
 }
 
+/// Docker could not publish one of a container's host ports at start.
+///
+/// Its `Display` is the whole message for the user: the CLI prints only the
+/// outermost error, so wrapping this in context would hide it.
+#[derive(Debug)]
+pub struct PortBindError {
+    container: String,
+    /// The host port Docker's message names, when it could be parsed
+    host_port: Option<u16>,
+    /// The bind was refused (a privileged port), not found taken
+    denied: bool,
+    /// The container itself publishes `host_port` more than once
+    reused: bool,
+    /// Running container that already publishes `host_port`
+    holder: Option<String>,
+    /// Host ports the container publishes, for when `host_port` is unknown
+    published: Vec<u16>,
+    /// Config settings that chose `host_port`, see [`name_port_settings`]
+    settings: Vec<String>,
+    macos: bool,
+    docker_error: String,
+}
+
+impl std::error::Error for PortBindError {}
+
+impl std::fmt::Display for PortBindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = &self.container;
+        let Some(port) = self.host_port else {
+            write!(
+                f,
+                "Failed to start container '{}': a host port could not be bound.\n\n\
+                 Docker error: {}",
+                name, self.docker_error
+            )?;
+            if !self.published.is_empty() {
+                let ports: Vec<String> = self.published.iter().map(u16::to_string).collect();
+                write!(f, "\n\nHost ports it publishes: {}", ports.join(", "))?;
+            }
+            if self.denied && self.published.iter().any(|p| *p < 1024) {
+                write!(f, "\n\nIf a port below 1024 is the one refused:")?;
+                write!(f, "\n- {}", privileged_port_fix(self.macos))?;
+            }
+            return Ok(());
+        };
+
+        let privileged = self.denied && port < 1024;
+        let freeing = if self.denied {
+            write!(
+                f,
+                "Failed to start container '{}': not allowed to bind host port {}.",
+                name, port
+            )?;
+            privileged.then(|| privileged_port_fix(self.macos).to_string())
+        } else if self.reused {
+            write!(
+                f,
+                "Failed to start container '{}': it publishes host port {} more than once.",
+                name, port
+            )?;
+            None
+        } else if let Some(holder) = &self.holder {
+            write!(
+                f,
+                "Failed to start container '{}': host port {} is already used by container '{}'.",
+                name, port, holder
+            )?;
+            Some(format!("Stop container '{}'", holder))
+        } else {
+            write!(
+                f,
+                "Failed to start container '{}': host port {} is already in use on this host.",
+                name, port
+            )?;
+            Some(format!(
+                "Stop the process holding it (find it with: sudo lsof -nP -iTCP:{} -sTCP:LISTEN)",
+                port
+            ))
+        };
+        let moving = if self.settings.is_empty() {
+            None
+        } else if self.reused && !privileged {
+            Some(format!(
+                "Give {} different host ports",
+                self.settings.join(" and ")
+            ))
+        } else {
+            let target = if privileged {
+                "a host port above 1023"
+            } else {
+                "a free host port"
+            };
+            Some(format!(
+                "Change {} to {}",
+                self.settings.join(" or "),
+                target
+            ))
+        };
+        // The holder is often another cluster or the shared router, so moving
+        // off the port comes first. A refused port below 1024 is usually
+        // 80/443 on purpose, so allowing it comes first.
+        let fixes = if privileged {
+            [freeing, moving]
+        } else {
+            [moving, freeing]
+        };
+
+        write!(f, "\n\nDocker error: {}", self.docker_error)?;
+        for (i, fix) in fixes.iter().flatten().enumerate() {
+            if i == 0 {
+                write!(f, "\n\nTo fix:\n- {}", fix)?;
+            } else {
+                // Every fix starts with an ASCII capital
+                let (first, rest) = fix.split_at(1);
+                write!(f, "\n- Or {}{}", first.to_lowercase(), rest)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn privileged_port_fix(macos: bool) -> &'static str {
+    if macos {
+        "Enable privileged port mapping in Docker Desktop → Settings → Advanced"
+    } else {
+        "Let the Docker daemon bind ports below 1024 (rootless Docker: \
+         lower net.ipv4.ip_unprivileged_port_start)"
+    }
+}
+
+/// Point a [`PortBindError`] at the config settings that chose its host port,
+/// so the message says what to change. Other errors pass through.
+///
+/// Only for containers created from the current config: an existing container
+/// keeps the ports it was created with, so changing a setting would not help.
+pub fn name_port_settings(
+    mut err: anyhow::Error,
+    settings_for: impl FnOnce(u16) -> Vec<String>,
+) -> anyhow::Error {
+    if let Some(bind) = err.downcast_mut::<PortBindError>() {
+        bind.settings = bind.host_port.map(settings_for).unwrap_or_default();
+    }
+    err
+}
+
+/// What a failed start says about publishing a host port
+#[derive(Debug, PartialEq)]
+struct BindFailure {
+    host_port: Option<u16>,
+    denied: bool,
+}
+
+/// Phrases Docker puts right before the host `address:port` it failed to bind.
+/// Docker Engine and Docker Desktop word this differently, and so do releases.
+const BIND_ADDRESS_MARKERS: &[&str] = &[
+    // Another container already publishes it
+    "bind for ",
+    // Docker Engine 28: `<host ip>:<host port>:<container ip>:<port>/tcp`
+    "bind host port for ",
+    // Docker Engine 29+: `<host ip>:<host port>/tcp`
+    "bind host port ",
+    // Docker Desktop, before the inner `listen tcp` error
+    "exposing port tcp ",
+    "exposing port udp ",
+    // Userland proxy, rootlesskit and Docker Desktop: `listen tcp4 0.0.0.0:80`
+    "listen tcp",
+    "listen udp",
+];
+
+/// Recognize a failed start as a host port problem, and find the port
+fn parse_bind_failure(message: &str) -> Option<BindFailure> {
+    let lower = message.to_lowercase();
+    let host_port = BIND_ADDRESS_MARKERS.iter().find_map(|marker| {
+        let rest = &lower[lower.find(marker)? + marker.len()..];
+        // `listen tcp4 0.0.0.0:80` puts the address family first
+        let address = rest.split_whitespace().take(2).find(|w| w.contains(':'))?;
+        host_port_of(address)
+    });
+
+    // The port can't always be parsed, but these say it is a port problem.
+    // "permission denied" alone is not enough: a mount can fail with it too.
+    let port_problem = host_port.is_some()
+        || [
+            "port is already allocated",
+            "address already in use",
+            "ports are not available",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase));
+
+    port_problem.then(|| BindFailure {
+        host_port,
+        denied: lower.contains("permission denied"),
+    })
+}
+
+/// The host port in an address Docker printed. Anything may follow the port
+/// (`/tcp`, `:`, or the container side), so it is read after the host IP.
+fn host_port_of(address: &str) -> Option<u16> {
+    let after_ip = match address.strip_prefix('[') {
+        Some(bracketed) => bracketed.split_once("]:")?.1,
+        None => match address.split_once(':')? {
+            (ip, rest) if ip.contains('.') => rest,
+            // No host IP at all
+            (port, _) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => port,
+            // Unbracketed IPv6, as in `Bind for :::80`: the port comes last
+            _ => address.trim_end_matches(':').rsplit_once(':')?.1,
+        },
+    };
+    let digits = after_ip
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(after_ip, |end| &after_ip[..end]);
+    digits.parse().ok().filter(|port| *port != 0)
+}
+
+/// Name of the container, other than `except`, that publishes host port `port`
+fn publisher_of(containers: &[ContainerSummary], port: u16, except: &str) -> Option<String> {
+    containers.iter().find_map(|c| {
+        let publishes = c
+            .ports
+            .as_ref()?
+            .iter()
+            .any(|p| p.public_port == Some(port));
+        let name = c.names.as_ref()?.first()?.trim_start_matches('/');
+        (publishes && name != except).then(|| name.to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bollard::models::PortSummary;
 
     fn summary(name: &str, labels: &[(&str, &str)]) -> ContainerSummary {
         ContainerSummary {
@@ -1473,5 +1714,273 @@ mod tests {
         assert_eq!(b.host_ip.as_deref(), Some("127.0.0.1"));
         // No host port: Docker allocates a free one
         assert_eq!(b.host_port, None);
+    }
+
+    fn failure(host_port: u16, denied: bool) -> Option<BindFailure> {
+        Some(BindFailure {
+            host_port: Some(host_port),
+            denied,
+        })
+    }
+
+    #[test]
+    fn bind_failures_name_the_host_port() {
+        let cases = [
+            // Docker Desktop: another container publishes the port
+            (
+                "Docker responded with status code 500: failed to set up container networking: \
+                 driver failed programming external connectivity on endpoint two-server (e001): \
+                 Bind for 0.0.0.0:6451 failed: port is already allocated",
+                failure(6451, false),
+            ),
+            // Docker Desktop: a host process holds it
+            (
+                "ports are not available: exposing port TCP 0.0.0.0:18432 -> 127.0.0.1:0: \
+                 listen tcp 0.0.0.0:18432: bind: address already in use",
+                failure(18432, false),
+            ),
+            // Docker Desktop without privileged port mapping
+            (
+                "ports are not available: exposing port TCP 0.0.0.0:80 -> 0.0.0.0:0: \
+                 listen tcp 0.0.0.0:80: bind: permission denied",
+                failure(80, true),
+            ),
+            // Engine 28 prints the whole binding, container side included
+            (
+                "driver failed programming external connectivity on endpoint web (abc): \
+                 failed to bind host port for 0.0.0.0:6451:172.18.0.2:6443/tcp: \
+                 address already in use",
+                failure(6451, false),
+            ),
+            (
+                "failed to bind host port for [::]:6451:[fd00::2]:6443/tcp: address already in use",
+                failure(6451, false),
+            ),
+            // Engine 29+
+            (
+                "driver failed programming external connectivity on endpoint web (abc): \
+                 failed to bind host port 0.0.0.0:8080/tcp: address already in use",
+                failure(8080, false),
+            ),
+            (
+                "failed to bind host port [::]:8443/tcp: address already in use",
+                failure(8443, false),
+            ),
+            // Engine allocator with an IPv6 host address, printed unbracketed
+            (
+                "Bind for :::8080 failed: port is already allocated",
+                failure(8080, false),
+            ),
+            // Older Engine userland proxy
+            (
+                "Error starting userland proxy: listen tcp4 0.0.0.0:443: bind: address already in use",
+                failure(443, false),
+            ),
+            // Rootless Docker
+            (
+                "error while calling RootlessKit PortManager.AddPort(): cannot expose privileged \
+                 port 80, you can add 'net.ipv4.ip_unprivileged_port_start=80' to \
+                 /etc/sysctl.conf (currently 1024): listen tcp4 0.0.0.0:80: bind: permission denied",
+                failure(80, true),
+            ),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(parse_bind_failure(message), expected, "{}", message);
+        }
+    }
+
+    #[test]
+    fn bind_failures_without_a_parsable_port_are_still_recognized() {
+        assert_eq!(
+            parse_bind_failure("ports are not available: something new"),
+            Some(BindFailure {
+                host_port: None,
+                denied: false
+            })
+        );
+    }
+
+    #[test]
+    fn mount_errors_are_not_port_errors() {
+        // Both used to match the old "bind" / "permission denied" test
+        for message in [
+            "invalid mount config for type \"bind\": bind source path does not exist: /nope",
+            "error mounting \"/data\" to rootfs at \"/data\": permission denied",
+        ] {
+            assert_eq!(parse_bind_failure(message), None, "{}", message);
+        }
+    }
+
+    fn published(name: &str, ports: &[u16]) -> ContainerSummary {
+        ContainerSummary {
+            names: Some(vec![format!("/{}", name)]),
+            ports: Some(
+                ports
+                    .iter()
+                    .map(|p| PortSummary {
+                        public_port: Some(*p),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_holder_is_another_container_publishing_the_port() {
+        let containers = [
+            published("k3dev-router", &[80, 443]),
+            published("one-server", &[6451]),
+            published("two-server", &[6451]),
+        ];
+        assert_eq!(
+            publisher_of(&containers, 6451, "two-server").as_deref(),
+            Some("one-server")
+        );
+        assert_eq!(
+            publisher_of(&containers, 6451, "one-server").as_deref(),
+            Some("two-server")
+        );
+        assert_eq!(publisher_of(&containers, 8080, "two-server"), None);
+    }
+
+    fn bind_error(host_port: Option<u16>, denied: bool) -> PortBindError {
+        PortBindError {
+            container: "two-server".to_string(),
+            host_port,
+            denied,
+            reused: false,
+            holder: None,
+            published: Vec::new(),
+            settings: Vec::new(),
+            macos: true,
+            docker_error: "docker said no".to_string(),
+        }
+    }
+
+    fn api_port() -> Vec<String> {
+        vec!["`infrastructure.api_port`".to_string()]
+    }
+
+    #[test]
+    fn a_taken_port_names_its_holder_and_setting_not_privileged_ports() {
+        let err = PortBindError {
+            holder: Some("one-server".to_string()),
+            settings: api_port(),
+            ..bind_error(Some(6451), false)
+        };
+        let msg = err.to_string();
+        assert!(msg.starts_with(
+            "Failed to start container 'two-server': \
+             host port 6451 is already used by container 'one-server'."
+        ));
+        // Moving off the port comes before stopping another cluster
+        assert!(msg.ends_with(
+            "Docker error: docker said no\n\n\
+             To fix:\n\
+             - Change `infrastructure.api_port` to a free host port\n\
+             - Or stop container 'one-server'"
+        ));
+        assert!(!msg.contains("rivileged"), "{}", msg);
+        assert!(!msg.contains("http_port"), "{}", msg);
+    }
+
+    #[test]
+    fn a_port_held_outside_docker_points_at_lsof() {
+        let msg = bind_error(Some(6451), false).to_string();
+        assert!(msg.contains("host port 6451 is already in use on this host"));
+        assert!(msg.contains("lsof -nP -iTCP:6451 -sTCP:LISTEN"));
+        // No setting is known, so none is suggested
+        assert!(!msg.contains("infrastructure"), "{}", msg);
+    }
+
+    #[test]
+    fn a_port_published_twice_names_both_settings() {
+        let err = PortBindError {
+            reused: true,
+            settings: vec![
+                "`infrastructure.http_port`".to_string(),
+                "the `8080:8080` entry in `infrastructure.additional_ports`".to_string(),
+            ],
+            ..bind_error(Some(8080), false)
+        };
+        let msg = err.to_string();
+        assert!(msg.starts_with(
+            "Failed to start container 'two-server': it publishes host port 8080 more than once."
+        ));
+        assert!(msg.ends_with(
+            "To fix:\n\
+             - Give `infrastructure.http_port` and the `8080:8080` entry in \
+             `infrastructure.additional_ports` different host ports"
+        ));
+        assert!(!msg.contains("lsof"), "{}", msg);
+    }
+
+    #[test]
+    fn a_refused_privileged_port_gets_the_platform_fix() {
+        let mac = PortBindError {
+            settings: vec!["`infrastructure.http_port`".to_string()],
+            ..bind_error(Some(80), true)
+        };
+        let msg = mac.to_string();
+        assert!(msg.contains("not allowed to bind host port 80"));
+        assert!(msg.contains("- Enable privileged port mapping in Docker Desktop"));
+        assert!(msg.ends_with("- Or change `infrastructure.http_port` to a host port above 1023"));
+
+        let linux = PortBindError {
+            macos: false,
+            ..bind_error(Some(80), true)
+        };
+        let msg = linux.to_string();
+        assert!(msg.contains("ip_unprivileged_port_start"));
+        assert!(!msg.contains("Docker Desktop"), "{}", msg);
+    }
+
+    #[test]
+    fn a_refused_high_port_suggests_only_the_setting() {
+        let err = PortBindError {
+            settings: api_port(),
+            ..bind_error(Some(6451), true)
+        };
+        let msg = err.to_string();
+        assert!(msg.ends_with("To fix:\n- Change `infrastructure.api_port` to a free host port"));
+        assert!(!msg.contains("rivileged"), "{}", msg);
+    }
+
+    #[test]
+    fn an_unknown_port_gets_privileged_advice_only_when_refused() {
+        let taken = PortBindError {
+            published: vec![80, 443, 6451],
+            ..bind_error(None, false)
+        };
+        let msg = taken.to_string();
+        assert!(msg.contains("a host port could not be bound"));
+        assert!(msg.contains("Host ports it publishes: 80, 443, 6451"));
+        assert!(!msg.contains("rivileged"), "{}", msg);
+
+        let high = PortBindError {
+            published: vec![6451],
+            ..bind_error(None, true)
+        };
+        assert!(!high.to_string().contains("rivileged"));
+
+        let low = PortBindError {
+            published: vec![80, 443, 6451],
+            ..bind_error(None, true)
+        };
+        assert!(low.to_string().contains("Enable privileged port mapping"));
+    }
+
+    #[test]
+    fn the_settings_are_named_through_context() {
+        let err = anyhow::Error::new(bind_error(Some(6451), false)).context("creating");
+        let err = name_port_settings(err, |port| if port == 6451 { api_port() } else { vec![] });
+        let bind = err.downcast_ref::<PortBindError>().unwrap();
+        assert_eq!(bind.settings, api_port());
+
+        // Other errors pass through untouched
+        let other = name_port_settings(anyhow!("boom"), |_| api_port());
+        assert_eq!(other.to_string(), "boom");
     }
 }

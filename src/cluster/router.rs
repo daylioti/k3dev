@@ -5,7 +5,7 @@ use tokio::fs;
 use tokio::sync::mpsc;
 
 use super::config::{ClusterConfig, NODEPORT_HTTP, NODEPORT_HTTPS};
-use super::docker::{ContainerRunConfig, DockerManager};
+use super::docker::{name_port_settings, ContainerRunConfig, DockerManager};
 use crate::ui::components::OutputLine;
 
 /// Name of the shared front-router container
@@ -179,6 +179,7 @@ impl RouterManager {
             // create it; the loser gets a name conflict. The router is shared,
             // so the winner's container is exactly what this call wanted.
             if !docker.container_exists(ROUTER_CONTAINER).await {
+                let e = name_port_settings(e, |port| config.router_port_settings(port));
                 return Err(e).context("Failed to create router container");
             }
             tracing::debug!("Router already created concurrently: {:#}", e);

@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use super::K3sManager;
 use crate::cluster::config::ClusterConfig;
-use crate::cluster::docker::{ContainerRunConfig, DockerManager};
+use crate::cluster::docker::{name_port_settings, ContainerRunConfig, DockerManager};
 use crate::cluster::platform::{docker_host_tcp_url, PlatformInfo};
 use crate::config::HookEvent;
 use crate::hooks::HookExecutor;
@@ -393,7 +393,10 @@ impl K3sManager {
         let _ = output_tx
             .send(OutputLine::info("Starting container from snapshot..."))
             .await;
-        self.docker.run_container(&run_config).await?;
+        self.docker
+            .run_container(&run_config)
+            .await
+            .map_err(|e| name_port_settings(e, |port| self.config.port_settings(port)))?;
 
         // The entrypoint blocks until this lands (see create_cluster)
         if use_proxy {

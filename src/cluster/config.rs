@@ -56,6 +56,11 @@ pub struct ClusterConfig {
     pub hooks: HooksConfig,
 }
 
+/// A port key as written in the config file
+fn setting(key: &str) -> String {
+    format!("`infrastructure.{}`", key)
+}
+
 /// Parse additional ports from string format "host:container" to tuple
 fn parse_port_mapping(s: &str) -> Option<(u16, u16)> {
     let parts: Vec<&str> = s.split(':').collect();
@@ -305,6 +310,43 @@ impl ClusterConfig {
         ports
     }
 
+    /// The settings that publish `host_port` from the cluster container (see
+    /// [`Self::port_mappings`]), named for an error that says what to change.
+    /// More than one means the container collides with itself.
+    pub fn port_settings(&self, host_port: u16) -> Vec<String> {
+        let mut settings = Vec::new();
+        if host_port == self.api_port {
+            settings.push(setting("api_port"));
+        }
+        if !self.use_router {
+            settings.extend(self.router_port_settings(host_port));
+        }
+        for (host, container) in &self.additional_ports {
+            if *host == host_port {
+                settings.push(format!(
+                    "the `{}:{}` entry in {}",
+                    host,
+                    container,
+                    setting("additional_ports")
+                ));
+            }
+        }
+        settings
+    }
+
+    /// Like [`Self::port_settings`], for `http_port` and `https_port` alone:
+    /// the shared router publishes those, or the cluster container without it
+    pub fn router_port_settings(&self, host_port: u16) -> Vec<String> {
+        let mut settings = Vec::new();
+        if host_port == self.http_port {
+            settings.push(setting("http_port"));
+        }
+        if host_port == self.https_port {
+            settings.push(setting("https_port"));
+        }
+        settings
+    }
+
     /// Get traefik dashboard domain
     pub fn traefik_dashboard_domain(&self) -> String {
         format!("traefik.{}", self.domain)
@@ -435,6 +477,73 @@ mod tests {
         // Host port maps onto the in-cluster NodePort, which never changes
         assert!(direct.port_mappings().contains(&"8080:80".to_string()));
         assert!(direct.port_mappings().contains(&"443:443".to_string()));
+    }
+
+    #[test]
+    fn every_published_port_has_one_setting() {
+        for use_router in [true, false] {
+            let config = ClusterConfig {
+                use_router,
+                api_port: 6451,
+                http_port: 8080,
+                https_port: 8443,
+                additional_ports: vec![(2345, 2345)],
+                ..Default::default()
+            };
+            for mapping in config.port_mappings() {
+                let host: u16 = mapping.split(':').next().unwrap().parse().unwrap();
+                assert_eq!(config.port_settings(host).len(), 1, "{}", mapping);
+            }
+        }
+    }
+
+    #[test]
+    fn port_settings_name_the_config_key() {
+        let config = ClusterConfig {
+            use_router: false,
+            api_port: 6451,
+            http_port: 8080,
+            https_port: 8443,
+            additional_ports: vec![(2345, 2346)],
+            ..Default::default()
+        };
+        assert_eq!(config.port_settings(6451), ["`infrastructure.api_port`"]);
+        assert_eq!(config.port_settings(8080), ["`infrastructure.http_port`"]);
+        assert_eq!(config.port_settings(8443), ["`infrastructure.https_port`"]);
+        assert_eq!(
+            config.port_settings(2345),
+            ["the `2345:2346` entry in `infrastructure.additional_ports`"]
+        );
+        assert!(config.port_settings(9999).is_empty());
+
+        // With the router, the cluster container does not publish HTTP(S);
+        // the router does
+        let routed = ClusterConfig {
+            use_router: true,
+            ..config
+        };
+        assert!(routed.port_settings(8080).is_empty());
+        assert_eq!(
+            routed.router_port_settings(8080),
+            ["`infrastructure.http_port`"]
+        );
+    }
+
+    #[test]
+    fn a_host_port_published_twice_names_both_settings() {
+        let config = ClusterConfig {
+            use_router: false,
+            http_port: 8080,
+            additional_ports: vec![(8080, 8080)],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.port_settings(8080),
+            [
+                "`infrastructure.http_port`",
+                "the `8080:8080` entry in `infrastructure.additional_ports`"
+            ]
+        );
     }
 
     #[test]
