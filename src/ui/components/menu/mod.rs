@@ -8,6 +8,7 @@ mod render;
 use std::collections::{HashMap, HashSet};
 
 use crate::app::{InfoBlockResult, InfoBlockStatus};
+use crate::cluster::docker::PublishedPort;
 use crate::cluster::{IngressEntry, IngressHealthStatus};
 use crate::config::{CommandEntry, CommandGroup, Config};
 use crate::ui::styles::Styles;
@@ -65,8 +66,8 @@ pub struct Menu {
     pub(super) missing_hosts: HashSet<String>,
     // Manual blink state (toggled by app loop)
     pub(super) blink_visible: bool,
-    // Forwarded ports from config (host_port, container_port)
-    pub(super) forwarded_ports: Vec<(u16, u16)>,
+    // Host ports Docker publishes from the cluster's containers
+    pub(super) forwarded_ports: Vec<PublishedPort>,
     // Active port forwards from kubectl port-forward
     pub(super) active_port_forwards: Vec<ActivePortForward>,
     // Search/filter state
@@ -141,7 +142,7 @@ impl Menu {
     }
 
     /// Update forwarded ports list
-    pub fn set_forwarded_ports(&mut self, ports: Vec<(u16, u16)>) {
+    pub fn set_forwarded_ports(&mut self, ports: Vec<PublishedPort>) {
         self.forwarded_ports = ports;
     }
 

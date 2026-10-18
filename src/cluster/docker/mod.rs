@@ -20,7 +20,7 @@ use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{
     ContainerConfig, ContainerCreateBody, ContainerSummary, HostConfig, HostConfigCgroupnsModeEnum,
     Mount, MountBindOptions, MountBindOptionsPropagationEnum, MountTypeEnum, NetworkConnectRequest,
-    NetworkCreateRequest, NetworkDisconnectRequest, PortBinding, VolumeCreateRequest,
+    NetworkCreateRequest, NetworkDisconnectRequest, PortBinding, PortMap, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CommitContainerOptions, CreateContainerOptions, CreateImageOptions, InspectContainerOptions,
@@ -235,6 +235,22 @@ impl DockerManager {
             .as_ref()?
             .parse()
             .ok()
+    }
+
+    /// Host ports a container is publishing, sorted by host port.
+    /// Reads the live bindings, so a stopped container publishes none.
+    pub async fn published_ports(&self, name: &str) -> Result<Vec<PublishedPort>> {
+        let info = self
+            .client
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+            .with_context(|| format!("Failed to inspect container {}", name))?;
+
+        let ports = info
+            .network_settings
+            .and_then(|network| network.ports)
+            .unwrap_or_default();
+        Ok(published_ports_of(name, &ports))
     }
 
     /// Get container status
@@ -898,6 +914,32 @@ impl DockerManager {
         }
     }
 
+    /// Re-attach a stopped container to its network if its endpoint is gone.
+    ///
+    /// Docker drops a container's endpoints when a start fails to publish its
+    /// ports (a host port already taken). Every later start then boots it with
+    /// loopback only, and k3s exits with "no default routes found".
+    pub async fn ensure_attached(&self, network: &str, container: &str) -> Result<()> {
+        let info = self
+            .client
+            .inspect_container(container, None::<InspectContainerOptions>)
+            .await
+            .with_context(|| format!("Failed to inspect container {}", container))?;
+        let attached = info
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .is_some_and(|networks| networks.contains_key(network));
+        if attached {
+            return Ok(());
+        }
+        tracing::warn!(
+            container,
+            network,
+            "Container lost its network endpoint, re-attaching"
+        );
+        self.connect_network(network, container).await
+    }
+
     /// Detach a container from a network (no-op if not attached)
     pub async fn disconnect_network(&self, network: &str, container: &str) -> Result<()> {
         // Errors here are always "not attached" or "no such network" — both mean
@@ -1418,6 +1460,15 @@ impl PortMapping {
     }
 }
 
+/// A host port Docker is publishing from a running container
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PublishedPort {
+    pub host_port: u16,
+    /// Name of the container that publishes it
+    pub container: String,
+    pub container_port: u16,
+}
+
 /// Configuration for running a Docker container
 #[derive(Debug, Clone, Default)]
 pub struct ContainerRunConfig {
@@ -1670,6 +1721,32 @@ fn publisher_of(containers: &[ContainerSummary], port: u16, except: &str) -> Opt
     })
 }
 
+/// One entry per host port → container port in a live port map. Ports that
+/// are only exposed carry no binding, and Docker repeats a binding for each
+/// address family it listens on (`0.0.0.0` and `::`).
+fn published_ports_of(container: &str, ports: &PortMap) -> Vec<PublishedPort> {
+    let mut published = Vec::new();
+    for (key, bindings) in ports {
+        // Keys look like `6443/tcp`
+        let Some(container_port) = key.split('/').next().and_then(|p| p.parse().ok()) else {
+            continue;
+        };
+        for binding in bindings.iter().flatten() {
+            let Some(host_port) = binding.host_port.as_deref().and_then(|p| p.parse().ok()) else {
+                continue;
+            };
+            published.push(PublishedPort {
+                host_port,
+                container: container.to_string(),
+                container_port,
+            });
+        }
+    }
+    published.sort();
+    published.dedup();
+    published
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1873,6 +1950,74 @@ mod tests {
             Some("two-server")
         );
         assert_eq!(publisher_of(&containers, 8080, "two-server"), None);
+    }
+
+    fn live(ip: &str, port: &str) -> PortBinding {
+        PortBinding {
+            host_ip: Some(ip.to_string()),
+            host_port: Some(port.to_string()),
+        }
+    }
+
+    fn port(host_port: u16, container: &str, container_port: u16) -> PublishedPort {
+        PublishedPort {
+            host_port,
+            container: container.to_string(),
+            container_port,
+        }
+    }
+
+    #[test]
+    fn published_ports_map_the_host_port_to_the_container_port() {
+        let ports = PortMap::from([
+            (
+                "6443/tcp".to_string(),
+                Some(vec![live("127.0.0.1", "6451")]),
+            ),
+            ("2345/tcp".to_string(), Some(vec![live("0.0.0.0", "2346")])),
+        ]);
+        assert_eq!(
+            published_ports_of("alpha-server", &ports),
+            [
+                port(2346, "alpha-server", 2345),
+                port(6451, "alpha-server", 6443)
+            ]
+        );
+    }
+
+    #[test]
+    fn published_ports_list_each_binding_once() {
+        // Docker reports a wildcard binding once per address family
+        let ports = PortMap::from([
+            (
+                "443/tcp".to_string(),
+                Some(vec![live("0.0.0.0", "443"), live("::", "443")]),
+            ),
+            (
+                "80/tcp".to_string(),
+                Some(vec![live("0.0.0.0", "80"), live("::", "80")]),
+            ),
+        ]);
+        assert_eq!(
+            published_ports_of("k3dev-router", &ports),
+            [port(80, "k3dev-router", 80), port(443, "k3dev-router", 443)]
+        );
+    }
+
+    #[test]
+    fn exposed_ports_without_a_binding_are_not_published() {
+        let ports = PortMap::from([
+            ("8080/tcp".to_string(), None),
+            ("9000/tcp".to_string(), Some(vec![])),
+            (
+                "9100/tcp".to_string(),
+                Some(vec![PortBinding {
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: None,
+                }]),
+            ),
+        ]);
+        assert!(published_ports_of("alpha-server", &ports).is_empty());
     }
 
     fn bind_error(host_port: Option<u16>, denied: bool) -> PortBindError {

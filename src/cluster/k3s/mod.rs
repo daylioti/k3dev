@@ -340,6 +340,11 @@ impl K3sManager {
                         .await;
                 }
             }
+            // A previous start that failed on a port conflict leaves the
+            // container without its network endpoint
+            self.docker
+                .ensure_attached(&self.config.network_name, &self.config.container_name)
+                .await?;
             self.docker
                 .start_container(&self.config.container_name)
                 .await?;

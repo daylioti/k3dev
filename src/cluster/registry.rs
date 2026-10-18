@@ -5,7 +5,7 @@
 //! so two clusters can never silently collide on the same subnet.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Highest index that still yields a valid `10.{42+2i}.0.0/16` pair
 pub const MAX_INDEX: u16 = 100;
@@ -52,6 +52,38 @@ fn save(map: &BTreeMap<String, u16>) {
     }
 }
 
+/// Hold an exclusive lock on a JSON state file under `~/.k3dev` for one
+/// read-modify-write; it is released when the returned file is dropped.
+///
+/// Without it, two k3dev processes updating the file at the same moment both
+/// read the same map and the second write drops the first's change — here, two
+/// clusters handed the same lowest free index and so one set of CIDRs. The lock
+/// is taken on a sidecar file because the state file is replaced by rename, and
+/// a lock on the replaced inode would not cover the new one.
+///
+/// Best effort: if the lock cannot be taken the caller proceeds unlocked, as
+/// before, rather than failing cluster start over a bookkeeping file.
+pub(super) fn lock_file(data_path: &Path) -> Option<std::fs::File> {
+    let path = data_path.with_extension("json.lock");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| {
+            tracing::warn!(error = %e, path = %path.display(), "Failed to open state file lock");
+        })
+        .ok()?;
+    if let Err(e) = file.lock() {
+        tracing::warn!(error = %e, path = %path.display(), "Failed to lock state file");
+        return None;
+    }
+    Some(file)
+}
+
 /// Lowest index not already reserved, capped at [`MAX_INDEX`].
 fn lowest_free(used: &[u16]) -> u16 {
     (0..=MAX_INDEX)
@@ -62,6 +94,7 @@ fn lowest_free(used: &[u16]) -> u16 {
 /// Resolve the index for `cluster_name`, allocating the lowest free one on
 /// first use. Called once at config construction, so blocking I/O is fine.
 pub fn resolve_index(cluster_name: &str) -> u16 {
+    let _lock = lock_file(&registry_path());
     let mut map = load();
 
     if let Some(idx) = map.get(cluster_name) {
@@ -96,6 +129,7 @@ pub fn reserve_index(cluster_name: &str, index: u16) -> u16 {
         index
     };
 
+    let _lock = lock_file(&registry_path());
     let mut map = load();
     if map.get(cluster_name) != Some(&index) {
         map.insert(cluster_name.to_string(), index);
@@ -111,6 +145,7 @@ pub fn all() -> BTreeMap<String, u16> {
 
 /// Drop a cluster's index reservation (called on `delete`).
 pub fn release_index(cluster_name: &str) {
+    let _lock = lock_file(&registry_path());
     let mut map = load();
     if map.remove(cluster_name).is_some() {
         save(&map);

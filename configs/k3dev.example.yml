@@ -34,7 +34,8 @@ infrastructure:
   # k3s_image_repo: "ghcr.io/daylioti/k3dev-k3s"
 
   # Ports
-  api_port: 6443
+  # api_port is optional: omit it to use 6443 + the cluster index, unique per cluster
+  # api_port: 6443
   http_port: 80
   https_port: 443
 

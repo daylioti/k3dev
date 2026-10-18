@@ -32,8 +32,10 @@ infrastructure:
   domain: "local.k8s.dev"      # default domain for ingresses; must be unique per cluster
   k3s_version: "latest"        # k3s image tag; pin e.g. "v1.35.2-k3s1" for a fixed version
   k3s_image_repo: "ghcr.io/daylioti/k3dev-k3s"  # image repo; tag is k3s_version. See note below.
-  api_port: 6443               # must be unique per cluster. Published on 127.0.0.1
-                               # only; with a remote Docker host, on all its interfaces
+  # api_port: 6443             # optional; omit and it is 6443 + the cluster index,
+                               # so unique per cluster. A pinned port must be unique
+                               # too. Published on 127.0.0.1 only; with a remote
+                               # Docker host, on all its interfaces
   http_port: 80                # host port the shared router listens on
   https_port: 443
   additional_ports:            # extra host:container port mappings
@@ -280,7 +282,7 @@ Each config must differ in:
 |---|---|
 | `cluster_name` | Namespaces the container, network, volumes, kubelet root-dir, cgroup root, snapshot images, `/etc/hosts` marker and kubeconfig context. |
 | `domain` | Host header / SNI is the only thing the shared router can route on, so two clusters must never claim the same domain. |
-| `api_port` | Published directly on the host (loopback only unless Docker is remote); it can be neither Host- nor SNI-routed. |
+| `api_port` | Only when pinned: left unset it is `6443 + index` and differs automatically. Published directly on the host (loopback only unless Docker is remote); it can be neither Host- nor SNI-routed. |
 | `additional_ports` | Raw host publishes — they collide like any other port. |
 
 `http_port` / `https_port` are the **host** ports the shared `k3dev-router`
@@ -320,10 +322,11 @@ it is currently up, filtered as you type.
 A cluster is defined by its whole config file — menu, hooks, info blocks,
 keybindings, theme — not just a kube context, so switching reopens the TUI
 against the target's config rather than repointing the current one. The
-cluster → config-file map is built automatically: every config the TUI opens is
-remembered in `~/.k3dev/configs.json`. A cluster that is running but was never
-opened in the TUI is listed as `no config` and cannot be switched to until you
-open it once with `k3dev -c <file>`.
+cluster → config-file map is built automatically: every config the TUI opens,
+or that `k3dev -c <file> start` / `restart` runs against, is remembered in
+`~/.k3dev/configs.json`. A running cluster with no recorded config (for example
+one started without a config file) is listed as `no config` and cannot be
+switched to until you open or start it once with `k3dev -c <file>`.
 
 Deleting `~/.k3dev/configs.json` only empties the switcher list; it has no
 effect on the clusters themselves.

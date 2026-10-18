@@ -306,9 +306,10 @@ pub struct InfrastructureConfig {
     #[serde(default = "default_k3s_image_repo")]
     pub k3s_image_repo: String,
 
-    /// Kubernetes API port
-    #[serde(default = "default_api_port")]
-    pub api_port: u16,
+    /// Host port for the Kubernetes API. Omit to derive one from the cluster
+    /// index, which keeps it unique among k3dev clusters.
+    #[serde(default)]
+    pub api_port: Option<u16>,
 
     /// HTTP port
     #[serde(default = "default_http_port")]
@@ -415,10 +416,6 @@ fn default_k3s_image_repo() -> String {
     "ghcr.io/daylioti/k3dev-k3s".to_string()
 }
 
-fn default_api_port() -> u16 {
-    6443
-}
-
 fn default_http_port() -> u16 {
     80
 }
@@ -439,7 +436,7 @@ impl Default for InfrastructureConfig {
             domain: default_domain(),
             k3s_version: default_k3s_version(),
             k3s_image_repo: default_k3s_image_repo(),
-            api_port: default_api_port(),
+            api_port: None,
             http_port: default_http_port(),
             https_port: default_https_port(),
             additional_ports: default_additional_ports(),
@@ -1071,5 +1068,19 @@ cmd: "uname -s"
     fn explicit_empty_additional_ports_stay_empty() {
         let infra: InfrastructureConfig = serde_yml::from_str("additional_ports: []").unwrap();
         assert!(infra.additional_ports.is_empty());
+    }
+
+    /// An unset `api_port` is left for the cluster to derive, not defaulted
+    #[test]
+    fn omitted_api_port_stays_unset() {
+        let infra: InfrastructureConfig = serde_yml::from_str("cluster_name: \"k3dev\"").unwrap();
+        assert_eq!(infra.api_port, None);
+        assert_eq!(InfrastructureConfig::default().api_port, None);
+    }
+
+    #[test]
+    fn explicit_api_port_is_pinned() {
+        let infra: InfrastructureConfig = serde_yml::from_str("api_port: 6443").unwrap();
+        assert_eq!(infra.api_port, Some(6443));
     }
 }

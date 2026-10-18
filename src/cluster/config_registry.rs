@@ -3,7 +3,8 @@
 //! A k3dev cluster is defined by a whole config file (menu, hooks, info blocks,
 //! ports), not just a kube context, so switching clusters at runtime means
 //! finding the YAML that defines the target. Nothing else on disk records that
-//! link, so every config the TUI opens is remembered here.
+//! link, so every config the TUI opens, or the CLI starts or restarts a
+//! cluster from, is remembered here.
 //!
 //! Kept separate from `clusters.json` on purpose: that file pins each cluster's
 //! CIDR index and a corrupt or reshaped copy would silently re-index a running
@@ -42,22 +43,35 @@ fn load() -> BTreeMap<String, ConfigEntry> {
         .unwrap_or_default()
 }
 
+/// Write the registry atomically (temp file + rename).
+///
+/// Writing in place lets two processes saving at once interleave into invalid
+/// JSON, which loads as empty and the next save then persists.
 fn save(map: &BTreeMap<String, ConfigEntry>) {
     let path = registry_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match serde_json::to_string_pretty(map) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                tracing::warn!(error = %e, path = %path.display(), "Failed to persist config registry");
-            }
+    let json = match serde_json::to_string_pretty(map) {
+        Ok(json) => json,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to serialize config registry");
+            return;
         }
-        Err(e) => tracing::warn!(error = %e, "Failed to serialize config registry"),
+    };
+
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, json) {
+        tracing::warn!(error = %e, path = %tmp.display(), "Failed to persist config registry");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        tracing::warn!(error = %e, path = %path.display(), "Failed to persist config registry");
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
-/// Every cluster the TUI has opened, name → config entry.
+/// Every recorded cluster, name → config entry.
 pub fn all() -> BTreeMap<String, ConfigEntry> {
     load()
 }
@@ -74,6 +88,7 @@ pub fn record(cluster_name: &str, config_path: &Path, domain: &str, api_port: u1
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    let _lock = super::registry::lock_file(&registry_path());
     let mut map = load();
     map.insert(
         cluster_name.to_string(),

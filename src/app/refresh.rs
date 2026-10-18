@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 use crate::cluster::docker::pull_progress::monitor_image_pull;
 use crate::cluster::{
     ClusterManager, ClusterStatus, DockerManager, IngressHealthChecker, IngressManager,
-    PortForwardDetector,
+    PortForwardDetector, ROUTER_CONTAINER,
 };
 use crate::commands::{capture_exec, check_visible, strip_ansi, trim_output};
 use crate::config::{ExecutionTarget, VisibleCheck};
@@ -406,6 +406,47 @@ impl App {
             let forwards = result.unwrap_or_default();
             let _ = message_tx
                 .send(AppMessage::ActivePortForwardsUpdated(forwards))
+                .await;
+        });
+    }
+
+    /// Read the host ports Docker publishes for this cluster: the server
+    /// container's, plus the shared router's when it serves HTTP/HTTPS.
+    pub(super) fn spawn_forwarded_ports_check(&mut self) {
+        if !self.cluster_is_running() {
+            return;
+        }
+
+        let docker = match self.ensure_docker_manager() {
+            Some(d) => d,
+            None => return,
+        };
+        let message_tx = self.message_tx.clone();
+        let config = Arc::clone(&self.cluster_config);
+        let timeout = self.refresh_config.port_forward_timeout;
+
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(timeout, async {
+                let mut containers = vec![config.container_name.as_str()];
+                if config.use_router {
+                    containers.push(ROUTER_CONTAINER);
+                }
+
+                let mut ports = Vec::new();
+                for name in containers {
+                    match docker.published_ports(name).await {
+                        Ok(published) => ports.extend(published),
+                        Err(e) => tracing::debug!("No published ports for {}: {:#}", name, e),
+                    }
+                }
+                ports.sort();
+                ports
+            })
+            .await;
+
+            let ports = result.unwrap_or_default();
+            let _ = message_tx
+                .send(AppMessage::ForwardedPortsUpdated(ports))
                 .await;
         });
     }

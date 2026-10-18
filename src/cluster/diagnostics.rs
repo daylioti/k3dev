@@ -85,6 +85,15 @@ const CAT_DEEP_VERIFICATION: &str = "Deep Verification";
 /// Namespace used for deep verification tests
 const DIAG_NAMESPACE: &str = "k3dev-diag";
 
+/// Termination grace period for deep verification pods. The busybox pods run
+/// `sleep` as PID 1, which ignores SIGTERM, so any grace period is spent
+/// waiting for SIGKILL, and the namespace stays Terminating until every pod is
+/// gone. None of these pods hold anything worth a graceful stop.
+const DIAG_POD_GRACE_PERIOD_SECS: i64 = 0;
+
+/// How long to wait for the deep verification namespace to finish deleting.
+const DIAG_NAMESPACE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Per-test timeout in seconds. Deep tests need longer than the default 10s.
 fn test_timeout(test_id: &str) -> Duration {
     let secs = match test_id {
@@ -94,7 +103,7 @@ fn test_timeout(test_id: &str) -> Duration {
         "deep_connectivity" => 120,
         "deep_volume" => 120,
         "deep_host_http" | "deep_docker_in_container" | "deep_runtime_socket" => 30,
-        "deep_cleanup" => 30,
+        "deep_cleanup" => 60,
         _ => 10,
     };
     Duration::from_secs(secs)
@@ -360,7 +369,7 @@ const CAT_PREFLIGHT_DOCKER: &str = "Docker";
 const CAT_PREFLIGHT_PORTS: &str = "Ports";
 const CAT_PREFLIGHT_CONFIG: &str = "Configuration";
 
-fn build_preflight_list(config: &ClusterConfig) -> Vec<DiagnosticResult> {
+fn build_preflight_list(config: &ClusterConfig, api_port: u16) -> Vec<DiagnosticResult> {
     let fixed: &[(&'static str, &'static str, &'static str)] = &[
         // System
         (
@@ -403,7 +412,7 @@ fn build_preflight_list(config: &ClusterConfig) -> Vec<DiagnosticResult> {
     let core_ports = [
         (config.http_port, "HTTP"),
         (config.https_port, "HTTPS"),
-        (config.api_port, "K8s API"),
+        (api_port, "K8s API"),
     ];
     for (port, label) in core_ports {
         tests.push(DiagnosticResult::pending(
@@ -672,8 +681,14 @@ async fn execute_preflight_test(
 
 /// Run preflight checks (no running cluster required)
 pub async fn run_preflight_checks(config: Arc<ClusterConfig>, tx: mpsc::Sender<AppMessage>) {
+    // A stopped container publishes the API port it was created with, which
+    // the config may no longer resolve to; that binding is what start needs.
+    let api_port = match docker_mgr() {
+        Ok(docker) => config.live_api_port(&docker).await,
+        Err(_) => config.api_port,
+    };
     let report = DiagnosticsReport {
-        results: build_preflight_list(&config),
+        results: build_preflight_list(&config, api_port),
         finished: false,
     };
     run_suite(
@@ -994,11 +1009,12 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 "127.0.0.1".to_string()
             };
 
+            let docker = docker_mgr()?;
+
             // In router mode HTTP/HTTPS are owned by the shared k3dev-router,
             // not by this cluster's container — so this check means "the router
             // is listening", and it must also be actually up.
             if config.use_router {
-                let docker = docker_mgr()?;
                 let router = RouterManager::new(config.router_image.clone());
                 if !router.is_healthy(&docker).await {
                     return Err(format!("{} not running", crate::cluster::ROUTER_CONTAINER));
@@ -1008,7 +1024,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             let ports: Vec<(u16, &str)> = vec![
                 (config.http_port, "HTTP"),
                 (config.https_port, "HTTPS"),
-                (config.api_port, "K8s API"),
+                (config.live_api_port(&docker).await, "K8s API"),
             ];
 
             let mut failed = Vec::new();
@@ -1320,6 +1336,26 @@ async fn delete_pod_if_exists(client: &kube::Client, namespace: &str, name: &str
     let _ = pods.delete(name, &DeleteParams::default()).await;
 }
 
+/// Wait for the k3dev-diag namespace to be fully gone. A namespace delete is
+/// accepted immediately but the namespace lingers in Terminating until all of
+/// its resources are removed.
+async fn wait_for_diag_namespace_gone(namespaces: &Api<Namespace>) -> Result<(), String> {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > DIAG_NAMESPACE_DELETE_TIMEOUT {
+            return Err(format!(
+                "namespace '{}' still terminating after {}s",
+                DIAG_NAMESPACE,
+                DIAG_NAMESPACE_DELETE_TIMEOUT.as_secs()
+            ));
+        }
+        match namespaces.get(DIAG_NAMESPACE).await {
+            Err(_) => return Ok(()), // gone
+            Ok(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+        }
+    }
+}
+
 // ==================== Deep Verification Tests ====================
 
 /// Create the k3dev-diag namespace (clean up stale one first)
@@ -1333,17 +1369,7 @@ async fn deep_setup(config: &ClusterConfig) -> Result<Option<String>, String> {
         .delete(DIAG_NAMESPACE, &DeleteParams::default())
         .await;
 
-    // Wait for namespace to be fully gone
-    let start = Instant::now();
-    loop {
-        if start.elapsed() > Duration::from_secs(30) {
-            return Err("timed out waiting for stale namespace deletion".to_string());
-        }
-        match namespaces.get(DIAG_NAMESPACE).await {
-            Err(_) => break, // gone
-            Ok(_) => tokio::time::sleep(Duration::from_secs(1)).await,
-        }
-    }
+    wait_for_diag_namespace_gone(&namespaces).await?;
 
     // Create fresh namespace
     let ns = Namespace {
@@ -1388,6 +1414,7 @@ async fn deep_dns(config: &ClusterConfig) -> Result<Option<String>, String> {
                 ..Default::default()
             }],
             restart_policy: Some("Never".to_string()),
+            termination_grace_period_seconds: Some(DIAG_POD_GRACE_PERIOD_SECS),
             ..Default::default()
         }),
         ..Default::default()
@@ -1457,6 +1484,7 @@ async fn deep_connectivity(config: &ClusterConfig) -> Result<Option<String>, Str
                 }]),
                 ..Default::default()
             }],
+            termination_grace_period_seconds: Some(DIAG_POD_GRACE_PERIOD_SECS),
             ..Default::default()
         }),
         ..Default::default()
@@ -1510,6 +1538,7 @@ async fn deep_connectivity(config: &ClusterConfig) -> Result<Option<String>, Str
                 ..Default::default()
             }],
             restart_policy: Some("Never".to_string()),
+            termination_grace_period_seconds: Some(DIAG_POD_GRACE_PERIOD_SECS),
             ..Default::default()
         }),
         ..Default::default()
@@ -1623,6 +1652,7 @@ async fn deep_volume(config: &ClusterConfig) -> Result<Option<String>, String> {
                 ..Default::default()
             }]),
             restart_policy: Some("Never".to_string()),
+            termination_grace_period_seconds: Some(DIAG_POD_GRACE_PERIOD_SECS),
             ..Default::default()
         }),
         ..Default::default()
@@ -1769,7 +1799,12 @@ async fn deep_cleanup(config: &ClusterConfig) -> Result<Option<String>, String> 
         .delete(DIAG_NAMESPACE, &DeleteParams::default())
         .await
     {
-        Ok(_) => Ok(Some(format!("deleted {}", DIAG_NAMESPACE))),
+        Ok(_) => {
+            // The delete is only accepted here; wait so nothing is left
+            // Terminating when the run reports done.
+            wait_for_diag_namespace_gone(&namespaces).await?;
+            Ok(Some(format!("deleted {}", DIAG_NAMESPACE)))
+        }
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(Some("already clean".to_string())),
         Err(e) => Err(format!("failed to delete namespace: {}", e)),
     }
@@ -2050,6 +2085,6 @@ mod tests {
             Duration::from_secs(30)
         );
         assert_eq!(test_timeout("deep_runtime_socket"), Duration::from_secs(30));
-        assert_eq!(test_timeout("deep_cleanup"), Duration::from_secs(30));
+        assert_eq!(test_timeout("deep_cleanup"), Duration::from_secs(60));
     }
 }

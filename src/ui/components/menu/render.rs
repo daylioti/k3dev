@@ -14,6 +14,7 @@ use ratatui::{
 
 use super::Menu;
 use crate::app::InfoBlockStatus;
+use crate::cluster::docker::PublishedPort;
 use crate::cluster::IngressHealthStatus;
 
 impl Menu {
@@ -93,12 +94,8 @@ impl Menu {
         }
 
         // Forwarded ports section
-        for (host_port, container_port) in &self.forwarded_ports {
-            // "    {port} → k3s:{port}"
-            let port_w = 4
-                + host_port.to_string().len() as u16
-                + 7
-                + container_port.to_string().len() as u16;
+        for port in &self.forwarded_ports {
+            let port_w = forwarded_port_line(port).chars().count() as u16;
             if port_w > max_width {
                 max_width = port_w;
             }
@@ -447,15 +444,17 @@ impl Menu {
             self.styles.group_header,
         )));
 
-        // Add static port entries (from k3s container)
+        // Add static port entries (published by the cluster's containers)
         if !self.forwarded_ports.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  📦 Container",
                 self.styles.muted_text,
             )));
-            for (host_port, container_port) in &self.forwarded_ports {
-                let port_text = format!("    {} → k3s:{}", host_port, container_port);
-                lines.push(Line::from(Span::styled(port_text, self.styles.normal_text)));
+            for port in &self.forwarded_ports {
+                lines.push(Line::from(Span::styled(
+                    forwarded_port_line(port),
+                    self.styles.normal_text,
+                )));
             }
         }
 
@@ -548,5 +547,49 @@ impl Menu {
             Span::styled("H", self.styles.warning_text.add_modifier(Modifier::BOLD)),
             Span::styled(" to add", self.styles.muted_text),
         ]));
+    }
+}
+
+/// Sidebar row for a published port: `host port → container:container port`
+fn forwarded_port_line(port: &PublishedPort) -> String {
+    format!(
+        "    {} → {}:{}",
+        port.host_port, port.container, port.container_port
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_port_line_names_the_publishing_container() {
+        let api = PublishedPort {
+            host_port: 6451,
+            container: "alpha-server".to_string(),
+            container_port: 6443,
+        };
+        assert_eq!(forwarded_port_line(&api), "    6451 → alpha-server:6443");
+    }
+
+    #[test]
+    fn menu_width_fits_the_longest_forwarded_port() {
+        let mut menu = Menu::new();
+        menu.set_forwarded_ports(vec![
+            PublishedPort {
+                host_port: 80,
+                container: "k3dev-router".to_string(),
+                container_port: 80,
+            },
+            PublishedPort {
+                host_port: 6451,
+                container: "alpha-server".to_string(),
+                container_port: 6443,
+            },
+        ]);
+        assert_eq!(
+            menu.longest_item_width() as usize,
+            "    6451 → alpha-server:6443".chars().count()
+        );
     }
 }

@@ -3,6 +3,7 @@
 //! Runs cluster actions and pod operations directly in the terminal,
 //! printing colored output instead of rendering the TUI.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -15,8 +16,20 @@ use crate::ui::components::{ClusterAction, OutputLine, OutputType};
 
 /// Load config and build a ClusterConfig arc
 fn load_cluster_config(config_path: Option<&str>) -> (crate::config::Config, Arc<ClusterConfig>) {
+    let (config, cluster_config, _) = load_cluster_config_with_path(config_path);
+    (config, cluster_config)
+}
+
+/// Like `load_cluster_config`, plus the config file the loader resolved —
+/// `None` when no file was found and the defaults are in use.
+fn load_cluster_config_with_path(
+    config_path: Option<&str>,
+) -> (crate::config::Config, Arc<ClusterConfig>, Option<PathBuf>) {
     let loader = ConfigLoader::new(config_path);
-    let config = loader.load().unwrap_or_default();
+    let (config, config_file_path) = loader
+        .load_with_path()
+        .map(|(c, p)| (c, Some(p)))
+        .unwrap_or_default();
 
     let kubeconfig = if config.cluster.kubeconfig.is_empty() {
         None
@@ -34,7 +47,7 @@ fn load_cluster_config(config_path: Option<&str>) -> (crate::config::Config, Arc
             .with_k8s_config(kubeconfig, context),
     );
 
-    (config, cluster_config)
+    (config, cluster_config, config_file_path)
 }
 
 /// Create a K8sClient bound to the configured cluster's kubeconfig context.
@@ -55,9 +68,24 @@ async fn create_k8s_client(config_path: Option<&str>) -> Result<K8sClient> {
 /// Run a cluster action headlessly, printing output to stdout.
 /// Returns the process exit code (0 = success, 1 = failure).
 pub async fn run_cli_action(action: ClusterAction, config_path: Option<&str>) -> Result<i32> {
-    let (config, cluster_config) = load_cluster_config(config_path);
+    let (config, cluster_config, config_file_path) = load_cluster_config_with_path(config_path);
 
     let _ = crate::logging::init_logging(&config.logging, &config.infrastructure.cluster_name);
+
+    // Actions that bring the cluster up remember its config, as opening the TUI
+    // does, so the TUI switcher can open a cluster that was started from here.
+    // Recorded before the action runs: the name → file link holds either way,
+    // and a start that times out can still leave the container running.
+    if matches!(action, ClusterAction::Start | ClusterAction::Restart) {
+        if let Some(path) = &config_file_path {
+            crate::cluster::config_registry::record(
+                &cluster_config.cluster_name,
+                path,
+                &cluster_config.domain,
+                cluster_config.api_port,
+            );
+        }
+    }
 
     let refresh_config = RefreshConfig::default();
     let timeout = refresh_config.cluster_operation_timeout;

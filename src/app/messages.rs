@@ -3,6 +3,7 @@
 //! This module defines the AppMessage enum and the handle_message implementation.
 
 use crate::cluster::diagnostics::DiagnosticsReport;
+use crate::cluster::docker::PublishedPort;
 use crate::cluster::{
     ClusterStatus, ContainerPullProgress, ContainerStats, IngressEntry, IngressHealthStatus,
 };
@@ -37,6 +38,9 @@ pub enum AppMessage {
 
     /// Pod stats updated (per-container stats)
     PodStatsUpdated(Vec<ContainerStats>),
+
+    /// Host ports published by the cluster's containers
+    ForwardedPortsUpdated(Vec<PublishedPort>),
 
     /// Active port forwards detected
     ActivePortForwardsUpdated(Vec<ActivePortForward>),
@@ -119,8 +123,9 @@ pub enum AppMessage {
     /// Capture failed (orchestrator/Docker error).
     CaptureFailed(String),
 
-    /// Cluster names currently running in Docker (for the cluster switcher)
-    RunningClustersLoaded(Vec<String>),
+    /// Clusters currently running in Docker, each with the API host port its
+    /// server container publishes (for the cluster switcher)
+    RunningClustersLoaded(Vec<(String, Option<u16>)>),
 
     /// A newer release than the running build was found (version string)
     UpdateAvailable(String),
@@ -234,20 +239,15 @@ impl App {
                     self.preflight_auto_triggered = false;
                 }
 
-                // If cluster just became running, trigger refresh and show ports
-                if is_running && !was_running {
-                    // Set forwarded ports from config
-                    let mut all_ports = vec![
-                        (self.cluster_config.http_port, self.cluster_config.http_port),
-                        (
-                            self.cluster_config.https_port,
-                            self.cluster_config.https_port,
-                        ),
-                        (self.cluster_config.api_port, self.cluster_config.api_port),
-                    ];
-                    all_ports.extend(self.cluster_config.additional_ports.clone());
-                    self.menu.set_forwarded_ports(all_ports);
+                // Re-read published ports on every running update, refreshes
+                // included: the shared router can come up after the server
+                // container, so one read at the transition may miss it.
+                if is_running {
+                    self.spawn_forwarded_ports_check();
+                }
 
+                // If cluster just became running, trigger refresh
+                if is_running && !was_running {
                     self.spawn_ingress_refresh();
                     self.spawn_missing_hosts_check();
                     self.spawn_port_forwards_check();
@@ -384,6 +384,12 @@ impl App {
             AppMessage::PodDescribeLoaded(lines) => {
                 if self.pod_detail_panel.is_open() {
                     self.pod_detail_panel.set_describe(lines);
+                }
+            }
+            AppMessage::ForwardedPortsUpdated(ports) => {
+                // A read that finishes after the cluster stopped is stale
+                if matches!(self.cluster_status, ClusterStatus::Running) {
+                    self.menu.set_forwarded_ports(ports);
                 }
             }
             AppMessage::ActivePortForwardsUpdated(forwards) => {
@@ -526,8 +532,8 @@ impl App {
             AppMessage::K8sClientReady(client) => {
                 self.k8s_client = client;
             }
-            AppMessage::RunningClustersLoaded(names) => {
-                self.cluster_switcher.apply_running(&names);
+            AppMessage::RunningClustersLoaded(running) => {
+                self.cluster_switcher.apply_running(&running);
             }
             AppMessage::UpdateAvailable(version) => {
                 tracing::info!(latest = %version, "Newer k3dev release available");
