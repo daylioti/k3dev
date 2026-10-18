@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+use crate::cluster::config::K3S_API_PORT;
 use crate::cluster::diagnostics::{run_all_diagnostics, run_preflight_checks};
 use crate::cluster::DockerManager;
 use crate::cluster::{ClusterManager, HostsUpdateResult, IngressManager};
@@ -98,7 +99,15 @@ impl App {
         if let Some(docker) = self.ensure_docker_manager() {
             let tx = self.message_tx.clone();
             tokio::spawn(async move {
-                let running = docker.list_cluster_servers().await;
+                // A container keeps the API port it was created with, which the
+                // recorded config may no longer resolve to
+                let mut running = Vec::new();
+                for name in docker.list_cluster_servers().await {
+                    let api_port = docker
+                        .published_host_port(&format!("{}-server", name), K3S_API_PORT)
+                        .await;
+                    running.push((name, api_port));
+                }
                 let _ = tx.send(AppMessage::RunningClustersLoaded(running)).await;
             });
         }

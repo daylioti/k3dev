@@ -74,19 +74,26 @@ impl ClusterSwitcher {
     /// A running cluster with no recorded config still gets a row — it is not
     /// switchable, but silently hiding a cluster that is demonstrably up would
     /// be more confusing than showing why it cannot be opened.
-    pub fn apply_running(&mut self, running: &[String]) {
+    ///
+    /// A running cluster's published API port replaces the recorded one: the
+    /// container keeps the port it was created with.
+    pub fn apply_running(&mut self, running: &[(String, Option<u16>)]) {
         for entry in &mut self.entries {
-            entry.running = running.contains(&entry.name);
+            let live = running.iter().find(|(name, _)| *name == entry.name);
+            entry.running = live.is_some();
+            if let Some((_, Some(port))) = live {
+                entry.api_port = *port;
+            }
         }
 
-        for name in running {
+        for (name, api_port) in running {
             if self.entries.iter().any(|e| &e.name == name) {
                 continue;
             }
             self.entries.push(SwitcherEntry {
                 name: name.clone(),
                 domain: String::new(),
-                api_port: 0,
+                api_port: api_port.unwrap_or(0),
                 config_path: None,
                 running: true,
                 current: false,
@@ -383,17 +390,28 @@ mod tests {
     fn running_flags_are_applied_by_name() {
         let mut switcher = ClusterSwitcher::new();
         switcher.set_entries(vec![entry("alpha", true, true), entry("two", false, true)]);
-        switcher.apply_running(&["two".to_string()]);
+        switcher.apply_running(&[("two".to_string(), None)]);
 
         assert!(!switcher.entries[0].running);
         assert!(switcher.entries[1].running);
     }
 
     #[test]
+    fn a_running_cluster_shows_its_published_api_port() {
+        let mut switcher = ClusterSwitcher::new();
+        let mut recorded = entry("two", false, true);
+        recorded.api_port = 6449;
+        switcher.set_entries(vec![recorded]);
+        switcher.apply_running(&[("two".to_string(), Some(6443))]);
+
+        assert_eq!(switcher.entries[0].api_port, 6443);
+    }
+
+    #[test]
     fn running_cluster_without_a_config_is_listed_but_not_switchable() {
         let mut switcher = ClusterSwitcher::new();
         switcher.set_entries(vec![entry("alpha", true, true)]);
-        switcher.apply_running(&["alpha".to_string(), "ghost".to_string()]);
+        switcher.apply_running(&[("alpha".to_string(), None), ("ghost".to_string(), None)]);
 
         let ghost = switcher
             .entries

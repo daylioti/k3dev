@@ -123,8 +123,9 @@ pub enum AppMessage {
     /// Capture failed (orchestrator/Docker error).
     CaptureFailed(String),
 
-    /// Cluster names currently running in Docker (for the cluster switcher)
-    RunningClustersLoaded(Vec<String>),
+    /// Clusters currently running in Docker, each with the API host port its
+    /// server container publishes (for the cluster switcher)
+    RunningClustersLoaded(Vec<(String, Option<u16>)>),
 
     /// A newer release than the running build was found (version string)
     UpdateAvailable(String),
@@ -531,8 +532,8 @@ impl App {
             AppMessage::K8sClientReady(client) => {
                 self.k8s_client = client;
             }
-            AppMessage::RunningClustersLoaded(names) => {
-                self.cluster_switcher.apply_running(&names);
+            AppMessage::RunningClustersLoaded(running) => {
+                self.cluster_switcher.apply_running(&running);
             }
             AppMessage::UpdateAvailable(version) => {
                 tracing::info!(latest = %version, "Newer k3dev release available");
