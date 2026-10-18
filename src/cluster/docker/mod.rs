@@ -914,6 +914,32 @@ impl DockerManager {
         }
     }
 
+    /// Re-attach a stopped container to its network if its endpoint is gone.
+    ///
+    /// Docker drops a container's endpoints when a start fails to publish its
+    /// ports (a host port already taken). Every later start then boots it with
+    /// loopback only, and k3s exits with "no default routes found".
+    pub async fn ensure_attached(&self, network: &str, container: &str) -> Result<()> {
+        let info = self
+            .client
+            .inspect_container(container, None::<InspectContainerOptions>)
+            .await
+            .with_context(|| format!("Failed to inspect container {}", container))?;
+        let attached = info
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .is_some_and(|networks| networks.contains_key(network));
+        if attached {
+            return Ok(());
+        }
+        tracing::warn!(
+            container,
+            network,
+            "Container lost its network endpoint, re-attaching"
+        );
+        self.connect_network(network, container).await
+    }
+
     /// Detach a container from a network (no-op if not attached)
     pub async fn disconnect_network(&self, network: &str, container: &str) -> Result<()> {
         // Errors here are always "not attached" or "no such network" — both mean
