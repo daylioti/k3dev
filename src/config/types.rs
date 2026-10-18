@@ -320,7 +320,7 @@ pub struct InfrastructureConfig {
     pub https_port: u16,
 
     /// Additional port mappings (host:container format)
-    #[serde(default = "default_additional_ports")]
+    #[serde(default)]
     pub additional_ports: Vec<String>,
 
     /// Front-router configuration
@@ -424,10 +424,6 @@ fn default_https_port() -> u16 {
     443
 }
 
-fn default_additional_ports() -> Vec<String> {
-    vec!["2345:2345".to_string(), "8309:8309".to_string()]
-}
-
 impl Default for InfrastructureConfig {
     fn default() -> Self {
         Self {
@@ -439,7 +435,7 @@ impl Default for InfrastructureConfig {
             api_port: None,
             http_port: default_http_port(),
             https_port: default_https_port(),
-            additional_ports: default_additional_ports(),
+            additional_ports: Vec::new(),
             router: RouterConfig::default(),
             speedup: SpeedupConfig::default(),
         }
@@ -1059,7 +1055,7 @@ cmd: "uname -s"
         let defaults = InfrastructureConfig::default();
 
         assert_eq!(infra.additional_ports, defaults.additional_ports);
-        assert!(!infra.additional_ports.is_empty());
+        assert!(infra.additional_ports.is_empty());
         assert_eq!(infra.k3s_version, defaults.k3s_version);
     }
 
