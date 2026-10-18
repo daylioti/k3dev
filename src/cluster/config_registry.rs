@@ -3,7 +3,8 @@
 //! A k3dev cluster is defined by a whole config file (menu, hooks, info blocks,
 //! ports), not just a kube context, so switching clusters at runtime means
 //! finding the YAML that defines the target. Nothing else on disk records that
-//! link, so every config the TUI opens is remembered here.
+//! link, so every config the TUI opens, or the CLI starts or restarts a
+//! cluster from, is remembered here.
 //!
 //! Kept separate from `clusters.json` on purpose: that file pins each cluster's
 //! CIDR index and a corrupt or reshaped copy would silently re-index a running
@@ -57,7 +58,7 @@ fn save(map: &BTreeMap<String, ConfigEntry>) {
     }
 }
 
-/// Every cluster the TUI has opened, name → config entry.
+/// Every recorded cluster, name → config entry.
 pub fn all() -> BTreeMap<String, ConfigEntry> {
     load()
 }

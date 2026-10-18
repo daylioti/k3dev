@@ -18,7 +18,8 @@ pub struct SwitcherEntry {
     pub domain: String,
     pub api_port: u16,
     /// Config file that defines this cluster. `None` means the cluster exists in
-    /// Docker but was never opened in the TUI, so there is nothing to switch to.
+    /// Docker but no config was ever recorded for it (neither opened in the TUI
+    /// nor started from the CLI with one), so there is nothing to switch to.
     pub config_path: Option<PathBuf>,
     pub running: bool,
     /// The cluster this App instance is currently showing
@@ -261,9 +262,16 @@ impl ClusterSwitcher {
             Span::raw("  ")
         });
 
-        // Status dot: filled when the cluster container is up
+        // Status dot: green when the cluster container is up. A dotted ring
+        // marks a cluster with no recorded config, so a running one still
+        // reads as up while showing it cannot be switched to.
         if entry.config_path.is_none() {
-            spans.push(Span::styled("\u{25cc} ", self.styles.muted_text));
+            let style = if entry.running {
+                self.styles.success_text
+            } else {
+                self.styles.muted_text
+            };
+            spans.push(Span::styled("\u{25cc} ", style));
         } else if entry.running {
             spans.push(Span::styled("\u{25cf} ", self.styles.success_text));
         } else {
@@ -395,5 +403,25 @@ mod tests {
         assert!(ghost.running);
         assert!(ghost.config_path.is_none());
         assert_eq!(switcher.filtered.len(), 2);
+    }
+
+    #[test]
+    fn running_cluster_without_a_config_shows_as_up() {
+        let switcher = ClusterSwitcher::new();
+        let mut ghost = entry("ghost", false, false);
+
+        // The dot follows the cluster state; "no config" marks it unswitchable
+        let line = switcher.render_entry(&ghost, false, 5);
+        assert_eq!(line.spans[1].content, "\u{25cc} ");
+        assert_eq!(line.spans[1].style, switcher.styles.muted_text);
+
+        ghost.running = true;
+        let line = switcher.render_entry(&ghost, false, 5);
+        assert_eq!(line.spans[1].content, "\u{25cc} ");
+        assert_eq!(line.spans[1].style, switcher.styles.success_text);
+        assert_eq!(
+            line.spans.last().map(|s| s.content.as_ref()),
+            Some("no config")
+        );
     }
 }

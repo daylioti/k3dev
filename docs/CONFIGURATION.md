@@ -320,10 +320,11 @@ it is currently up, filtered as you type.
 A cluster is defined by its whole config file — menu, hooks, info blocks,
 keybindings, theme — not just a kube context, so switching reopens the TUI
 against the target's config rather than repointing the current one. The
-cluster → config-file map is built automatically: every config the TUI opens is
-remembered in `~/.k3dev/configs.json`. A cluster that is running but was never
-opened in the TUI is listed as `no config` and cannot be switched to until you
-open it once with `k3dev -c <file>`.
+cluster → config-file map is built automatically: every config the TUI opens,
+or that `k3dev -c <file> start` / `restart` runs against, is remembered in
+`~/.k3dev/configs.json`. A running cluster with no recorded config (for example
+one started without a config file) is listed as `no config` and cannot be
+switched to until you open or start it once with `k3dev -c <file>`.
 
 Deleting `~/.k3dev/configs.json` only empties the switcher list; it has no
 effect on the clusters themselves.
