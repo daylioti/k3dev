@@ -38,7 +38,7 @@ infrastructure:
                                # Docker host, on all its interfaces
   http_port: 80                # host port the shared router listens on
   https_port: 443
-  additional_ports:            # extra host:container port mappings
+  additional_ports:            # extra host:container port mappings; none by default
     - "2345:2345"
     - "8080:8080"
 

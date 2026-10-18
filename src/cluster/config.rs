@@ -155,7 +155,7 @@ impl Default for ClusterConfig {
             api_port_auto: infra.api_port.is_none(),
             http_port: infra.http_port,
             https_port: infra.https_port,
-            additional_ports: vec![(2345, 2345), (8309, 8309)],
+            additional_ports: Vec::new(),
 
             use_router: infra.router.enabled,
             router_image: infra.router.image,
