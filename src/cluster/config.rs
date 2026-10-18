@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::docker::PortMapping;
+use super::docker::{DockerManager, PortMapping};
 use crate::config::{HooksConfig, InfrastructureConfig, SpeedupConfig};
 
 /// In-cluster Traefik NodePort for HTTP. Distinct from `http_port`, which is
@@ -9,6 +9,11 @@ pub const NODEPORT_HTTP: u16 = 80;
 
 /// In-cluster Traefik NodePort for HTTPS
 pub const NODEPORT_HTTPS: u16 = 443;
+
+/// Port the k3s API server listens on inside the cluster container. Also the
+/// base of the automatic host port: an unset `api_port` resolves to this plus
+/// the cluster index, so index 0 publishes it unchanged.
+pub const K3S_API_PORT: u16 = 6443;
 
 /// Unified cluster configuration settings
 ///
@@ -38,7 +43,11 @@ pub struct ClusterConfig {
     pub network_name: String,
 
     // Ports
+    /// Host port for the API: the configured one, or derived from
+    /// `cluster_index` when the config leaves it unset
     pub api_port: u16,
+    /// `api_port` was derived rather than set in the config
+    pub api_port_auto: bool,
     pub http_port: u16,
     pub https_port: u16,
     pub additional_ports: Vec<(u16, u16)>,
@@ -60,6 +69,13 @@ pub struct ClusterConfig {
 /// A port key as written in the config file
 fn setting(key: &str) -> String {
     format!("`infrastructure.{}`", key)
+}
+
+/// The API host port: a pinned value as is, otherwise offset by the cluster
+/// index. Indices are unique and capped, so derived ports never collide with
+/// each other.
+fn resolve_api_port(pinned: Option<u16>, cluster_index: u16) -> u16 {
+    pinned.unwrap_or(K3S_API_PORT + cluster_index)
 }
 
 /// Parse additional ports from string format "host:container" to tuple
@@ -102,7 +118,8 @@ impl From<InfrastructureConfig> for ClusterConfig {
             domain: infra.domain,
             container_name,
             network_name,
-            api_port: infra.api_port,
+            api_port: resolve_api_port(infra.api_port, cluster_index),
+            api_port_auto: infra.api_port.is_none(),
             http_port: infra.http_port,
             https_port: infra.https_port,
             additional_ports,
@@ -134,7 +151,8 @@ impl Default for ClusterConfig {
             container_name,
             network_name,
 
-            api_port: infra.api_port,
+            api_port: resolve_api_port(infra.api_port, 0),
+            api_port_auto: infra.api_port.is_none(),
             http_port: infra.http_port,
             https_port: infra.https_port,
             additional_ports: vec![(2345, 2345), (8309, 8309)],
@@ -303,9 +321,9 @@ impl ClusterConfig {
     /// has to be reachable on its interfaces.
     pub fn port_mappings(&self, docker_remote: bool) -> Vec<PortMapping> {
         let mut ports = vec![if docker_remote {
-            PortMapping::new(self.api_port, 6443)
+            PortMapping::new(self.api_port, K3S_API_PORT)
         } else {
-            PortMapping::loopback(self.api_port, 6443)
+            PortMapping::loopback(self.api_port, K3S_API_PORT)
         }];
 
         if !self.use_router {
@@ -326,7 +344,14 @@ impl ClusterConfig {
     pub fn port_settings(&self, host_port: u16) -> Vec<String> {
         let mut settings = Vec::new();
         if host_port == self.api_port {
-            settings.push(setting("api_port"));
+            if self.api_port_auto {
+                settings.push(format!(
+                    "{} (unset, so derived from the cluster index)",
+                    setting("api_port")
+                ));
+            } else {
+                settings.push(setting("api_port"));
+            }
         }
         if !self.use_router {
             settings.extend(self.router_port_settings(host_port));
@@ -355,6 +380,17 @@ impl ClusterConfig {
             settings.push(setting("https_port"));
         }
         settings
+    }
+
+    /// Host port the API is reached on. A container keeps the port it was
+    /// created with, which the config may since resolve differently (`api_port`
+    /// changed or removed), so an existing container's binding wins over
+    /// [`Self::api_port`].
+    pub async fn live_api_port(&self, docker: &DockerManager) -> u16 {
+        docker
+            .published_host_port(&self.container_name, K3S_API_PORT)
+            .await
+            .unwrap_or(self.api_port)
     }
 
     /// Get traefik dashboard domain
@@ -470,6 +506,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unset_api_port_is_derived_from_the_cluster_index() {
+        assert_eq!(resolve_api_port(None, 0), 6443);
+        assert_eq!(resolve_api_port(None, 3), 6446);
+        assert_eq!(
+            resolve_api_port(None, super::super::registry::MAX_INDEX),
+            6543
+        );
+    }
+
+    #[test]
+    fn a_pinned_api_port_wins_over_the_index() {
+        assert_eq!(resolve_api_port(Some(7000), 3), 7000);
+        assert_eq!(resolve_api_port(Some(6443), 3), 6443);
+    }
+
+    #[test]
+    fn the_default_config_keeps_the_k3s_api_port() {
+        let config = ClusterConfig::default();
+        assert_eq!(config.cluster_index, 0);
+        assert_eq!(config.api_port, 6443);
+        assert!(config.api_port_auto);
+    }
+
+    #[test]
     fn router_mode_leaves_http_ports_to_the_router() {
         let with_router = ClusterConfig {
             use_router: true,
@@ -533,6 +593,7 @@ mod tests {
         let config = ClusterConfig {
             use_router: false,
             api_port: 6451,
+            api_port_auto: false,
             http_port: 8080,
             https_port: 8443,
             additional_ports: vec![(2345, 2346)],
@@ -557,6 +618,22 @@ mod tests {
         assert_eq!(
             routed.router_port_settings(8080),
             ["`infrastructure.http_port`"]
+        );
+    }
+
+    /// Pinning a free port is still the fix, but the key is absent from the
+    /// config file, so the message says where the port came from
+    #[test]
+    fn an_auto_api_port_says_it_was_derived() {
+        let config = ClusterConfig {
+            cluster_index: 2,
+            api_port: 6445,
+            api_port_auto: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.port_settings(6445),
+            ["`infrastructure.api_port` (unset, so derived from the cluster index)"]
         );
     }
 

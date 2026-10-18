@@ -29,10 +29,11 @@ impl<'a> ConfigValidator<'a> {
             .entry(infra.https_port)
             .or_default()
             .push("https_port");
-        port_usage
-            .entry(infra.api_port)
-            .or_default()
-            .push("api_port");
+        // An unset api_port is derived from the persisted cluster index, which
+        // the validator does not read; a clash still fails the bind at start.
+        if let Some(api_port) = infra.api_port {
+            port_usage.entry(api_port).or_default().push("api_port");
+        }
 
         for (port, usages) in port_usage {
             if usages.len() > 1 {
@@ -274,12 +275,18 @@ impl<'a> ConfigValidator<'a> {
         // Compare against the shipped defaults, not hardcoded literals: with
         // several clusters every secondary one necessarily uses non-default
         // ports and would otherwise warn on every load.
-        for port in [infra.http_port, infra.https_port, infra.api_port] {
+        let ports = [
+            Some(infra.http_port),
+            Some(infra.https_port),
+            infra.api_port,
+        ];
+        for port in ports.into_iter().flatten() {
             if let Some(service) = common_conflicts.get(&port) {
-                // Only warn if it's not the expected port
+                // Only warn if it's not the expected port; a pinned api_port
+                // has no default to match
                 if (port == infra.http_port && port != defaults.http_port)
                     || (port == infra.https_port && port != defaults.https_port)
-                    || (port == infra.api_port && port != defaults.api_port)
+                    || infra.api_port == Some(port)
                 {
                     self.result.add_warning(ValidationWarning::SuspiciousPort {
                         port,

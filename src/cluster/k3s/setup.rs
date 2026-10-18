@@ -50,13 +50,11 @@ impl K3sManager {
         let api_host = PlatformInfo::docker_remote_host()
             .unwrap_or("127.0.0.1")
             .to_string();
+        let api_port = self.config.live_api_port(&self.docker).await;
 
         for attempt in 0..max_attempts {
             match client
-                .get(format!(
-                    "https://{}:{}/healthz",
-                    api_host, self.config.api_port
-                ))
+                .get(format!("https://{}:{}/healthz", api_host, api_port))
                 .send()
                 .await
             {
@@ -311,6 +309,7 @@ impl K3sManager {
         fs::create_dir_all(&kube_dir).await?;
 
         let kubeconfig_path = kube_dir.join("config");
+        let api_port = self.config.live_api_port(&self.docker).await;
 
         // Wait for k3s to generate kubeconfig
         let max_retries = 30;
@@ -327,7 +326,7 @@ impl K3sManager {
                 if !content.is_empty() && content.contains("clusters:") {
                     let name = self.config.context_name();
                     let host = PlatformInfo::docker_remote_host().unwrap_or("127.0.0.1");
-                    let server = format!("https://{}:{}", host, self.config.api_port);
+                    let server = format!("https://{}:{}", host, api_port);
 
                     let generated = Kubeconfig::from_yaml(&content)
                         .context("Failed to parse kubeconfig emitted by k3s")?;

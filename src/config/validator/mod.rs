@@ -227,4 +227,49 @@ mod tests {
         assert!(validate_key_syntax("").is_err());
         assert!(validate_key_syntax("Foo+c").is_err());
     }
+
+    fn port_warnings(api_port: Option<u16>, https_port: u16) -> Vec<ValidationWarning> {
+        let mut config = Config::default();
+        config.infrastructure.api_port = api_port;
+        config.infrastructure.https_port = https_port;
+        ConfigValidator::new(&config)
+            .validate()
+            .warnings
+            .into_iter()
+            .filter(|w| {
+                matches!(
+                    w,
+                    ValidationWarning::PortConflict { .. }
+                        | ValidationWarning::SuspiciousPort { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// The derived port depends on the registry, so an unset one is not checked
+    #[test]
+    fn an_auto_api_port_is_not_checked() {
+        assert!(port_warnings(None, 6443).is_empty());
+    }
+
+    #[test]
+    fn a_pinned_api_port_still_conflicts_with_another_port() {
+        let warnings = port_warnings(Some(8443), 8443);
+        assert_eq!(warnings.len(), 1, "{:?}", warnings);
+        assert!(matches!(
+            &warnings[0],
+            ValidationWarning::PortConflict { ports, description }
+                if ports == &[8443] && description.contains("api_port")
+        ));
+    }
+
+    #[test]
+    fn a_pinned_api_port_on_a_common_service_port_is_suspicious() {
+        let warnings = port_warnings(Some(8080), 443);
+        assert_eq!(warnings.len(), 1, "{:?}", warnings);
+        assert!(matches!(
+            &warnings[0],
+            ValidationWarning::SuspiciousPort { port: 8080, .. }
+        ));
+    }
 }

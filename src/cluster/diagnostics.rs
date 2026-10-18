@@ -369,7 +369,7 @@ const CAT_PREFLIGHT_DOCKER: &str = "Docker";
 const CAT_PREFLIGHT_PORTS: &str = "Ports";
 const CAT_PREFLIGHT_CONFIG: &str = "Configuration";
 
-fn build_preflight_list(config: &ClusterConfig) -> Vec<DiagnosticResult> {
+fn build_preflight_list(config: &ClusterConfig, api_port: u16) -> Vec<DiagnosticResult> {
     let fixed: &[(&'static str, &'static str, &'static str)] = &[
         // System
         (
@@ -412,7 +412,7 @@ fn build_preflight_list(config: &ClusterConfig) -> Vec<DiagnosticResult> {
     let core_ports = [
         (config.http_port, "HTTP"),
         (config.https_port, "HTTPS"),
-        (config.api_port, "K8s API"),
+        (api_port, "K8s API"),
     ];
     for (port, label) in core_ports {
         tests.push(DiagnosticResult::pending(
@@ -681,8 +681,14 @@ async fn execute_preflight_test(
 
 /// Run preflight checks (no running cluster required)
 pub async fn run_preflight_checks(config: Arc<ClusterConfig>, tx: mpsc::Sender<AppMessage>) {
+    // A stopped container publishes the API port it was created with, which
+    // the config may no longer resolve to; that binding is what start needs.
+    let api_port = match docker_mgr() {
+        Ok(docker) => config.live_api_port(&docker).await,
+        Err(_) => config.api_port,
+    };
     let report = DiagnosticsReport {
-        results: build_preflight_list(&config),
+        results: build_preflight_list(&config, api_port),
         finished: false,
     };
     run_suite(
@@ -1003,11 +1009,12 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
                 "127.0.0.1".to_string()
             };
 
+            let docker = docker_mgr()?;
+
             // In router mode HTTP/HTTPS are owned by the shared k3dev-router,
             // not by this cluster's container — so this check means "the router
             // is listening", and it must also be actually up.
             if config.use_router {
-                let docker = docker_mgr()?;
                 let router = RouterManager::new(config.router_image.clone());
                 if !router.is_healthy(&docker).await {
                     return Err(format!("{} not running", crate::cluster::ROUTER_CONTAINER));
@@ -1017,7 +1024,7 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             let ports: Vec<(u16, &str)> = vec![
                 (config.http_port, "HTTP"),
                 (config.https_port, "HTTPS"),
-                (config.api_port, "K8s API"),
+                (config.live_api_port(&docker).await, "K8s API"),
             ];
 
             let mut failed = Vec::new();
