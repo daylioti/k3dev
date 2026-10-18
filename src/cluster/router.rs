@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::fs;
 use tokio::sync::mpsc;
 
@@ -176,8 +177,15 @@ impl RouterManager {
         if let Err(e) = docker.run_container(&run_config).await {
             // Two clusters starting at once both find no router and both try to
             // create it; the loser gets a name conflict. The router is shared,
-            // so the winner's container is exactly what this call wanted.
-            if !docker.container_exists(ROUTER_CONTAINER).await {
+            // so the winner's container is exactly what this call wanted. Docker
+            // reserves the name before the winner's container can be inspected,
+            // so on a conflict wait for it instead of checking once.
+            let created = if is_name_conflict(&e) {
+                Self::wait_for_concurrent_router(docker).await
+            } else {
+                docker.container_exists(ROUTER_CONTAINER).await
+            };
+            if !created {
                 let e = name_port_settings(e, |port| config.router_port_settings(port));
                 return Err(e).context("Failed to create router container");
             }
@@ -191,6 +199,18 @@ impl RouterManager {
         }
 
         Ok(())
+    }
+
+    /// Wait for a router that another k3dev process is creating to come up.
+    /// Returns whether it exists by the deadline; it may still be stopped.
+    async fn wait_for_concurrent_router(docker: &DockerManager) -> bool {
+        for _ in 0..50 {
+            if docker.container_running(ROUTER_CONTAINER).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        docker.container_exists(ROUTER_CONTAINER).await
     }
 
     /// Report ports this cluster asked for that the existing router does not own
@@ -387,9 +407,35 @@ tcp:
     )
 }
 
+/// Docker's 409: the container name is already taken
+fn is_name_conflict(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<bollard::errors::Error>(),
+        Some(bollard::errors::Error::DockerResponseServerError {
+            status_code: 409,
+            ..
+        })
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn docker_error(status_code: u16) -> anyhow::Error {
+        anyhow::Error::new(bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message: "boom".into(),
+        })
+        .context("Failed to create container k3dev-router")
+    }
+
+    #[test]
+    fn a_taken_router_name_is_a_concurrent_create() {
+        assert!(is_name_conflict(&docker_error(409)));
+        assert!(!is_name_conflict(&docker_error(500)));
+        assert!(!is_name_conflict(&anyhow::anyhow!("boom")));
+    }
 
     fn alpha() -> ClusterConfig {
         ClusterConfig {
