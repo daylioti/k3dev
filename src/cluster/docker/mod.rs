@@ -10,6 +10,7 @@
 
 pub(crate) mod pull_progress;
 mod stats;
+mod subnet;
 mod volumes;
 
 pub use pull_progress::{ContainerPullProgress, PullPhase};
@@ -880,6 +881,11 @@ impl DockerManager {
             })
             .await
             .with_context(|| format!("Failed to create network {}", name))?;
+
+        // Docker checks its pick only against the main routing table
+        if let Some((subnet, route)) = self.network_shadowed_by(name).await {
+            self.recreate_on_free_subnet(name, subnet, &route).await?;
+        }
 
         Ok(())
     }
