@@ -399,7 +399,7 @@ fn build_preflight_list(config: &ClusterConfig, api_port: u16) -> Vec<Diagnostic
         (
             "pre_network_conflict",
             CAT_PREFLIGHT_DOCKER,
-            "No network name conflict",
+            "No network conflict",
         ),
     ];
     let mut tests: Vec<DiagnosticResult> = fixed
@@ -563,14 +563,21 @@ async fn execute_preflight_test(
                 )
                 .await
                 .is_ok();
-            if exists {
-                Ok(Some(format!(
-                    "'{}' exists (will be reused)",
-                    config.network_name
-                )))
-            } else {
-                Ok(None)
+            if !exists {
+                return Ok(None);
             }
+            // Routes added after the network was created, by a VPN for one,
+            // can take its traffic; only a new network gets a free subnet
+            if let Some((subnet, route)) = docker.network_shadowed_by(&config.network_name).await {
+                return Err(format!(
+                    "'{}' subnet {} is routed via {}, not its bridge; delete the cluster to recreate it on a free subnet",
+                    config.network_name, subnet, route
+                ));
+            }
+            Ok(Some(format!(
+                "'{}' exists (will be reused)",
+                config.network_name
+            )))
         }
         "pre_port" => {
             // Extract port number from test name: "Port XXXX (...) available"
