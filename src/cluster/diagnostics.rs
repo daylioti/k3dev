@@ -245,6 +245,11 @@ fn build_test_list() -> Vec<DiagnosticResult> {
             "Ingress endpoints healthy",
         ),
         ("tls_cert_valid", CAT_NETWORKING, "TLS certificate valid"),
+        (
+            "tls_ca_trusted",
+            CAT_NETWORKING,
+            "k3dev root CA trusted by system",
+        ),
         // Pods
         ("no_stuck_pods", CAT_PODS, "No stuck pods"),
         ("no_pull_errors", CAT_PODS, "No ImagePullBackOff"),
@@ -1130,36 +1135,37 @@ async fn execute_test(test_id: &str, config: &ClusterConfig) -> Result<Option<St
             let certs_dir = config.certs_dir();
             let cert_path = certs_dir.join("local-cert.pem");
             let key_path = certs_dir.join("local-key.pem");
+            let ca_path = super::local_ca::ca_cert_path();
 
-            if !cert_path.exists() {
-                return Err(format!("cert not found: {}", cert_path.display()));
-            }
             if !key_path.exists() {
                 return Err(format!("key not found: {}", key_path.display()));
             }
-
-            // Check cert expiry using x509-parser
-            {
-                use x509_parser::prelude::*;
-                let pem_data =
-                    std::fs::read(&cert_path).map_err(|e| format!("failed to read cert: {}", e))?;
-                let pem_parsed =
-                    ::pem::parse(&pem_data).map_err(|e| format!("failed to parse PEM: {}", e))?;
-                match X509Certificate::from_der(pem_parsed.contents()) {
-                    Ok((_, cert)) => {
-                        let now = chrono::Utc::now().timestamp();
-                        let not_after = cert.validity().not_after.timestamp();
-                        let remaining_secs = not_after - now;
-                        if remaining_secs < 0 {
-                            Err("certificate expired".to_string())
-                        } else if remaining_secs < 86400 {
-                            Err("certificate expiring within 24h".to_string())
-                        } else {
-                            Ok(Some("valid, not expiring within 24h".to_string()))
-                        }
-                    }
-                    Err(e) => Err(format!("failed to parse certificate: {}", e)),
-                }
+            let leaf = std::fs::read_to_string(&cert_path)
+                .map_err(|e| format!("cert not readable: {}: {}", cert_path.display(), e))?;
+            let ca = std::fs::read_to_string(&ca_path)
+                .map_err(|e| format!("CA not readable: {}: {}", ca_path.display(), e))?;
+            super::local_ca::check_leaf(&leaf, &ca, &config.domain, chrono::Utc::now())
+                .map(|expiry| Some(format!("valid until {}", expiry.format("%Y-%m-%d"))))
+                .map_err(|reason| {
+                    format!(
+                        "certificate {} — restart the cluster to regenerate it",
+                        reason
+                    )
+                })
+        }
+        "tls_ca_trusted" => {
+            use super::local_ca::TrustStatus;
+            let ca_path = super::local_ca::ca_cert_path();
+            if !ca_path.exists() {
+                return Err(format!("CA not found: {}", ca_path.display()));
+            }
+            match super::local_ca::trust_status(&ca_path).await {
+                TrustStatus::Trusted => Ok(None),
+                TrustStatus::NotTrusted => Err(format!(
+                    "not trusted — restart the cluster to install it, or run: {}",
+                    super::local_ca::manual_trust_hint(&ca_path)
+                )),
+                TrustStatus::Unknown => Ok(Some("no known trust store to check".to_string())),
             }
         }
         "no_stuck_pods" => {
@@ -1824,7 +1830,7 @@ mod tests {
     #[test]
     fn test_build_test_list() {
         let tests = build_test_list();
-        assert_eq!(tests.len(), 31);
+        assert_eq!(tests.len(), 32);
         assert!(tests.iter().all(|t| t.status == DiagnosticStatus::Pending));
     }
 

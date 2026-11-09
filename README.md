@@ -27,7 +27,7 @@ A TUI for managing local K3s clusters in Docker.
 - Linux or macOS (Docker Desktop)
 - Docker (running; Linux needs the `cgroupfs` cgroup driver)
 - kubectl (only required for interactive `exec` and `logs --follow`)
-- HTTPS certificates are generated automatically (built-in CA)
+- HTTPS certificates are generated automatically (built-in CA). When a cluster starts and the system doesn't trust the CA yet, k3dev asks for sudo to install it.
 
 ### Docker Configuration (Linux)
 

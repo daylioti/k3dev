@@ -398,11 +398,6 @@ impl ClusterConfig {
         format!("traefik.{}", self.domain)
     }
 
-    /// Get wildcard domain for certificates
-    pub fn wildcard_domain(&self) -> String {
-        format!("*.{}", self.domain)
-    }
-
     /// Builder method to set hooks configuration
     pub fn with_hooks(mut self, hooks: HooksConfig) -> Self {
         self.hooks = hooks;
