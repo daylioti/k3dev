@@ -7,6 +7,7 @@ pub mod docker_relay;
 mod ingress;
 mod k3s;
 pub(crate) mod kube_ops;
+mod local_ca;
 mod platform;
 mod port_forward;
 pub(crate) mod registry;
