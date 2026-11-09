@@ -202,7 +202,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
             artifact: k3dev-macos-x86_64
           - target: aarch64-apple-darwin
             os: macos-latest
